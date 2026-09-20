@@ -1,0 +1,36 @@
+{
+  "status_success": {
+    "success": true,
+    "data": {
+      "quota_per_unit": 500000,
+      "turnstile_site_key": "0x4AAAAAAAJustDoWorkKey"
+    }
+  },
+  "self_success": {
+    "success": true,
+    "data": {
+      "id": 201,
+      "username": "just_user",
+      "display_name": "Just Worker",
+      "quota": 45000000,
+      "used_quota": 5000000
+    }
+  },
+  "refresh_success": {
+    "success": true,
+    "data": {
+      "access_token": "refreshed-token-just-999"
+    }
+  },
+  "checkin_status_checked_today": {
+    "success": true,
+    "data": {
+      "records": [
+        {
+          "checkin_date": "{{TODAY}}",
+          "quota_awarded": 10000000
+        }
+      ]
+    }
+  }
+}

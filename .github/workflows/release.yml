@@ -1,0 +1,27 @@
+name: Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+
+      - name: Build macOS DMGs
+        run: ./scripts/build-macos.sh
+
+      - name: Verify Release Artifacts
+        run: ./scripts/verify-release.sh
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmgs
+          path: dist/*.dmg

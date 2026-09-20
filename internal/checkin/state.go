@@ -1,0 +1,26 @@
+package checkin
+
+import "time"
+
+type JobStatus string
+
+const (
+	StatusIdle              JobStatus = "idle"
+	StatusRunning           JobStatus = "running"
+	StatusSuccess           JobStatus = "success"
+	StatusFailed            JobStatus = "failed"
+	StatusCooldown          JobStatus = "cooldown"
+	StatusNeedManual        JobStatus = "need_manual"
+	StatusPersistenceFailed JobStatus = "persistence_failed"
+)
+
+type JobState struct {
+	ChannelID       string    `json:"channel_id"`
+	Status          JobStatus `json:"status"`
+	ExecutionStatus JobStatus `json:"execution_status,omitempty"`
+	LastRunAt       time.Time `json:"last_run_at"`
+	NextRunAt       time.Time `json:"next_run_at"`
+	LastReward      string    `json:"last_reward"`
+	LastError       string    `json:"last_error"`
+	FailureCount    int       `json:"failure_count"`
+}

@@ -1,0 +1,26 @@
+services:
+  relayhub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: relayhub:latest
+    container_name: relayhub
+    restart: unless-stopped
+    # By default, management API is bound to 127.0.0.1 to prevent public internet exposure
+    ports:
+      - "8787:8787"       # HTTP / HTTPS CONNECT transparent proxy
+      - "8788:8788"       # SOCKS5 proxy
+      - "8789:8789"       # OpenAI / Anthropic Gateway
+      - "127.0.0.1:8790:8790" # Local management console / Web UI
+    volumes:
+      - relayhub-data:/data
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  relayhub-data:
+    driver: local

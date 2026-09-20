@@ -1,0 +1,30 @@
+{
+  "http_401_unauthorized": {
+    "error": {
+      "message": "无权访问，请先登录",
+      "type": "new_api_error"
+    }
+  },
+  "http_403_forbidden": {
+    "error": {
+      "message": "IP 或地区被限制，禁止访问",
+      "type": "access_denied"
+    }
+  },
+  "http_429_rate_limit": {
+    "error": {
+      "message": "请求过于频繁，请稍后再试",
+      "type": "rate_limit_exceeded"
+    }
+  },
+  "http_500_server_error": {
+    "error": {
+      "message": "数据库连接超时",
+      "type": "internal_server_error"
+    }
+  },
+  "turnstile_required": {
+    "success": false,
+    "message": "人机验证未通过或需要交互式验证"
+  }
+}

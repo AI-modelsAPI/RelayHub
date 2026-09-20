@@ -1,0 +1,12 @@
+.git
+.superpowers
+bin
+dist
+*.db
+*.key
+*.bak
+*.diff
+docs
+*.md
+tests
+scripts

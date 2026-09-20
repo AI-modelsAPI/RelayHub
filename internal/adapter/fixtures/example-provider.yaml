@@ -1,0 +1,11 @@
+name: example-provider
+checkin:
+  method: POST
+  path: /api/user/checkin
+  headers:
+    Content-Type: application/json
+  body: '{"type":"daily"}'
+balance:
+  method: GET
+  path: /api/user/quota
+timeout: 10s

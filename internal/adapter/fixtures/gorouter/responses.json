@@ -1,0 +1,43 @@
+{
+  "status_success": {
+    "success": true,
+    "data": {
+      "quota_per_unit": 500000
+    }
+  },
+  "self_success_checked": {
+    "success": true,
+    "data": {
+      "id": 301,
+      "username": "gorouter_user",
+      "quota": 35000000,
+      "used_quota": 1000000,
+      "checked_in": true
+    }
+  },
+  "self_success_not_checked": {
+    "success": true,
+    "data": {
+      "id": 301,
+      "username": "gorouter_user",
+      "quota": 35000000,
+      "used_quota": 1000000,
+      "checked_in": false
+    }
+  },
+  "checkin_status_empty": {
+    "success": true,
+    "data": {
+      "stats": {
+        "checked_in_today": false,
+        "records": []
+      }
+    }
+  },
+  "log_empty": {
+    "success": true,
+    "data": {
+      "items": []
+    }
+  }
+}

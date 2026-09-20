@@ -1,0 +1,24 @@
+{
+  "status_success": {
+    "success": true,
+    "data": {
+      "quota_per_unit": 500000,
+      "turnstile_site_key": "0x4AAAAAAASeekAIKey"
+    }
+  },
+  "self_success": {
+    "success": true,
+    "data": {
+      "id": 401,
+      "username": "seekai_user",
+      "quota": 12000000,
+      "used_quota": 300000
+    }
+  },
+  "refresh_success": {
+    "success": true,
+    "data": {
+      "access_token": "refreshed-seekai-token"
+    }
+  }
+}

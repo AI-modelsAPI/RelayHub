@@ -1,0 +1,30 @@
+name: Tests & Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: Formatting Check
+        run: |
+          test -z "$(gofmt -l cmd internal tests)"
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Unit & Integration Tests (Race)
+        run: go test -race ./... -count=1 -timeout=15m
+
+      - name: Local Smoke Test
+        run: ./scripts/smoke-local.sh

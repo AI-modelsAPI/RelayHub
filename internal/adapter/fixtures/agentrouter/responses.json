@@ -1,0 +1,101 @@
+{
+  "status_success": {
+    "success": true,
+    "data": {
+      "quota_per_unit": 500000
+    }
+  },
+  "self_success": {
+    "success": true,
+    "data": {
+      "user": {
+        "id": 101,
+        "username": "ar_user",
+        "display_name": "AR User",
+        "quota": 10000000,
+        "used_quota": 250000,
+        "aff_quota": 1500000,
+        "checked_in": false
+      }
+    }
+  },
+  "self_success_flat": {
+    "success": true,
+    "data": {
+      "id": 101,
+      "username": "ar_user",
+      "display_name": "AR User",
+      "quota": 10000000,
+      "used_quota": 250000,
+      "aff_quota": 1500000,
+      "checked_in": true
+    }
+  },
+  "checkin_status_checked_today": {
+    "success": true,
+    "data": {
+      "stats": {
+        "checked_in_today": true,
+        "records": [
+          {
+            "checkin_date": "{{TODAY}}",
+            "quota_awarded": 12500000
+          }
+        ]
+      }
+    }
+  },
+  "checkin_status_not_checked": {
+    "success": true,
+    "data": {
+      "stats": {
+        "checked_in_today": false,
+        "records": [
+          {
+            "checkin_date": "{{YESTERDAY}}",
+            "quota_awarded": 12500000
+          }
+        ]
+      }
+    }
+  },
+  "log_bonus_today": {
+    "success": true,
+    "data": {
+      "items": [
+        {
+          "created_at": "{{TODAY}} 09:30:00",
+          "type": 4,
+          "content": "用户签到，获得额度 ＄25.00 额度",
+          "quota": 0
+        }
+      ]
+    }
+  },
+  "log_bonus_yesterday": {
+    "success": true,
+    "data": {
+      "items": [
+        {
+          "created_at": "{{YESTERDAY}} 09:30:00",
+          "type": 4,
+          "content": "用户签到，获得额度 ＄25.00 额度",
+          "quota": 0
+        }
+      ]
+    }
+  },
+  "aff_transfer_success": {
+    "success": true,
+    "message": "划转成功"
+  },
+  "usage_today": {
+    "success": true,
+    "data": {
+      "data": [
+        { "quota": 100000 },
+        { "quota": 150000 }
+      ]
+    }
+  }
+}

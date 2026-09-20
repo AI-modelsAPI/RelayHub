@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# RelayHub runtime state (never commit local data or secrets)
+/relayhub-data/
+*.db
+*.db-wal
+*.db-shm
+*.rhx
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

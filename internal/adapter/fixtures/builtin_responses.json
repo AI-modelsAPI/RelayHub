@@ -1,0 +1,20 @@
+{
+  "new_api": {
+    "self": {
+      "data": {
+        "id": 1,
+        "username": "testuser",
+        "quota": 500000
+      }
+    },
+    "checkin": {
+      "success": true,
+      "message": "签到成功，获得 1000 额度",
+      "reward": "1000"
+    },
+    "already_checked_in": {
+      "success": false,
+      "message": "今日已签到"
+    }
+  }
+}
