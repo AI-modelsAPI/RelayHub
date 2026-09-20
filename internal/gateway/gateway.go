@@ -8,15 +8,20 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"relayhub/internal/auth"
 	"relayhub/internal/domain"
+	"relayhub/internal/guard"
 	"relayhub/internal/health"
+	"relayhub/internal/lab"
+	"relayhub/internal/ratelimit"
 	"relayhub/internal/router"
 	"relayhub/internal/usage"
+	"relayhub/internal/verify"
 )
 
 var (
@@ -54,17 +59,25 @@ type Request struct {
 	Decision router.Decision
 }
 type Response struct {
-	StatusCode int
-	Header     http.Header
-	Body       io.ReadCloser
+	StatusCode      int
+	Header          http.Header
+	Body            io.ReadCloser
+	CredentialKeyID string
+	RetryAfter      time.Duration
 }
 
 // HTTPUpstream is the production HTTP implementation used for compatible
 // OpenAI and Anthropic endpoints.
+type CredentialPick struct {
+	Token string
+	KeyID string
+}
+
 type HTTPUpstream struct {
-	Client       *http.Client
-	Credential   func(context.Context, router.Decision) (string, error)
-	MaxBodyBytes int64
+	Client         *http.Client
+	Credential     func(context.Context, router.Decision) (string, error)
+	PickCredential func(context.Context, router.Decision) (CredentialPick, error)
+	MaxBodyBytes   int64
 }
 
 type boundedReadCloser struct {
@@ -109,22 +122,37 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 	} else {
 		httpReq.Header = make(http.Header)
 	}
-	if u.Credential != nil {
+	var pick CredentialPick
+	if u.PickCredential != nil {
+		var err error
+		pick, err = u.PickCredential(ctx, req.Decision)
+		if err != nil {
+			return Response{}, err
+		}
+	} else if u.Credential != nil {
 		credential, err := u.Credential(ctx, req.Decision)
 		if err != nil {
 			return Response{}, err
 		}
-		if credential != "" {
-			if req.Protocol == "anthropic" || req.Protocol == "anthropic-messages" {
-				httpReq.Header.Set("x-api-key", credential)
-			} else {
-				httpReq.Header.Set("Authorization", "Bearer "+credential)
-			}
+		pick.Token = credential
+	}
+	if pick.Token != "" {
+		if req.Protocol == "anthropic" || req.Protocol == "anthropic-messages" {
+			httpReq.Header.Set("x-api-key", pick.Token)
+		} else {
+			httpReq.Header.Set("Authorization", "Bearer "+pick.Token)
 		}
 	}
 	client := u.Client
 	if client == nil {
 		client = http.DefaultClient
+	}
+	if proxyRaw := strings.TrimSpace(req.Decision.Channel.ProxyURL); proxyRaw != "" {
+		if proxyURL, err := url.Parse(proxyRaw); err == nil && proxyURL.Scheme != "" {
+			cloned := *client
+			cloned.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+			client = &cloned
+		}
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -133,7 +161,13 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 	if u.MaxBodyBytes > 0 {
 		resp.Body = boundedReadCloser{Reader: io.LimitReader(resp.Body, u.MaxBodyBytes), Closer: resp.Body}
 	}
-	return Response{StatusCode: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
+	return Response{
+		StatusCode:      resp.StatusCode,
+		Header:          resp.Header,
+		Body:            resp.Body,
+		CredentialKeyID: pick.KeyID,
+		RetryAfter:      parseRetryAfter(resp.Header),
+	}, nil
 }
 
 // Config controls the local gateway listener handler.
@@ -143,9 +177,14 @@ type Config struct {
 	Auth           *auth.LocalKeyService
 	Recorder       usage.Recorder
 	Health         *health.Registry
+	DisableKey     func(context.Context, string)
 	MaxAttempts    int
 	RequestTimeout time.Duration
 	Now            func() time.Time
+	Limiter        *ratelimit.Limiter
+	Lab            *lab.Ring
+	Guard          *guard.Guard
+	Verify         *verify.Registry
 }
 
 type Handler struct {
@@ -218,10 +257,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, r, http.StatusBadRequest, "client_error", err.Error())
 		return
 	}
-	decision, err := h.cfg.Resolver.Resolve(r.Context(), router.Request{Protocol: protocol, Model: model})
+	if h.cfg.Lab != nil && h.cfg.Lab.Enabled() {
+		h.cfg.Lab.Push(lab.Capture{Model: model, Protocol: protocol, Body: append([]byte(nil), input...)})
+	}
+	tools, vision, reasoning := requestCapabilities(protocol, input)
+	routeReq := router.Request{
+		Protocol: protocol, Model: model,
+		ToolCallRequired: tools, VisionRequired: vision, ReasoningRequired: reasoning,
+		SessionKey: requestSessionKey(r.Header.Get("X-Session-Id"), input),
+	}
+	decision, err := h.cfg.Resolver.Resolve(r.Context(), routeReq)
 	if err != nil {
 		writeGatewayError(w, r, http.StatusBadRequest, classifyResolve(err), err.Error())
 		return
+	}
+	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
+		if _, kid, ok := rr.Sticky.Lookup(routeReq.SessionKey); ok {
+			decision.PreferredKeyID = kid
+		}
 	}
 	upstreamInput, err := transformRequest(protocol, endpoint, input, decision)
 	if err != nil {
@@ -238,7 +291,40 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		upProto, upPath := upstreamEndpointAndProtocol(protocol, endpoint, decision)
+		limKey := last.CredentialKeyID
+		if limKey == "" {
+			limKey = decision.Channel.ID
+		}
+		if wait := h.cfg.Limiter.Wait(limKey); wait > 0 && wait <= 2*time.Second {
+			timer := time.NewTimer(wait)
+			select {
+			case <-r.Context().Done():
+				timer.Stop()
+				writeGatewayError(w, r, http.StatusRequestTimeout, "timeout", "request canceled")
+				return
+			case <-timer.C:
+			}
+		} else if wait > 2*time.Second {
+			if resolver, ok := h.cfg.Resolver.(excludingResolver); ok {
+				if next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted); resolveErr == nil {
+					decision = next
+					attempted[decision.Channel.ID] = true
+					upstreamInput, err = transformRequest(protocol, endpoint, input, decision)
+					if err != nil {
+						break
+					}
+					continue
+				}
+			}
+		}
 		last, lastErr = h.cfg.Upstream.Do(r.Context(), Request{Protocol: upProto, Path: upPath, Headers: requestHeaders(r, upProto, stream, decision), Body: upstreamInput, Stream: stream, Decision: decision})
+		if lastErr == nil {
+			obsKey := last.CredentialKeyID
+			if obsKey == "" {
+				obsKey = decision.Channel.ID
+			}
+			h.cfg.Limiter.Observe(obsKey, last.StatusCode, last.RetryAfter, last.Header)
+		}
 		if lastErr != nil {
 			if !retryableNetwork(lastErr) || attempt+1 == h.cfg.MaxAttempts {
 				break
@@ -247,7 +333,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
 			}
 			if resolver, ok := h.cfg.Resolver.(excludingResolver); ok {
-				next, resolveErr := resolver.ResolveExcluding(r.Context(), router.Request{Protocol: protocol, Model: model}, attempted)
+				next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted)
 				if resolveErr != nil {
 					break
 				}
@@ -260,6 +346,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		if last.StatusCode == 401 && h.cfg.DisableKey != nil && last.CredentialKeyID != "" {
+			h.cfg.DisableKey(r.Context(), last.CredentialKeyID)
+		}
+		if last.StatusCode == 429 && last.RetryAfter > 0 && last.RetryAfter <= 2*time.Second && attempt+1 < h.cfg.MaxAttempts {
+			if last.Body != nil {
+				_ = last.Body.Close()
+			}
+			timer := time.NewTimer(last.RetryAfter)
+			select {
+			case <-r.Context().Done():
+				timer.Stop()
+				writeGatewayError(w, r, http.StatusRequestTimeout, "timeout", "request canceled")
+				return
+			case <-timer.C:
+			}
+			continue
+		}
 		if retryableStatus(last.StatusCode) && attempt+1 < h.cfg.MaxAttempts {
 			if last.Body != nil {
 				_ = last.Body.Close()
@@ -268,7 +371,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
 			}
 			if resolver, ok := h.cfg.Resolver.(excludingResolver); ok {
-				next, resolveErr := resolver.ResolveExcluding(r.Context(), router.Request{Protocol: protocol, Model: model}, attempted)
+				next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted)
 				if resolveErr != nil {
 					break
 				}
@@ -302,13 +405,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Health != nil {
 		h.cfg.Health.RecordSuccess(decision.Channel.ID, 0, 1)
 	}
+	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
+		rr.Sticky.Remember(routeReq.SessionKey, decision.Channel.ID, last.CredentialKeyID)
+	}
 	startReq := time.Now()
 	if stream {
-		events, err := writeSSE(w, last.Body, protocol)
+		upProto := normalizeProtocol(decision.ProviderModel.Protocol)
+		meta, err := writeSSE(w, last.Body, protocol, upProto, decision.Model.ID)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return
 		}
-		h.record(r, protocol, decision, events, http.StatusOK, time.Since(startReq).Milliseconds())
+		rec := recordFor(r, protocol, decision, nil, http.StatusOK, h.cfg.Now())
+		rec.LatencyMS = int(time.Since(startReq).Milliseconds())
+		rec.TTFTMS = meta.TTFTMS
+		rec.InputTokens = meta.InputTokens
+		rec.OutputTokens = meta.OutputTokens
+		rec.CacheReadTokens = meta.CacheReadTokens
+		rec.CacheWriteTokens = meta.CacheWriteTokens
+		rec.FinishReason = meta.FinishReason
+		if meta.UpstreamModel != "" {
+			rec.UpstreamModel = meta.UpstreamModel
+		}
+		if h.cfg.Verify != nil {
+			h.cfg.Verify.Observe(rec)
+		}
+		if h.cfg.Recorder != nil {
+			_ = h.cfg.Recorder.Record(r.Context(), rec)
+		}
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(last.Body, 16<<20))
@@ -328,9 +451,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) record(r *http.Request, protocol string, decision router.Decision, body []byte, status int, latencyMS int64) {
+	rec := recordFor(r, protocol, decision, body, status, h.cfg.Now())
+	rec.LatencyMS = int(latencyMS)
+	if h.cfg.Verify != nil {
+		h.cfg.Verify.Observe(rec)
+	}
 	if h.cfg.Recorder != nil {
-		rec := recordFor(r, protocol, decision, body, status, h.cfg.Now())
-		rec.LatencyMS = int(latencyMS)
 		_ = h.cfg.Recorder.Record(r.Context(), rec)
 	}
 }
@@ -387,6 +513,26 @@ func retryableStatus(status int) bool {
 }
 func retryableNetwork(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+func parseRetryAfter(h http.Header) time.Duration {
+	if h == nil {
+		return 0
+	}
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 func classifyResolve(err error) string {
 	if errors.Is(err, router.ErrModelNotFound) {

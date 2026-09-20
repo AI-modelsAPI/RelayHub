@@ -100,6 +100,20 @@ func (s *Syncer) Preview(ctx context.Context, desired clisync.DesiredState) (cli
 		changedKeys = append(changedKeys, "env.ANTHROPIC_DEFAULT_SONNET_MODEL")
 	}
 
+	mcp, _ := current["mcpServers"].(map[string]interface{})
+	if mcp == nil {
+		mcp = map[string]interface{}{}
+		current["mcpServers"] = mcp
+	}
+	if _, ok := mcp["relayhub"]; !ok {
+		mcp["relayhub"] = map[string]interface{}{
+			"command": "relayhub",
+			"args":    []string{"mcp"},
+			"env":     map[string]interface{}{"RELAYHUB_MGMT": s.endpoint()},
+		}
+		changedKeys = append(changedKeys, "mcpServers.relayhub")
+	}
+
 	newBytes, err := json.MarshalIndent(current, "", "  ")
 	if err != nil {
 		return clisync.Diff{}, err

@@ -3,309 +3,215 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RelayHub Console</title>
+  <title>RelayHub</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="app-container">
-    <header class="cmd-bar">
-      <div class="brand">
-        <span class="brand-mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span>
-        <span class="brand-name">RELAYHUB</span>
+  <div class="os">
+    <header class="titlebar" data-tauri-drag-region>
+      <div class="traffic">
+        <span class="tl close"></span>
+        <span class="tl min"></span>
+        <span class="tl max"></span>
       </div>
-      <nav class="nav-list" id="nav-list">
-        <a href="#/overview" class="nav-item active" data-nav="overview" data-i18n="nav_overview">概览</a>
-        <a href="#/channels" class="nav-item" data-nav="channels" data-i18n="nav_channels">渠道</a>
-        <a href="#/models" class="nav-item" data-nav="models" data-i18n="nav_models">模型</a>
-        <a href="#/checkin" class="nav-item" data-nav="checkin" data-i18n="nav_checkin">签到</a>
-        <a href="#/usage" class="nav-item" data-nav="usage" data-i18n="nav_usage">用量</a>
-        <a href="#/cli-sync" class="nav-item" data-nav="cli-sync" data-i18n="nav_cli">CLI 同步</a>
-        <a href="#/logs" class="nav-item" data-nav="logs" data-i18n="nav_logs">日志</a>
-        <a href="#/settings" class="nav-item" data-nav="settings" data-i18n="nav_settings">设置</a>
-      </nav>
-      <div class="cmd-status">
-        <span class="sb-metric" id="sb-tps" title="Output tokens per second">-- t/s</span>
-        <span class="status-pill"><span class="status-dot" id="sb-dot"></span><span id="sb-status-text" data-i18n="core_running">运行中</span></span>
-        <button id="sb-restart-btn" class="sb-btn" style="display:none;" data-i18n="sb_restart">重启</button>
+      <div class="title-cluster">
+        <span class="wordmark">RelayHub</span>
+        <span class="sep"></span>
+        <button class="cmd" id="cmd-open" type="button">
+          <kbd>⌘K</kbd>
+          <span>搜索渠道、模型、请求…</span>
+        </button>
+      </div>
+      <div class="title-right">
+        <span class="live" id="core-live"><i></i> Core</span>
       </div>
     </header>
 
-    <main class="main-content">
-      <header class="topbar">
-        <span class="topbar-title" id="page-title">概览</span>
-      </header>
+    <div class="workspace">
+      <nav class="rail" aria-label="主导航">
+        <button class="rail-btn on" data-view="pulse" title="脉搏">
+          <svg viewBox="0 0 24 24"><path d="M3 12h3l2-6 4 12 2-6h7"/></svg>
+        </button>
+        <button class="rail-btn" data-view="channels" title="渠道">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/></svg>
+        </button>
+        <button class="rail-btn" data-view="models" title="模型">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
+        </button>
+        <button class="rail-btn" data-view="identity" title="身份">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.2"/><path d="M5 19c1.4-3.2 3.8-5 7-5s5.6 1.8 7 5"/></svg>
+        </button>
+        <button class="rail-btn" data-view="checkin" title="签到">
+          <svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M8 3v4M16 3v4M4 10h16"/></svg>
+        </button>
+        <button class="rail-btn" data-view="lab" title="实验室">
+          <svg viewBox="0 0 24 24"><path d="M9 3h6M10 3v7l-5.5 9.2A2 2 0 0 0 6.2 22h11.6a2 2 0 0 0 1.7-2.8L14 10V3"/></svg>
+        </button>
+        <button class="rail-btn" data-view="usage" title="用量">
+          <svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16M8 16v-5M12 16V8M16 16v-3"/></svg>
+        </button>
+        <button class="rail-btn" data-view="agents" title="Agent">
+          <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg>
+        </button>
+        <span class="rail-spacer"></span>
+        <button class="rail-btn" data-view="settings" title="设置">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>
+        </button>
+      </nav>
 
-      
-
-      <div class="content-body">
-        <!-- Overview -->
-        <section id="view-overview" class="view-panel active">
-          <div class="dash">
-            <div class="dash-main">
-              <div class="panel flow-panel">
-                <div class="panel-head"><span class="panel-title" data-i18n="topo_title">实时请求流转</span></div>
-                <div class="flow-track">
-                  <div class="flow-node"><div class="node-box">客户端</div><span class="node-label">Claude Code</span></div>
-                  <div class="flow-line"><div class="flow-orb"></div></div>
-                  <div class="flow-node"><div class="node-box node-core">RelayHub</div><span class="node-label">网关</span></div>
-                  <div class="flow-line"><div class="flow-orb" style="animation-delay:1.2s"></div></div>
-                  <div class="flow-node"><div class="node-box">上游站点</div><span class="node-label" id="flow-upstream-count">—</span></div>
-                </div>
+      <section class="stage" id="stage">
+        <!-- Pulse -->
+        <article class="view on" id="view-pulse">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h">
+                <h1>脉搏</h1>
+                <span class="hint" id="pulse-clock">实时</span>
+              </header>
+              <div class="pulse-hero">
+                <div class="hero-k">今日缓存命中</div>
+                <div class="hero-v" id="pulse-cache">—</div>
+                <div class="hero-sub" id="pulse-saved">等待网关心跳</div>
               </div>
-              <div class="stat-strip">
-                <div class="stat-cell"><span class="stat-label" data-i18n="card_channels">活跃渠道</span><span class="stat-value" id="val-channels-count">0</span></div>
-                <div class="stat-cell"><span class="stat-label" data-i18n="card_models">模型数</span><span class="stat-value" id="val-models-count">0</span></div>
-                <div class="stat-cell"><span class="stat-label" data-i18n="card_uptime">运行时长</span><span class="stat-value" id="val-uptime">0s</span></div>
-              </div>
+              <ol class="feed" id="pulse-feed"></ol>
             </div>
-            <aside class="dash-side">
-              <div class="panel side-panel">
-                <div class="panel-head"><span class="panel-title">快速操作</span></div>
-                <div class="side-actions">
-                  <button id="action-manual-checkin" class="btn btn-primary btn-block" data-i18n="act_checkin_all">立即全站签到</button>
-                  <button id="action-add-channel-quick" class="btn btn-secondary btn-block" data-i18n="act_add_channel">添加渠道</button>
-                </div>
+            <div class="col inspector">
+              <header class="col-h"><h2>拓扑</h2></header>
+              <div class="topo" id="topo">
+                <div class="topo-node">本地 Agent</div>
+                <div class="topo-wire"></div>
+                <div class="topo-node core">RelayHub</div>
+                <div class="topo-wire"></div>
+                <div class="topo-node" id="topo-up">上游</div>
               </div>
-            </aside>
-          </div>
-</section>
-
-        <!-- Channels: full-width list + slide-in editor -->
-        <section id="view-channels" class="view-panel">
-          <div class="ch-workspace" id="ch-workspace">
-            <div class="ch-list-pane" id="ch-list-pane">
-              <div class="toolbar">
-                <input id="ch-search" class="form-input" placeholder="搜索…">
-                <select id="ch-filter-status" class="form-input"><option value="" data-i18n="f_all_status">全部</option><option value="enabled" data-i18n="f_enabled">启用</option><option value="disabled" data-i18n="f_disabled">停用</option></select>
-                <span style="flex:1;"></span>
-                <span id="ch-selected-count" class="sel-count" aria-live="polite">已选渠道: 0</span>
-                <button class="btn btn-secondary" onclick="bulkChannelAction('enable')" data-i18n="bulk_enable">启用</button>
-                <button class="btn btn-secondary" onclick="bulkChannelAction('disable')" data-i18n="bulk_disable">停用</button>
-                <button class="btn btn-secondary" onclick="bulkChannelAction('archive')" data-i18n="bulk_archive">归档</button>
-                <button class="btn btn-danger" onclick="bulkChannelAction('delete')" data-i18n="bulk_delete">删除</button>
-                <button id="btn-new-channel" class="btn btn-primary" data-i18n="act_add_channel">添加渠道</button>
-              </div>
-              <div class="data-table-container table-fill">
-                <table class="data-table">
-                  <thead><tr><th><input id="ch-select-all" type="checkbox" aria-label="全选当前筛选结果" disabled></th><th data-i18n="th_name">名称</th><th data-i18n="th_type">类型</th><th data-i18n="th_status">状态</th><th data-i18n="th_models">模型</th><th data-i18n="th_tags">标签</th><th data-i18n="th_health">健康</th><th data-i18n="th_actions">操作</th></tr></thead>
-                  <tbody id="channels-table-rows"><tr><td colspan="8" class="empty-cell" data-i18n="msg_no_channels">暂无渠道</td></tr></tbody>
-                </table>
-              </div>
-            </div>
-            <div class="ch-edit-pane" id="ch-edit-pane">
-              <div class="ch-edit-header">
-                <button id="btn-ch-back" class="btn-link-back" data-i18n="btn_back">← 返回</button>
-                <h3 id="ch-edit-title" data-i18n="new_channel">新建渠道</h3>
-                <span class="ch-edit-spacer"></span>
-                <button id="btn-ch-save" class="btn btn-primary" data-i18n="btn_save">保存</button>
-              </div>
-              <div class="ch-edit-body" id="ch-edit-body"></div>
+              <div class="metric-grid" id="pulse-metrics"></div>
+              <header class="col-h tight"><h2>信任最低</h2></header>
+              <ul class="quiet-list" id="pulse-trust"></ul>
             </div>
           </div>
-</section>
+        </article>
 
-        <!-- Models: Master-Detail -->
-        <section id="view-models" class="view-panel">
-          <div class="action-bar">
-            <h2 class="view-title" data-i18n="nav_models">模型</h2>
-            <input id="md-search" class="form-input" placeholder="搜索模型…" style="width:200px;">
-            <button id="btn-new-model" class="btn btn-primary" data-i18n="act_add_model">新建模型</button>
-          </div>
-          <div class="master-detail">
-            <div class="master-list" id="model-list"></div>
-            <div class="detail-pane" id="model-detail">
-              <div style="color:var(--text-secondary);padding:60px 0;text-align:center;width:100%;" data-i18n="msg_select_model">选择左侧模型查看绑定详情</div>
+        <!-- Channels -->
+        <article class="view" id="view-channels">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h">
+                <h1>渠道</h1>
+                <button class="ghost" id="ch-new" type="button">新建</button>
+              </header>
+              <input class="search" id="ch-q" placeholder="过滤名称 / 标签 / 上游">
+              <ul class="rows" id="ch-rows"></ul>
+            </div>
+            <div class="col inspector" id="ch-ins">
+              <div class="empty">选一条渠道。Inspector 展示健康、密钥、身份、信任证据。</div>
             </div>
           </div>
-        </section>
+        </article>
 
-        <!-- Checkin -->
-        <section id="view-checkin" class="view-panel">
-          <div class="toolbar">
-            <h2 class="view-title" data-i18n="nav_checkin">签到记录</h2>
-            <button id="btn-trigger-checkin-now" class="btn btn-primary" data-i18n="act_checkin_all">立即签到</button>
+        <!-- Models -->
+        <article class="view" id="view-models">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h"><h1>模型</h1><button class="ghost" id="md-new" type="button">新建</button></header>
+              <ul class="rows" id="md-rows"></ul>
+            </div>
+            <div class="col inspector" id="md-ins"><div class="empty">选择逻辑模型，查看绑定与能力。</div></div>
           </div>
-          <div class="panel stream-panel">
-            <table class="data-table stream-table">
-              <thead><tr><th>渠道</th><th>时间</th><th>奖励</th><th>结果</th><th>详情</th></tr></thead>
-              <tbody id="checkin-table-rows"><tr><td colspan="5" class="empty-cell">暂无记录</td></tr></tbody>
-            </table>
+        </article>
+
+        <!-- Identity -->
+        <article class="view" id="view-identity">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h"><h1>身份束</h1></header>
+              <p class="lede">签到浏览器、声明式签到、网关上游、健康探测共用同一出口 / UA / 时区。</p>
+              <ul class="rows" id="id-rows"></ul>
+            </div>
+            <div class="col inspector" id="id-ins"><div class="empty">每条渠道一张身份卡。</div></div>
           </div>
-</section>
+        </article>
+
+        <!-- Check-in -->
+        <article class="view" id="view-checkin">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h"><h1>签到</h1><button class="ghost" id="ck-now" type="button">立即全站</button></header>
+              <ul class="rows" id="ck-rows"></ul>
+            </div>
+            <div class="col inspector" id="ck-ins"><div class="empty">签到时间线与浏览器会话。</div></div>
+          </div>
+        </article>
+
+        <!-- Lab -->
+        <article class="view" id="view-lab">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h"><h1>实验室</h1></header>
+              <div class="seg" id="lab-seg">
+                <button class="on" data-lab="replay" type="button">回放</button>
+                <button data-lab="probe" type="button">探针</button>
+                <button data-lab="hedge" type="button">对冲</button>
+              </div>
+              <ul class="rows" id="lab-rows"></ul>
+            </div>
+            <div class="col inspector" id="lab-ins"><div class="empty">捕获的请求可扇出到多渠道对比。</div></div>
+          </div>
+        </article>
 
         <!-- Usage -->
-        <section id="view-usage" class="view-panel">
-          <div class="toolbar"><h2 class="view-title" data-i18n="nav_usage">用量</h2></div>
-          <div class="stat-strip">
-            <div class="stat-cell"><span class="stat-label">总请求</span><span class="stat-value" id="stat-total-reqs">0</span></div>
-            <div class="stat-cell"><span class="stat-label">成功率</span><span class="stat-value" id="stat-success-rate">100.0%</span></div>
-            <div class="stat-cell"><span class="stat-label">Tokens</span><span class="stat-value" id="stat-total-tokens">0</span></div>
-            <div class="stat-cell"><span class="stat-label">平均延迟</span><span class="stat-value" id="stat-avg-latency">0 ms</span></div>
-          </div>
-          <div class="panel">
-            <div class="panel-head"><span class="panel-title">请求明细</span></div>
-            <table class="data-table">
-              <thead><tr><th>Request</th><th>模型</th><th>渠道</th><th>耗时</th><th>Tokens</th><th>状态</th></tr></thead>
-              <tbody id="usage-table-rows"><tr><td colspan="6" class="empty-cell">暂无请求</td></tr></tbody>
-            </table>
-          </div>
-</section>
-
-        <!-- CLI Sync -->
-        <section id="view-cli-sync" class="view-panel">
-          <div class="action-bar">
-            <h2 class="view-title" data-i18n="nav_cli">CLI 同步</h2>
-            <button class="btn btn-secondary" onclick="loadCLISync()"><span data-i18n="btn_refresh">刷新</span></button>
-          </div>
-          <div class="card-grid" id="cli-sync-cards">
-            <div class="metric-card"><span class="metric-label" data-i18n="cli_loading">正在检测…</span></div>
-          </div>
-
-          <div class="form-card">
-            <h3 style="margin:0 0 12px;font-size:1rem;" data-i18n="cli_history">同步历史</h3>
-            <div class="data-table-container">
-              <table class="data-table">
-                <thead><tr><th data-i18n="th_time">时间</th><th>CLI</th><th data-i18n="th_status">状态</th><th data-i18n="th_path">配置路径</th></tr></thead>
-                <tbody id="cli-sync-history"><tr><td colspan="4" style="text-align:center;color:var(--text-muted);" data-i18n="cli_no_history">暂无同步记录</td></tr></tbody>
-              </table>
+        <article class="view" id="view-usage">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h"><h1>用量</h1></header>
+              <div class="metric-grid" id="usage-metrics"></div>
+              <ul class="rows" id="usage-rows"></ul>
             </div>
+            <div class="col inspector" id="usage-ins"><div class="empty">单次请求的路由解释。</div></div>
           </div>
+        </article>
 
-          <!-- Import / Export -->
-          <div class="form-card">
-            <h3 style="margin:0 0 12px;font-size:1rem;" data-i18n="io_title">配置导入 / 导出</h3>
-            <div class="form-grid">
-              <div class="fld">
-                <label data-i18n="io_password">密码（导出/导入凭据时必填）</label>
-                <input type="password" id="io-password" class="form-input" autocomplete="new-password" placeholder="••••••••">
-              </div>
-              <div class="fld">
-                <label data-i18n="io_policy">冲突策略</label>
-                <select id="io-policy" class="form-input">
-                  <option value="skip" data-i18n="io_skip">跳过已存在</option>
-                  <option value="overwrite" data-i18n="io_overwrite">覆盖已存在</option>
-                </select>
-              </div>
-              <div class="fld full-width">
-                <label><input type="checkbox" id="io-include-secrets"> <span data-i18n="io_include">包含凭据（加密存放于导出文件中）</span></label>
-              </div>
-              <div class="fld full-width">
-                <label data-i18n="io_package">配置包（导出后显示在此；导入时粘贴到此）</label>
-                <textarea id="io-package" class="form-input" spellcheck="false" placeholder='{"manifest":…}'></textarea>
-              </div>
+        <!-- Agents -->
+        <article class="view" id="view-agents">
+          <div class="split">
+            <div class="col list-col">
+              <header class="col-h"><h1>Agent</h1></header>
+              <ul class="rows" id="ag-rows"></ul>
             </div>
-            <div class="form-row">
-              <button class="btn btn-secondary" onclick="doExport()"><span data-i18n="io_btn_export">导出配置</span></button>
-              <button class="btn btn-secondary" onclick="doImportPreview()"><span data-i18n="io_btn_preview">预览导入</span></button>
-              <button class="btn btn-primary" id="io-apply-btn" onclick="doImportApply()" disabled><span data-i18n="io_btn_apply">确认导入</span></button>
-            </div>
-            <pre id="io-result" style="display:none;margin:12px 0 0;padding:12px;background:var(--bg-canvas-2);border-radius:8px;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto;"></pre>
+            <div class="col inspector" id="ag-ins"><div class="empty">CLI 同步 diff 与 MCP 工具列表。</div></div>
           </div>
-        </section>
-
-        <!-- CLI sync preview: full-page takeover view (no popup/modal) -->
-        <section id="view-diff" class="view-panel diff-view">
-          <div class="page-head">
-            <button class="btn-link-back" onclick="closeCLIDiff()">← <span data-i18n="btn_back">返回</span></button>
-            <h3 id="cli-diff-title" class="page-head-title">同步预览</h3>
-            <div style="flex:1"></div>
-            <button class="btn btn-secondary" onclick="closeCLIDiff()" data-i18n="btn_cancel">取消</button>
-            <button class="btn btn-primary" id="cli-diff-apply"><span data-i18n="diff_confirm">确认写入</span></button>
-          </div>
-          <p id="cli-diff-summary" class="diff-summary"></p>
-          <div class="diff-cols diff-cols-full">
-            <div class="diff-pane">
-              <div class="diff-col-label" data-i18n="diff_before">当前内容</div>
-              <pre id="cli-diff-old"></pre>
-            </div>
-            <div class="diff-pane">
-              <div class="diff-col-label" data-i18n="diff_after">同步后内容</div>
-              <pre id="cli-diff-new"></pre>
-            </div>
-          </div>
-        </section>
-
-        <!-- Logs -->
-        <section id="view-logs" class="view-panel">
-          <div class="toolbar">
-            <h2 class="view-title" data-i18n="nav_logs">服务日志</h2>
-            <span style="flex:1"></span>
-            <button class="btn btn-secondary" onclick="loadLogs()"><span data-i18n="btn_refresh">刷新</span></button>
-          </div>
-          <div class="panel term-panel">
-            <table class="data-table term-table">
-              <thead><tr><th style="width:180px;">时间</th><th style="width:80px;">级别</th><th style="width:200px;">事件</th><th>详情</th></tr></thead>
-              <tbody id="logs-table-rows"><tr><td colspan="4" class="empty-cell">暂无日志</td></tr></tbody>
-            </table>
-          </div>
-</section>
+        </article>
 
         <!-- Settings -->
-        <section id="view-settings" class="view-panel">
-          <div class="action-bar"><h2 class="view-title" data-i18n="nav_settings">设置</h2></div>
+        <article class="view" id="view-settings">
+          <div class="settings-sheet">
+            <h1>设置</h1>
+            <dl class="sheet">
+              <div><dt>Gateway</dt><dd id="set-gw">127.0.0.1:8789</dd></div>
+              <div><dt>HTTP 代理</dt><dd>127.0.0.1:8787</dd></div>
+              <div><dt>SOCKS5</dt><dd>127.0.0.1:8788</dd></div>
+              <div><dt>管理面</dt><dd>127.0.0.1:8790</dd></div>
+            </dl>
+            <p class="lede">桌面壳负责启停 Core、钥匙串、开机启动。本窗口是壳内唯一界面，不再提供浏览器后台管理页。</p>
+          </div>
+        </article>
+      </section>
+    </div>
 
-          <!-- Gateway access: the endpoint + local key a user points their client at -->
-          <div class="form-card">
-            <div class="settings-section-title" data-i18n="set_access">接入信息（把它填进你的 AI 客户端）</div>
-            <div class="form-row">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_gw_base">Base URL</span>
-              <code id="gw-base-url" style="font-family:ui-monospace,Menlo,monospace;font-size:13px;">http://127.0.0.1:8789/v1</code>
-              <button class="btn btn-secondary" style="margin-left:8px;padding:3px 12px;font-size:12px;" onclick="copyText('gw-base-url')" data-i18n="btn_copy">复制</button>
-            </div>
-            <div class="form-row" style="align-items:flex-start;">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_gw_keys">访问密钥</span>
-              <div style="flex:1;">
-                <div id="gw-keys-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px;"></div>
-                <button class="btn btn-primary" style="padding:4px 14px;font-size:12px;" onclick="mintGatewayKey()" data-i18n="btn_new_key">生成新密钥</button>
-                <span style="color:var(--text-muted);font-size:12px;margin-left:8px;" data-i18n="gw_key_hint">密钥只在生成时完整显示一次，请立即复制保存</span>
-              </div>
-            </div>
-          </div>
-
-          <div class="form-card">
-            <div class="settings-section-title" data-i18n="set_general">通用</div>
-            <div class="form-row">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_language">界面语言</span>
-              <select id="settings-lang" class="form-input" style="width:200px;">
-                <option value="zh">简体中文</option>
-                <option value="en">English</option>
-              </select>
-            </div>
-          </div>
-          <div class="form-card">
-            <div class="settings-section-title" data-i18n="set_browser">浏览器运行时 (签到/Turnstile)</div>
-            <div class="form-row">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_browser_status">状态</span>
-              <span id="set-browser-status" class="badge badge-neutral">--</span>
-            </div>
-            <div class="form-row">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_browser_tier">运行时级别</span>
-              <span id="set-browser-tier" class="badge badge-neutral">--</span>
-            </div>
-            <div class="form-row">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_browser_path">浏览器路径</span>
-              <span id="set-browser-path" style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;word-break:break-all;color:var(--text-primary);">--</span>
-            </div>
-            <div class="form-row">
-              <span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;" data-i18n="set_browser_version">版本</span>
-              <span id="set-browser-version" style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--text-primary);">--</span>
-            </div>
-          </div>
-          <div class="form-card">
-            <div class="settings-section-title" data-i18n="set_network">服务端口</div>
-            <div class="form-row"><span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;">HTTP 代理</span><span class="badge badge-neutral">127.0.0.1:8787</span></div>
-            <div class="form-row"><span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;">SOCKS5</span><span class="badge badge-neutral">127.0.0.1:8788</span></div>
-            <div class="form-row"><span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;">AI Gateway</span><span class="badge badge-neutral">127.0.0.1:8789</span></div>
-            <div class="form-row"><span style="color:var(--text-secondary);width:160px;font-size:13.5px;font-weight:500;">管理面板</span><span class="badge badge-neutral">127.0.0.1:8790</span></div>
-          </div>
-        </section>
-      </div>
-
-      <!-- Bottom status bar -->
-      
-    </main>
+    <footer class="statusbar">
+      <span id="sb-gw">gw :8789</span>
+      <span class="dot">·</span>
+      <span id="sb-cache">cache —</span>
+      <span class="dot">·</span>
+      <span id="sb-trust">trust —</span>
+      <span class="grow"></span>
+      <span id="sb-hint">本地优先 · 上游不可信</span>
+    </footer>
   </div>
-  <div id="toast"></div>
+
+  <div class="palette" id="palette" hidden>
+    <input id="palette-q" placeholder="跳转或执行…" autocomplete="off">
+    <ul id="palette-list"></ul>
+  </div>
   <script src="app.js"></script>
 </body>
 </html>

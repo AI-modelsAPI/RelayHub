@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"relayhub/internal/affinity"
 	"relayhub/internal/domain"
 	"relayhub/internal/health"
 )
@@ -17,6 +18,7 @@ type Request struct {
 	Protocol, Model   string
 	Now               time.Time
 	Source            uint64
+	SessionKey        string
 	ToolCallRequired  bool
 	VisionRequired    bool
 	ReasoningRequired bool
@@ -29,14 +31,15 @@ type Candidate struct {
 	Priority      int
 }
 type Decision struct {
-	Candidate     Candidate
-	Model         domain.Model
-	ProviderModel domain.ProviderModel
-	Channel       domain.Channel
-	Transform     domain.ProviderModel
-	Excluded      map[string]string
-	Route         domain.Route
-	Strategy      string
+	Candidate      Candidate
+	Model          domain.Model
+	ProviderModel  domain.ProviderModel
+	Channel        domain.Channel
+	Transform      domain.ProviderModel
+	Excluded       map[string]string
+	Route          domain.Route
+	Strategy       string
+	PreferredKeyID string
 }
 type Resolver struct {
 	state          *resolverState
@@ -51,6 +54,7 @@ type Resolver struct {
 	Strategy       string
 	FixedChannel   string
 	Rand           RandomSource
+	Sticky         *affinity.Table
 }
 
 type resolverState struct {
@@ -117,6 +121,7 @@ func (r Resolver) snapshot() Resolver {
 			Strategy:       r.Strategy,
 			FixedChannel:   r.FixedChannel,
 			Rand:           r.Rand,
+			Sticky:         r.Sticky,
 		}
 	}
 	return Resolver{
@@ -131,6 +136,7 @@ func (r Resolver) snapshot() Resolver {
 		Strategy:       r.Strategy,
 		FixedChannel:   r.FixedChannel,
 		Rand:           r.Rand,
+		Sticky:         r.Sticky,
 	}
 }
 
@@ -239,6 +245,16 @@ func (r Resolver) resolve(ctx context.Context, req Request, excluded map[string]
 		return d, fmt.Errorf("%w: %s", ErrNoCandidates, exclusionSummary(d.Excluded))
 	}
 	chosen := selectCandidate(candidates, d.Strategy, r.FixedChannel, r.Health, r.Rand, req.Source)
+	if req.SessionKey != "" && r.Sticky != nil {
+		if chID, _, ok := r.Sticky.Lookup(req.SessionKey); ok {
+			for _, c := range candidates {
+				if c.Channel.ID == chID {
+					chosen = c
+					break
+				}
+			}
+		}
+	}
 	d.Candidate, d.ProviderModel, d.Channel, d.Transform = chosen, chosen.ProviderModel, chosen.Channel, chosen.ProviderModel
 	return d, nil
 }

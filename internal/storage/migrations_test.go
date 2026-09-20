@@ -117,6 +117,39 @@ func TestMigration003NormalizesExistingProtocols(t *testing.T) {
 	}
 }
 
+func TestMigration008AddsRequestMetaColumns(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err = d.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("008 sql len=%d", len(requestRecordMeta))
+	rows, err := d.Query(`PRAGMA table_info(request_records)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		cols[name] = true
+	}
+	for _, c := range []string{"ttft_ms", "cache_read_tokens", "finish_reason", "upstream_model"} {
+		if !cols[c] {
+			t.Fatalf("missing column %s in %#v", c, cols)
+		}
+	}
+}
+
 func TestSchemaContainsRequiredTablesAndIndexes(t *testing.T) {
 	d, err := Open(filepath.Join(t.TempDir(), "relay.db"))
 	if err != nil {

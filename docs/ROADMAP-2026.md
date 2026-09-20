@@ -1,5 +1,8 @@
 # RelayHub 产品规划书（独立评审版）
 
+> **2026-09-20 续**：执行计划与 UI 规范见 `docs/dev/PLAN-2026-09-20.md`、`docs/ui/desktop-paradigm.md`。差异化提案见 `docs/proposals/2026-09-20-differentiation.md`。下文「路由只有 weighted/RR」已过时（selector 已有 fixed/latency/success-rate/quota-aware）。旧 Web Console 已删除。
+
+
 > 评审日期：2026-09-20 · 评审方式：**仅读代码**（internal/ 131 个 Go 文件、19.5k 行、web/、tests/、Makefile），不参考任何现有文档或历史计划。
 > 本文目的是跳出"补完 AxonHub 复刻"的思维，从"这是个什么产品、缺什么、能独有什 么"重新审视。
 
@@ -28,7 +31,7 @@ RelayHub = **本地优先的 AI 网关 + 渠道养号农场**。
 
 | 模块 | 现状 | 评价 |
 |---|---|---|
-| `internal/router` | 协议+模型匹配、组（含 fallback 组）、priority/weight、health 感知选择 | 核心扎实，但策略只有 weighted/RR |
+| `internal/router` | 协议+模型匹配、组（含 fallback 组）、priority/weight、health 感知选择 | 策略已有 fixed / latency / success-rate / quota-aware / weighted / RR / random；会话粘性见 affinity |
 | `internal/gateway` | openai + anthropic 双协议、跨协议转换、SSE、自定义头 | 完整，是可用网关 |
 | `internal/proxy` | HTTP + SOCKS5 代理（本机出站/入站） | 超出同类，利于抗封 |
 | `internal/checkin` | 定时签到、随机抖动、退避、人工兜底（turnstile）、自动模型同步 | 独有，半成品 |

@@ -14,7 +14,7 @@ import (
 
 func TestSSEValidationRejectsMalformedEvent(t *testing.T) {
 	w := httptest.NewRecorder()
-	_, err := writeSSE(w, strings.NewReader("data: not-json\n\n"), "openai")
+	_, err := writeSSE(w, strings.NewReader("data: not-json\n\n"), "openai-chat", "openai-chat", "m")
 	if err == nil || w.Code != http.StatusOK {
 		t.Fatalf("err=%v code=%d", err, w.Code)
 	}

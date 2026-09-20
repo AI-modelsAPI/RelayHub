@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -205,6 +204,9 @@ func transformAnthropicToOpenAIRequest(src map[string]any, model string) ([]byte
 	if stopSeq, ok := src["stop_sequences"]; ok {
 		dst["stop"] = stopSeq
 	}
+	if cc, ok := src["cache_control"]; ok {
+		dst["cache_control"] = cc
+	}
 
 	// 4. Tools & tool_choice
 	if tools, ok := src["tools"].([]any); ok && len(tools) > 0 {
@@ -349,6 +351,9 @@ func transformOpenAIToAnthropicRequest(src map[string]any, model string) ([]byte
 	}
 	if stream, ok := src["stream"]; ok {
 		dst["stream"] = stream
+	}
+	if cc, ok := src["cache_control"]; ok {
+		dst["cache_control"] = cc
 	}
 	if stop, ok := src["stop"]; ok {
 		if stopStr, ok := stop.(string); ok {
@@ -649,41 +654,13 @@ func classifyHTTPStatus(status int) string {
 	}
 }
 
-func writeSSE(w http.ResponseWriter, body io.Reader, protocol string) ([]byte, error) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 4096), 4<<20)
-	var captured bytes.Buffer
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if bytes.HasPrefix(line, []byte("data: ")) {
-			payload := bytes.TrimSpace(line[6:])
-			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) && !json.Valid(payload) {
-				return captured.Bytes(), errors.New("malformed upstream SSE event")
-			}
-		}
-		lineOut := append(append([]byte(nil), line...), '\n')
-		captured.Write(lineOut)
-		if _, err := w.Write(lineOut); err != nil {
-			return captured.Bytes(), err
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-	return captured.Bytes(), scanner.Err()
-}
-
 func recordFor(r *http.Request, protocol string, decision router.Decision, body []byte, status int, now time.Time) (record usage.RequestRecord) {
 	record.ID = fmt.Sprintf("rec-%d", now.UnixNano())
 	record.RequestID = r.Header.Get("X-Request-ID")
 	record.Protocol, record.ModelID = protocol, decision.Model.ID
 	record.ProviderID, record.ChannelID = decision.ProviderModel.ProviderID, decision.Channel.ID
 	record.StatusCode, record.CreatedAt = status, now.UTC()
+	record.UpstreamModel = decision.ProviderModel.UpstreamModelName
 	if status >= 400 {
 		if status == 429 {
 			record.ErrorClass = "rate_limited"
@@ -694,16 +671,39 @@ func recordFor(r *http.Request, protocol string, decision router.Decision, body 
 		}
 	}
 	var obj struct {
+		Model string `json:"model"`
 		Usage struct {
-			PromptTokens     int `json:"prompt_tokens"`
-			CompletionTokens int `json:"completion_tokens"`
-			InputTokens      int `json:"input_tokens"`
-			OutputTokens     int `json:"output_tokens"`
+			PromptTokens             int `json:"prompt_tokens"`
+			CompletionTokens         int `json:"completion_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			PromptTokensDetails      struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
+		StopReason string `json:"stop_reason"`
+		Choices    []struct {
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
 	}
 	if json.Unmarshal(body, &obj) == nil {
 		record.InputTokens = obj.Usage.PromptTokens + obj.Usage.InputTokens
 		record.OutputTokens = obj.Usage.CompletionTokens + obj.Usage.OutputTokens
+		record.CacheReadTokens = obj.Usage.CacheReadInputTokens
+		if obj.Usage.PromptTokensDetails.CachedTokens > 0 {
+			record.CacheReadTokens = obj.Usage.PromptTokensDetails.CachedTokens
+		}
+		record.CacheWriteTokens = obj.Usage.CacheCreationInputTokens
+		if obj.Model != "" {
+			record.UpstreamModel = obj.Model
+		}
+		if obj.StopReason != "" {
+			record.FinishReason = obj.StopReason
+		} else if len(obj.Choices) > 0 {
+			record.FinishReason = obj.Choices[0].FinishReason
+		}
 	}
 	return record
 }

@@ -5,7 +5,7 @@ RelayHub is a local-first AI gateway, transparent proxy, and check-in aggregator
 ```text
 ┌────────────────────────────────────────────────────────────┐
 │                    Local Control Plane                     │
-│           Web UI (127.0.0.1:8790) / macOS Menu Bar         │
+│     Desktop shell (icon rail + inspector) / macOS menu bar │
 └─────────────────────────────┬──────────────────────────────┘
                               │
 ┌─────────────────────────────▼──────────────────────────────┐

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"relayhub/internal/affinity"
 	"relayhub/internal/audit"
 	"relayhub/internal/auth"
 	"relayhub/internal/browser"
@@ -28,7 +29,10 @@ import (
 	"relayhub/internal/clisync/hermes"
 	"relayhub/internal/domain"
 	"relayhub/internal/export"
+	"relayhub/internal/lab"
 	"relayhub/internal/logging"
+	"relayhub/internal/ratelimit"
+	"relayhub/internal/verify"
 	"relayhub/internal/repository"
 	"relayhub/internal/secrets"
 	webassets "relayhub/internal/web"
@@ -68,6 +72,11 @@ type Server struct {
 	// management API reports the feature unsupported rather than pretending a
 	// sync happened.
 	CLISync *clisync.Service
+
+	Verify  *verify.Registry
+	Lab     *lab.Ring
+	Sticky  *affinity.Table
+	Limiter *ratelimit.Limiter
 }
 
 type peerPolicy struct {

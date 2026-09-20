@@ -781,7 +781,7 @@ func (s *Store) ListHealthRecords(ctx context.Context, channelID string) ([]doma
 }
 
 func (s *Store) CreateRequestRecord(ctx context.Context, r domain.RequestRecord) error {
-	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO request_records(id,request_id,protocol,model_id,provider_id,channel_id,status_code,latency_ms,input_tokens,output_tokens,error_class,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.RequestID, r.Protocol, nullString(r.ModelID), nullString(r.ProviderID), nullString(r.ChannelID), r.StatusCode, r.LatencyMS, r.InputTokens, r.OutputTokens, r.ErrorClass, stamp(r.CreatedAt))
+	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO request_records(id,request_id,protocol,model_id,provider_id,channel_id,status_code,latency_ms,input_tokens,output_tokens,error_class,created_at,ttft_ms,cache_read_tokens,cache_write_tokens,finish_reason,upstream_model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, r.ID, r.RequestID, r.Protocol, nullString(r.ModelID), nullString(r.ProviderID), nullString(r.ChannelID), r.StatusCode, r.LatencyMS, r.InputTokens, r.OutputTokens, r.ErrorClass, stamp(r.CreatedAt), r.TTFTMS, r.CacheReadTokens, r.CacheWriteTokens, r.FinishReason, r.UpstreamModel)
 	return err
 }
 func nullString(v string) any {

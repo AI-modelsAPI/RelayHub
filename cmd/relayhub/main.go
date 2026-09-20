@@ -62,6 +62,9 @@ func run(args []string) error {
 		return nil
 	}
 
+	if fs.NArg() == 1 && fs.Arg(0) == "mcp" {
+		return runMCPStdio(managementAddr)
+	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
 	}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"relayhub/internal/domain"
+	"relayhub/internal/identity"
 )
 
 const (
@@ -225,10 +226,7 @@ func (b *BaseNewAPIAdapter) RefreshAccessToken(ctx context.Context, channel doma
 	req.Header.Set("Referer", baseURL+"/")
 	req.Header.Set("Cookie", cred.SiteCookie)
 
-	client := b.Client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
+	client := clientForChannel(b.Client, channel)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -330,10 +328,7 @@ func (b *BaseNewAPIAdapter) FetchStatusQuotaPerUnit(ctx context.Context, channel
 	if err != nil {
 		return DefaultQuotaPerUnit
 	}
-	client := b.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	}
+	client := clientForChannel(b.Client, channel)
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return DefaultQuotaPerUnit
@@ -760,4 +755,14 @@ func (b *BaseNewAPIAdapter) CheckIn(ctx context.Context, channel domain.Channel)
 		Already: false,
 		Message: "登录保活完成（未检测到今日签到记录，未标记已签）",
 	}, nil
+}
+
+func clientForChannel(fallback *http.Client, ch domain.Channel) *http.Client {
+	if strings.TrimSpace(ch.ProxyURL) != "" {
+		return identity.HTTPClient(ch.ProxyURL, 15*time.Second)
+	}
+	if fallback != nil {
+		return fallback
+	}
+	return &http.Client{Timeout: 15 * time.Second}
 }

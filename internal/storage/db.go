@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -32,6 +33,9 @@ var channelKeys string
 
 //go:embed migrations/007_model_icon_archive.sql
 var modelIconArchive string
+
+//go:embed migrations/008_request_record_meta.sql
+var requestRecordMeta string
 
 type DB struct {
 	*sql.DB
@@ -101,6 +105,7 @@ var migrations = []struct {
 	{5, modelCatalog},
 	{6, channelKeys},
 	{7, modelIconArchive},
+	{8, requestRecordMeta},
 }
 
 func (d *DB) Migrate(ctx context.Context) error {
@@ -122,9 +127,15 @@ func (d *DB) Migrate(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, m.SQL); err != nil {
-			_ = tx.Rollback()
-			return err
+		for _, stmt := range strings.Split(m.SQL, ";") {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			if _, err = tx.ExecContext(ctx, stmt); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES(?, ?)`, m.Version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			_ = tx.Rollback()

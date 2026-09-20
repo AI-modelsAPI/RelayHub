@@ -43,7 +43,7 @@ func TestResolveChannelCredentialRotatesAndSkipsDisabled(t *testing.T) {
 	var rot atomic.Uint64
 
 	// No channel keys yet -> falls back to legacy CredentialRef.
-	if got, _ := resolveChannelCredential(ctx, repo, secStore, &rot, ch); got != "LEGACY" {
+	if got, _, _ := resolveChannelCredential(ctx, repo, secStore, &rot, ch, ""); got != "LEGACY" {
 		t.Fatalf("expected legacy fallback, got %q", got)
 	}
 
@@ -59,7 +59,7 @@ func TestResolveChannelCredentialRotatesAndSkipsDisabled(t *testing.T) {
 	rot.Store(0)
 	seen := map[string]int{}
 	for i := 0; i < 6; i++ {
-		got, err := resolveChannelCredential(ctx, repo, secStore, &rot, ch)
+		got, _, err := resolveChannelCredential(ctx, repo, secStore, &rot, ch, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,7 @@ func TestResolveChannelCredentialRotatesAndSkipsDisabled(t *testing.T) {
 	k2, _ := repo.GetChannelKey(ctx, "k2")
 	k2.Disabled = true
 	_ = repo.UpdateChannelKey(ctx, k2)
-	if got, _ := resolveChannelCredential(ctx, repo, secStore, &rot, ch); got != "LEGACY" {
+	if got, _, _ := resolveChannelCredential(ctx, repo, secStore, &rot, ch, ""); got != "LEGACY" {
 		t.Fatalf("expected legacy fallback after disabling all keys, got %q", got)
 	}
 }

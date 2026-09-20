@@ -165,18 +165,23 @@ type HealthRecord struct {
 }
 
 type RequestRecord struct {
-	ID           string    `json:"id"`
-	RequestID    string    `json:"request_id"`
-	Protocol     string    `json:"protocol"`
-	ModelID      string    `json:"model_id,omitempty"`
-	ProviderID   string    `json:"provider_id,omitempty"`
-	ChannelID    string    `json:"channel_id,omitempty"`
-	ErrorClass   string    `json:"error_class"`
-	StatusCode   int       `json:"status_code"`
-	LatencyMS    int       `json:"latency_ms"`
-	InputTokens  int       `json:"input_tokens"`
-	OutputTokens int       `json:"output_tokens"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID               string    `json:"id"`
+	RequestID        string    `json:"request_id"`
+	Protocol         string    `json:"protocol"`
+	ModelID          string    `json:"model_id,omitempty"`
+	ProviderID       string    `json:"provider_id,omitempty"`
+	ChannelID        string    `json:"channel_id,omitempty"`
+	ErrorClass       string    `json:"error_class"`
+	StatusCode       int       `json:"status_code"`
+	LatencyMS        int       `json:"latency_ms"`
+	TTFTMS           int       `json:"ttft_ms"`
+	InputTokens      int       `json:"input_tokens"`
+	OutputTokens     int       `json:"output_tokens"`
+	CacheReadTokens  int       `json:"cache_read_tokens"`
+	CacheWriteTokens int       `json:"cache_write_tokens"`
+	FinishReason     string    `json:"finish_reason,omitempty"`
+	UpstreamModel    string    `json:"upstream_model,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type CLISyncRecord struct {

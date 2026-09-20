@@ -18,6 +18,7 @@ import (
 	"relayhub/internal/adapter/justdowork"
 	"relayhub/internal/adapter/kktoken"
 	"relayhub/internal/adapter/seekai"
+	"relayhub/internal/affinity"
 	"relayhub/internal/api"
 	"relayhub/internal/audit"
 	"relayhub/internal/auth"
@@ -26,14 +27,18 @@ import (
 	"relayhub/internal/checkin"
 	"relayhub/internal/domain"
 	"relayhub/internal/gateway"
+	"relayhub/internal/guard"
 	"relayhub/internal/health"
+	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/proxy"
+	"relayhub/internal/ratelimit"
 	"relayhub/internal/repository"
 	"relayhub/internal/router"
 	"relayhub/internal/secrets"
 	"relayhub/internal/storage"
 	"relayhub/internal/usage"
+	"relayhub/internal/verify"
 )
 
 type Runtime struct {
@@ -101,6 +106,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		routeList = append(routeList, r)
 	}
 
+	sticky := affinity.New(5 * time.Minute)
 	res := &router.Resolver{
 		Models:         rModels,
 		ProviderModels: pmList,
@@ -110,6 +116,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		Members:        rMembers,
 		Routes:         routeList,
 		Health:         healthReg,
+		Sticky:         sticky,
 	}
 
 	// Secret Store
@@ -273,18 +280,37 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	// auto_sync enabled, reusing the API server's fetch+filter+bind logic.
 	sched.SetModelSync(apiServer.SyncChannelModels)
 
+	verifyReg := verify.New()
+	labRing := lab.NewRing(32)
+	aimd := ratelimit.New()
+	runaway := guard.New()
+	apiServer.WithControlPlane(verifyReg, labRing, sticky, aimd)
+
 	// keyRotation drives round-robin selection across a channel's enabled keys.
 	var keyRotation atomic.Uint64
 	gwHandler := gateway.New(gateway.Config{
 		Resolver: res,
 		Upstream: gateway.HTTPUpstream{
-			Credential: func(ctx context.Context, d router.Decision) (string, error) {
-				return resolveChannelCredential(ctx, repo, secStore, &keyRotation, d.Channel)
+			PickCredential: func(ctx context.Context, d router.Decision) (gateway.CredentialPick, error) {
+				token, keyID, err := resolveChannelCredential(ctx, repo, secStore, &keyRotation, d.Channel, d.PreferredKeyID)
+				return gateway.CredentialPick{Token: token, KeyID: keyID}, err
 			},
 		},
-		Health:   healthReg,
-		Auth:     localKeys,
+		Health: healthReg,
+		Auth:   localKeys,
+		DisableKey: func(ctx context.Context, keyID string) {
+			k, err := repo.GetChannelKey(ctx, keyID)
+			if err != nil {
+				return
+			}
+			k.Disabled = true
+			_ = repo.UpdateChannelKey(ctx, k)
+		},
 		Recorder: usage.RepositoryRecorder{Repo: repo},
+		Limiter:  aimd,
+		Lab:      labRing,
+		Guard:    runaway,
+		Verify:   verifyReg,
 	})
 
 	gwServer := &http.Server{
@@ -318,7 +344,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 // resolveChannelCredential selects the credential the gateway injects upstream.
 // It prefers per-channel API keys (round-robin over enabled keys) and falls back
 // to the channel's legacy single CredentialRef when no channel keys exist.
-func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepository, secStore *secrets.Store, rot *atomic.Uint64, ch domain.Channel) (string, error) {
+func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepository, secStore *secrets.Store, rot *atomic.Uint64, ch domain.Channel, preferredKeyID string) (string, string, error) {
 	if keys, err := repo.ListChannelKeys(ctx, ch.ID); err == nil && len(keys) > 0 {
 		enabled := make([]domain.ChannelKey, 0, len(keys))
 		for _, k := range keys {
@@ -327,20 +353,30 @@ func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepos
 			}
 		}
 		if len(enabled) > 0 {
-			idx := int(rot.Add(1)-1) % len(enabled)
+			idx := 0
+			if preferredKeyID != "" {
+				for i, k := range enabled {
+					if k.ID == preferredKeyID {
+						idx = i
+						break
+					}
+				}
+			} else {
+				idx = int(rot.Add(1)-1) % len(enabled)
+			}
 			if secretBytes, err := secStore.Get(ctx, enabled[idx].SecretRef); err == nil {
-				return string(secretBytes), nil
+				return string(secretBytes), enabled[idx].ID, nil
 			}
 		}
 	}
 	if ch.CredentialRef == "" {
-		return "", nil
+		return "", "", nil
 	}
 	secretBytes, err := secStore.Get(ctx, ch.CredentialRef)
 	if err != nil {
-		return "", nil
+		return "", "", nil
 	}
-	return string(secretBytes), nil
+	return string(secretBytes), "", nil
 }
 
 // describeTargetPolicy renders a proxy target policy for operator-facing logs.

@@ -23,7 +23,7 @@ go build -o bin/relayhub ./cmd/relayhub
 ./bin/relayhub -full-stack
 ```
 
-Web Console is available at `http://127.0.0.1:8790`.
+The desktop-paradigm console is served at `http://127.0.0.1:8790` during development (icon rail + inspector; not a website admin). See `docs/ui/desktop-paradigm.md`.
 
 ### 2. Run with Docker Compose
 
@@ -46,7 +46,10 @@ go test -race ./... -count=1
 
 ## Documentation
 
-- [Architecture & Design](docs/architecture.md)
+- [Architecture](docs/architecture.md)
+- [Desktop UI paradigm](docs/ui/desktop-paradigm.md)
+- [Development plan](docs/dev/PLAN-2026-09-20.md)
+- [Differentiation proposals](docs/proposals/2026-09-20-differentiation.md)
 - [Authoring Custom Providers](docs/provider-authoring.md)
 - [CLI Synchronization Guide](docs/cli-sync.md)
 - [Docker Deployment](docs/deployment-docker.md)
