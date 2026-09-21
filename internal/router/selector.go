@@ -434,8 +434,18 @@ func hasTag(tags, want string) bool {
 	}
 	return false
 }
+
+// isQuotaStrategy reports whether the strategy routes by observed balance.
+// "quota-first" is the documented name; "quota-aware" is the historical one.
+func isQuotaStrategy(strategy string) bool {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "quota-first", "quota_first", "quota-aware", "quota_aware":
+		return true
+	}
+	return false
+}
+
 func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, rand RandomSource, source uint64) Candidate {
-	c = highestPriority(c)
 	if fixed != "" {
 		for _, v := range c {
 			if v.Channel.ID == fixed {
@@ -443,6 +453,13 @@ func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, 
 			}
 		}
 	}
+	// quota-first deliberately looks across priority tiers: its whole point
+	// is "spend observed free/prepaid balance before touching the channels I
+	// would otherwise prefer". Priority remains the tie-breaker.
+	if isQuotaStrategy(strategy) {
+		return quotaFirst(c, h)
+	}
+	c = highestPriority(c)
 	switch strings.ToLower(strategy) {
 	case "fixed":
 		return c[0]
@@ -459,22 +476,6 @@ func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, 
 				return int64(h.Get(v.Channel.ID).SuccessRate * 1000000)
 			}
 			return int64(v.Channel.Priority)
-		})
-	case "quota-aware":
-		return maxBy(c, func(v Candidate) int64 {
-			if h == nil {
-				return 0
-			}
-			s := h.Get(v.Channel.ID)
-			remaining := s.QuotaRemaining
-			if remaining < 0 {
-				remaining = 0
-			}
-			resetScore := int64(0)
-			if !s.QuotaResetAt.IsZero() {
-				resetScore = -s.QuotaResetAt.Unix()
-			}
-			return remaining*1000000 + int64(s.QuotaScore*1000) + resetScore
 		})
 	case "weighted", "weighted-round-robin", "round-robin", "random":
 		total := 0
@@ -497,6 +498,55 @@ func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, 
 	}
 	return c[0]
 }
+
+// quotaFirst orders candidates by observed balance: channels with a known,
+// positive balance first (larger USD balance first, then larger native
+// remaining), then channels whose quota was never observed; priority and
+// ProviderModel ID break ties. Exhausted channels never reach this function
+// because health.Available already excluded them.
+func quotaFirst(c []Candidate, h *health.Registry) Candidate {
+	type ranked struct {
+		known     bool
+		usd       float64
+		remaining int64
+	}
+	rank := func(v Candidate) ranked {
+		if h == nil {
+			return ranked{}
+		}
+		s := h.Get(v.Channel.ID)
+		if !s.QuotaKnown {
+			return ranked{}
+		}
+		return ranked{known: true, usd: s.QuotaUSD, remaining: s.QuotaRemaining}
+	}
+	better := func(a, b Candidate) bool {
+		ra, rb := rank(a), rank(b)
+		if ra.known != rb.known {
+			return ra.known
+		}
+		if ra.known {
+			if ra.usd != rb.usd {
+				return ra.usd > rb.usd
+			}
+			if ra.remaining != rb.remaining {
+				return ra.remaining > rb.remaining
+			}
+		}
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+		return a.ProviderModel.ID < b.ProviderModel.ID
+	}
+	best := c[0]
+	for _, v := range c[1:] {
+		if better(v, best) {
+			best = v
+		}
+	}
+	return best
+}
+
 func highestPriority(c []Candidate) []Candidate {
 	priority := c[0].Priority
 	for _, v := range c[1:] {

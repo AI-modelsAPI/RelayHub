@@ -23,4 +23,10 @@ type JobState struct {
 	LastReward      string    `json:"last_reward"`
 	LastError       string    `json:"last_error"`
 	FailureCount    int       `json:"failure_count"`
+	// Balance observation attached to the job so the UI can show "signed in,
+	// $1.50 left" without a second round-trip. QuotaUSD is 0 when unknown;
+	// check LastBalanceAt to distinguish "unknown" from "empty".
+	QuotaUSD         float64   `json:"quota_usd"`
+	LastBalanceAt    time.Time `json:"last_balance_at,omitempty"`
+	LastBalanceError string    `json:"last_balance_error,omitempty"`
 }

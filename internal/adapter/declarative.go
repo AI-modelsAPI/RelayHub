@@ -30,8 +30,25 @@ type DeclarativeConfig struct {
 }
 
 type DeclarativeAdapter struct {
-	Config DeclarativeConfig
-	Client *http.Client
+	Config  DeclarativeConfig
+	Client  *http.Client
+	Clients ClientProvider
+}
+
+// SetClientProvider implements EgressAware.
+func (d *DeclarativeAdapter) SetClientProvider(p ClientProvider) { d.Clients = p }
+
+func (d *DeclarativeAdapter) httpClient(ch domain.Channel) *http.Client {
+	if d.Clients != nil {
+		timeout := d.Config.Timeout
+		if timeout <= 0 {
+			timeout = 15 * time.Second
+		}
+		if c := d.Clients.ClientFor(ch, timeout); c != nil {
+			return c
+		}
+	}
+	return d.Client
 }
 
 func NewDeclarativeAdapter(cfg DeclarativeConfig, client *http.Client) (*DeclarativeAdapter, error) {
@@ -164,7 +181,7 @@ func (d *DeclarativeAdapter) executeStep(ctx context.Context, channel domain.Cha
 		req.Header.Set("Authorization", "Bearer "+channel.CredentialRef)
 	}
 
-	resp, err := d.Client.Do(req)
+	resp, err := d.httpClient(channel).Do(req)
 	if err != nil {
 		return nil, err
 	}

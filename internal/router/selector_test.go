@@ -90,3 +90,50 @@ func TestResolveProviderMappingAndGroupFallback(t *testing.T) {
 		t.Fatalf("decision=%+v err=%v", d, err)
 	}
 }
+
+// quota-first must route by observed balance (USD, cross-site comparable) and
+// fall back to priority when nothing is known; an exhausted channel must be
+// excluded with a readable reason and traffic must move to the next one.
+func TestResolveQuotaFirstUsesObservedBalance(t *testing.T) {
+	now := time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC)
+	h := health.NewRegistry()
+	r := Resolver{Models: map[string]domain.Model{"m": {ID: "m", Enabled: true}},
+		Channels: map[string]domain.Channel{
+			"free": {ID: "free", ProviderID: "p", Enabled: true, RoutingEnabled: true},
+			"paid": {ID: "paid", ProviderID: "p", Enabled: true, RoutingEnabled: true},
+		},
+		ProviderModels: []domain.ProviderModel{
+			// paid sorts first by ID and by priority: quota must still win.
+			{ID: "a-paid", ProviderID: "p", ModelID: "m", ChannelID: "paid", Priority: 1, Enabled: true},
+			{ID: "b-free", ProviderID: "p", ModelID: "m", ChannelID: "free", Priority: 2, Enabled: true},
+		}, Health: h, Strategy: "quota-first"}
+
+	// Nothing observed yet: fall back to priority.
+	d, err := r.Resolve(context.Background(), Request{Model: "m", Now: now})
+	if err != nil || d.Channel.ID != "paid" {
+		t.Fatalf("unknown quota should fall back to priority: %+v %v", d, err)
+	}
+	h.SetQuota("free", health.QuotaUpdate{USD: 2, Remaining: 1000000, Known: true}, now)
+	for _, strategy := range []string{"quota-first", "quota_first", "quota-aware"} {
+		r.Strategy = strategy
+		d, err = r.Resolve(context.Background(), Request{Model: "m", Now: now})
+		if err != nil || d.Channel.ID != "free" {
+			t.Fatalf("%s: funded channel must win: %+v %v", strategy, d, err)
+		}
+	}
+	// Two funded channels: larger USD balance first.
+	h.SetQuota("paid", health.QuotaUpdate{USD: 5, Remaining: 10, Known: true}, now)
+	d, err = r.Resolve(context.Background(), Request{Model: "m", Now: now})
+	if err != nil || d.Channel.ID != "paid" {
+		t.Fatalf("higher USD balance must win regardless of native units: %+v %v", d, err)
+	}
+	// Exhausted: excluded with reason, traffic moves on.
+	h.SetQuota("paid", health.QuotaUpdate{USD: 0, Remaining: 0, Known: true}, now)
+	d, err = r.Resolve(context.Background(), Request{Model: "m", Now: now})
+	if err != nil || d.Channel.ID != "free" {
+		t.Fatalf("exhausted channel must be skipped: %+v %v", d, err)
+	}
+	if d.Excluded["a-paid/paid"] != "quota exhausted" {
+		t.Fatalf("exclusion reason must be explainable: %#v", d.Excluded)
+	}
+}

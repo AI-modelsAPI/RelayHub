@@ -15,7 +15,20 @@ import (
 // GenericAdapter handles standard OpenAI/Anthropic/Gemini compatible endpoints.
 // It explicitly refuses check-in operations.
 type GenericAdapter struct {
-	Client *http.Client
+	Client  *http.Client
+	Clients ClientProvider
+}
+
+// SetClientProvider implements EgressAware.
+func (g *GenericAdapter) SetClientProvider(p ClientProvider) { g.Clients = p }
+
+func (g *GenericAdapter) httpClient(ch domain.Channel) *http.Client {
+	if g.Clients != nil {
+		if c := g.Clients.ClientFor(ch, 15*time.Second); c != nil {
+			return c
+		}
+	}
+	return g.Client
 }
 
 func NewGenericAdapter(client *http.Client) *GenericAdapter {
@@ -61,7 +74,7 @@ func (g *GenericAdapter) Models(ctx context.Context, channel domain.Channel) ([]
 		req.Header.Set("Authorization", "Bearer "+channel.CredentialRef)
 	}
 
-	resp, err := g.Client.Do(req)
+	resp, err := g.httpClient(channel).Do(req)
 	if err != nil {
 		return nil, err
 	}

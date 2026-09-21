@@ -71,10 +71,26 @@ func run(args []string) error {
 	if err := validateManagementAddress(managementAddr); err != nil {
 		return err
 	}
+	// Optional <data-dir>/config.json plus RELAYHUB_* environment overrides
+	// supply non-secret settings (egress proxy, notification sinks). Listen
+	// addresses keep coming from flags/env as before.
+	fileCfg, err := config.Load(dataDir)
+	if err != nil {
+		return err
+	}
+	config.ApplyEnv(&fileCfg)
 	a, err := app.New(app.Config{
 		DataDir:        dataDir,
 		ManagementAddr: managementAddr,
 		WireFullStack:  fullStack,
+		EgressProxyURL: fileCfg.EgressProxyURL,
+		Notify: app.NotifyConfig{
+			WebhookURL:       fileCfg.Notify.WebhookURL,
+			BarkURL:          fileCfg.Notify.BarkURL,
+			TelegramBotToken: fileCfg.Notify.TelegramBotToken,
+			TelegramChatID:   fileCfg.Notify.TelegramChatID,
+			QuotaLowUSD:      fileCfg.Notify.QuotaLowUSD,
+		},
 	})
 	if err != nil {
 		return err
