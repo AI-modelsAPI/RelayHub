@@ -543,6 +543,29 @@ func (s *Scheduler) pollBalancesFor(ctx context.Context, channels []domain.Chann
 // waitBackground blocks until in-flight balance refreshes finish (tests).
 func (s *Scheduler) waitBackground() { s.bg.Wait() }
 
+// balanceHasEvidence reports whether a BalanceResult carries any information
+// at all. A zero value is treated as "unknown" rather than "exhausted".
+func balanceHasEvidence(res adapter.BalanceResult) bool {
+	return res.Remaining != 0 || res.Total != 0 || !res.ResetAt.IsZero() ||
+		res.AvailableUSD != 0 || res.UsedUSD != 0 || res.TodayUsedUSD != 0 ||
+		res.QuotaPerUnit != 0 || res.Username != ""
+}
+
+// safeBalance calls adp.Balance and converts a panicking adapter into an
+// error. Balance refresh is best-effort telemetry that runs right after a
+// successful check-in and from the background poll loop; a misbehaving
+// adapter (e.g. a partial implementation embedding a nil ProviderAdapter)
+// must neither undo the recorded check-in nor take the daemon down.
+func safeBalance(ctx context.Context, adp adapter.ProviderAdapter, ch domain.Channel) (res adapter.BalanceResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = adapter.BalanceResult{}
+			err = fmt.Errorf("balance adapter panicked: %v", r)
+		}
+	}()
+	return adp.Balance(ctx, ch)
+}
+
 // refreshBalance fetches the balance, persists the structured snapshot on the
 // channel, mirrors it onto the job state and notifies the quota observer.
 func (s *Scheduler) refreshBalance(ctx context.Context, ch domain.Channel, adp adapter.ProviderAdapter, source string, now time.Time) (domain.QuotaSnapshot, error) {
@@ -551,7 +574,13 @@ func (s *Scheduler) refreshBalance(ctx context.Context, ch domain.Channel, adp a
 	}
 	bctx, cancel := context.WithTimeout(ctx, balanceTimeout)
 	defer cancel()
-	res, err := adp.Balance(bctx, ch)
+	res, err := safeBalance(bctx, adp, ch)
+	if err == nil && !balanceHasEvidence(res) {
+		// An all-zero result is indistinguishable from "endpoint answered
+		// but we could not read it" (e.g. a declarative site with a
+		// different JSON shape). Never let it mark a channel exhausted.
+		err = fmt.Errorf("%w: balance response carried no quota data", adapter.ErrUnsupportedOperation)
+	}
 	if err != nil {
 		if !errors.Is(err, adapter.ErrUnsupportedOperation) {
 			prev := s.GetState(ch.ID)

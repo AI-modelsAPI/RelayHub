@@ -24,7 +24,25 @@ jobs:
         run: go vet ./...
 
       - name: Unit & Integration Tests (Race)
-        run: go test -race ./... -count=1 -timeout=15m
+        run: |
+          set -o pipefail
+          go test -race ./... -count=1 -timeout=15m 2>&1 | tee test-output.log
+
+      # Surface the failing test names as check annotations so a red run can
+      # be understood from the PR checks tab / API without opening raw logs.
+      - name: Summarize Test Failures
+        if: failure()
+        run: |
+          [ -f test-output.log ] || exit 0
+          grep -E '^(--- FAIL|FAIL[[:space:]]|panic:|WARNING: DATA RACE)' test-output.log | head -n 20 | while IFS= read -r line; do
+            echo "::error title=go test::${line}"
+          done
+          {
+            echo '### Failing tests'
+            echo '```'
+            grep -E -A 12 '^(--- FAIL|panic:)' test-output.log | head -n 200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Local Smoke Test
         run: ./scripts/smoke-local.sh

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -168,5 +169,75 @@ func TestBalancePollingCadence(t *testing.T) {
 	ch, _ := repo.GetChannel(ctx, "c")
 	if q, ok := domain.ParseQuotaSnapshot(ch.QuotaState); !ok || q.Source != "balance" {
 		t.Fatalf("polled balance must be persisted with source=balance: %q", ch.QuotaState)
+	}
+}
+
+// partialAdapter mirrors the fixture style used by Chrome-only wiring tests:
+// a struct embedding a nil adapter.ProviderAdapter that only overrides
+// CheckIn. Calling Balance on it panics (nil interface dispatch).
+type partialAdapter struct{ adapter.ProviderAdapter }
+
+func (partialAdapter) CheckIn(context.Context, domain.Channel) (adapter.CheckInResult, error) {
+	return adapter.CheckInResult{Success: true, Message: "ok"}, nil
+}
+
+// Regression (CI-only failure on PR #1): the post-check-in balance refresh
+// must be best-effort. A panicking Balance implementation must neither turn
+// a successful check-in into a failure nor crash the caller.
+func TestRunNowSurvivesPanickingBalanceAdapter(t *testing.T) {
+	repo := newBalanceRepo(t)
+	ctx := context.Background()
+	_ = repo.CreateProvider(ctx, domain.Provider{ID: "p", Name: "P", AdapterType: "partial", Enabled: true})
+	_ = repo.CreateChannel(ctx, domain.Channel{ID: "c", ProviderID: "p", Name: "C", BaseURL: "https://x", Enabled: true, CheckinEnabled: true})
+
+	reg := adapter.NewRegistry()
+	_ = reg.Register("partial", partialAdapter{})
+	sched := NewScheduler(Config{Interval: time.Hour, RandomJitter: time.Second, BaseBackoff: time.Millisecond}, reg, repo)
+
+	if err := sched.RunNow(ctx, "c"); err != nil {
+		t.Fatalf("check-in must succeed even if balance refresh panics, got %v", err)
+	}
+	st := sched.GetState("c")
+	if st.Status != StatusSuccess {
+		t.Fatalf("status = %s, want %s (err=%q)", st.Status, StatusSuccess, st.LastError)
+	}
+	if st.LastBalanceError == "" || !strings.Contains(st.LastBalanceError, "panicked") {
+		t.Fatalf("panic must surface as LastBalanceError, got %q", st.LastBalanceError)
+	}
+	records, err := repo.ListCheckinRecords(ctx, "c")
+	if err != nil || len(records) != 1 || records[0].Status != "success" {
+		t.Fatalf("records=%+v err=%v", records, err)
+	}
+}
+
+// An adapter that answers with an all-zero BalanceResult (typical when a
+// declarative site's JSON shape is not understood) must be treated as
+// "quota unknown": no snapshot persisted, no observer call, so routing never
+// marks the channel exhausted on missing evidence.
+func TestZeroBalanceResultIsUnknownNotExhausted(t *testing.T) {
+	repo := newBalanceRepo(t)
+	ctx := context.Background()
+	_ = repo.CreateProvider(ctx, domain.Provider{ID: "p", Name: "P", AdapterType: "bal", Enabled: true})
+	_ = repo.CreateChannel(ctx, domain.Channel{ID: "c", ProviderID: "p", Name: "C", BaseURL: "https://x", Enabled: true, CheckinEnabled: true})
+
+	adp := &balanceAdapter{} // zero result, nil error
+	reg := adapter.NewRegistry()
+	_ = reg.Register("bal", adp)
+	sched := NewScheduler(Config{Interval: time.Hour, RandomJitter: time.Second, BaseBackoff: time.Millisecond}, reg, repo)
+	observed := 0
+	sched.SetQuotaObserver(func(domain.Channel, domain.QuotaSnapshot) { observed++ })
+
+	if err := sched.RunNow(ctx, "c"); err != nil {
+		t.Fatal(err)
+	}
+	if observed != 0 {
+		t.Fatalf("observer must not run on an evidence-free balance, got %d calls", observed)
+	}
+	ch, _ := repo.GetChannel(ctx, "c")
+	if _, ok := domain.ParseQuotaSnapshot(ch.QuotaState); ok {
+		t.Fatalf("no snapshot must be persisted, got %q", ch.QuotaState)
+	}
+	if st := sched.GetState("c"); st.Status != StatusSuccess || !st.LastBalanceAt.IsZero() {
+		t.Fatalf("check-in stays successful and balance stays unknown, got %+v", st)
 	}
 }
