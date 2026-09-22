@@ -37,6 +37,9 @@ var modelIconArchive string
 //go:embed migrations/008_request_record_meta.sql
 var requestRecordMeta string
 
+//go:embed migrations/009_custom_headers_and_indices.sql
+var customHeadersAndIndices string
+
 type DB struct {
 	*sql.DB
 	// JournalMode is the effective SQLite journal mode after Open (normally "wal").
@@ -66,8 +69,12 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d.SetMaxOpenConns(1)
-	d.SetMaxIdleConns(1)
+	// WAL permits concurrent readers alongside the single writer; a hard cap of
+	// one connection serialized gateway record writes against every UI/metrics
+	// read (AUDIT RH-32/P2-4). Writer-heavy statements still serialize through
+	// SQLite's file lock and busy_timeout.
+	d.SetMaxOpenConns(4)
+	d.SetMaxIdleConns(4)
 	if err = d.Ping(); err != nil {
 		_ = d.Close()
 		return nil, err
@@ -106,6 +113,7 @@ var migrations = []struct {
 	{6, channelKeys},
 	{7, modelIconArchive},
 	{8, requestRecordMeta},
+	{9, customHeadersAndIndices},
 }
 
 func (d *DB) Migrate(ctx context.Context) error {
