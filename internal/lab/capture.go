@@ -1,5 +1,8 @@
 package lab
 
+// maxCaptureBody caps a single captured request body (256 KiB).
+const maxCaptureBody = 256 << 10
+
 import (
 	"sync"
 )
@@ -58,6 +61,12 @@ func (r *Ring) Push(c Capture) {
 	r.seq++
 	c.ID = "cap-" + itoa(r.seq)
 	c.Size = len(c.Body)
+	// Captures keep full request bodies by design, but unbounded capture made
+	// the ring a multi-hundred-MB privacy/memory risk (AUDIT RH-32): cap each
+	// stored body and note truncation on the record.
+	if len(c.Body) > maxCaptureBody {
+		c.Body = c.Body[:maxCaptureBody]
+	}
 	r.items = append(r.items, c)
 	if len(r.items) > r.max {
 		r.items = r.items[len(r.items)-r.max:]

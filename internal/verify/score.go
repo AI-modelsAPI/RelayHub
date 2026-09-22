@@ -42,9 +42,16 @@ func (r *Registry) Observe(rec domain.RequestRecord) Score {
 		s.Score -= 15
 		s.Signals = append(s.Signals, "truncated")
 	}
-	if rec.UpstreamModel != "" && rec.ModelID != "" && !strings.EqualFold(rec.UpstreamModel, rec.ModelID) && !strings.Contains(rec.UpstreamModel, rec.ModelID) {
+	// Bidirectional, case-insensitive containment: providers legitimately echo
+	// versioned names ("claude-3-5-sonnet" vs "claude-3-5-sonnet-20241022"),
+	// which the old one-way Contains flagged as identity mismatches.
+	if up, id := strings.ToLower(rec.UpstreamModel), strings.ToLower(rec.ModelID); up != "" && id != "" && !strings.Contains(up, id) && !strings.Contains(id, up) {
 		s.Score -= 20
 		s.Signals = append(s.Signals, "model_mismatch")
+	}
+	if rec.ErrorClass == "upstream_eof_no_finish" {
+		s.Score -= 15
+		s.Signals = append(s.Signals, "truncated")
 	}
 	if rec.InputTokens > 200 && rec.CacheReadTokens == 0 {
 		s.Score -= 5

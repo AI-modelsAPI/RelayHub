@@ -62,7 +62,11 @@ func (l *Limiter) Observe(key string, status int, retryAfter time.Duration, hdr 
 	s.updated = now
 }
 
-// Wait returns how long to queue locally. Zero means proceed; >2s means caller should failover.
+// Wait returns how long to queue locally. Zero means proceed (a token has
+// been reserved); >2s means caller should failover. When a positive wait is
+// returned the wait window is also reserved via retryAt, so a burst of
+// concurrent callers sees a monotonic backoff instead of all being released
+// at the same instant (AUDIT RH-19).
 func (l *Limiter) Wait(key string) time.Duration {
 	if l == nil || key == "" {
 		return 0
@@ -85,7 +89,11 @@ func (l *Limiter) Wait(key string) time.Duration {
 		return 0
 	}
 	need := (1 - s.tokens) / s.rate
-	return time.Duration(need * float64(time.Second))
+	wait := time.Duration(need * float64(time.Second))
+	// Reserve the window: the next waiter observes this slot as occupied and
+	// queues behind it rather than racing to the same wake-up time.
+	s.retryAt = now.Add(wait)
+	return wait
 }
 
 func (l *Limiter) Snapshot(key string) (rate float64, learned bool) {

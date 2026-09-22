@@ -2,6 +2,8 @@ package router
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"strings"
@@ -68,7 +70,16 @@ type resolverState struct {
 	Routes         []domain.Route
 }
 
+// statePublish guards the one-time publication of Resolver.state. The pointer
+// is immutable after the first publication (UpdateSnapshot mutates the state's
+// contents under the state's own lock), so only the initial read/write needs
+// this lock; using an atomic/noCopy field is not possible here because
+// Resolver is deliberately copied by value throughout the package.
+var statePublish sync.RWMutex
+
 func (r *Resolver) ensureState() *resolverState {
+	statePublish.Lock()
+	defer statePublish.Unlock()
 	if r.state != nil {
 		return r.state
 	}
@@ -81,6 +92,14 @@ func (r *Resolver) ensureState() *resolverState {
 		Members:        r.Members,
 		Routes:         r.Routes,
 	}
+	return r.state
+}
+
+// publishedState returns the published snapshot state, or nil when the resolver
+// still serves its inline construction-time maps only.
+func (r *Resolver) publishedState() *resolverState {
+	statePublish.RLock()
+	defer statePublish.RUnlock()
 	return r.state
 }
 
@@ -106,17 +125,17 @@ func (r *Resolver) UpdateSnapshot(
 }
 
 func (r Resolver) snapshot() Resolver {
-	if r.state != nil {
-		r.state.mu.RLock()
-		defer r.state.mu.RUnlock()
+	if st := r.publishedState(); st != nil {
+		st.mu.RLock()
+		defer st.mu.RUnlock()
 		return Resolver{
-			Models:         r.state.Models,
-			ProviderModels: r.state.ProviderModels,
-			Channels:       r.state.Channels,
-			Providers:      r.state.Providers,
-			Groups:         r.state.Groups,
-			Members:        r.state.Members,
-			Routes:         r.state.Routes,
+			Models:         st.Models,
+			ProviderModels: st.ProviderModels,
+			Channels:       st.Channels,
+			Providers:      st.Providers,
+			Groups:         st.Groups,
+			Members:        st.Members,
+			Routes:         st.Routes,
 			Health:         r.Health,
 			Strategy:       r.Strategy,
 			FixedChannel:   r.FixedChannel,
@@ -144,6 +163,23 @@ type RandomSource interface{ Uint64() uint64 }
 type counterSource struct{ n atomic.Uint64 }
 
 func (c *counterSource) Uint64() uint64 { return c.n.Add(1) - 1 }
+
+// cryptoSource backs the "random" selection strategy with crypto/rand so a
+// random policy is genuinely random in production. Round-robin style
+// strategies intentionally keep the per-request Source counter instead, so
+// they rotate deterministically (AUDIT RH-07 / P0-2).
+type cryptoSource struct{}
+
+func (cryptoSource) Uint64() uint64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+// NewCryptoSource returns a RandomSource backed by crypto/rand for production use.
+func NewCryptoSource() RandomSource { return cryptoSource{} }
 
 var ErrModelNotFound = fmt.Errorf("model not found")
 var ErrNoCandidates = fmt.Errorf("no available candidates")
@@ -229,6 +265,16 @@ func (r Resolver) resolve(ctx context.Context, req Request, excluded map[string]
 		}
 	}
 	m, ok := r.Models[modelID]
+	if !ok {
+		// Model aliases let one logical model answer to several wire names;
+		// without this the aliases stored on the model had no routing effect.
+		for _, cand := range r.Models {
+			if aliasMatch(cand, modelID) {
+				m, ok = cand, true
+				break
+			}
+		}
+	}
 	if !ok || !m.Enabled {
 		return d, fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
 	}
@@ -258,6 +304,16 @@ func (r Resolver) resolve(ctx context.Context, req Request, excluded map[string]
 	d.Candidate, d.ProviderModel, d.Channel, d.Transform = chosen, chosen.ProviderModel, chosen.Channel, chosen.ProviderModel
 	return d, nil
 }
+// aliasMatch reports whether name is registered as an alias of m.
+func aliasMatch(m domain.Model, name string) bool {
+	for _, a := range m.Aliases {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (r Resolver) findGroup(nameOrID string) (domain.ModelGroup, bool) {
 	if g, ok := r.Groups[nameOrID]; ok {
 		return g, true
@@ -271,6 +327,11 @@ func (r Resolver) findGroup(nameOrID string) (domain.ModelGroup, bool) {
 }
 
 func (r Resolver) selectGroupModel(groupID string, req Request, protocol, filter string, now time.Time, d *Decision, visited map[string]bool) (string, error) {
+	// A fallback cycle (self-reference or A→B→A) must terminate with an error
+	// instead of recursing until the stack is exhausted (AUDIT RH-02).
+	if visited[groupID] {
+		return "", fmt.Errorf("%w: model group fallback cycle at %s", ErrNoCandidates, groupID)
+	}
 	g, ok := r.Groups[groupID]
 	if !ok || !g.Enabled {
 		return "", fmt.Errorf("%w: group %s", ErrModelNotFound, groupID)
@@ -296,10 +357,15 @@ func (r Resolver) selectGroupModel(groupID string, req Request, protocol, filter
 	})
 	strategy := strings.ToLower(g.Strategy)
 	if strategy == "weighted" || strategy == "weighted-round-robin" || strategy == "round-robin" {
+		// Keep only the best-priority members. The previous loop compared the
+		// first element against itself and therefore never removed anything
+		// (AUDIT RH-07).
 		bestPriority := list[0].Priority
-		for len(list) > 0 && list[0].Priority != bestPriority {
-			list = list[1:]
+		cut := 0
+		for cut < len(list) && list[cut].Priority == bestPriority {
+			cut++
 		}
+		list = list[:cut]
 		total := 0
 		for _, m := range list {
 			w := m.Weight

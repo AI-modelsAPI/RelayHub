@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -85,6 +86,43 @@ type boundedReadCloser struct {
 	io.Closer
 }
 
+// upstreamClients caches one http.Client per proxy configuration so gateway
+// requests reuse connections (AUDIT RH-20). The zero-value cache covers the
+// process lifetime; proxy configurations are operator-defined, so cardinality
+// is bounded in practice.
+var upstreamClients sync.Map // string -> *http.Client
+
+func upstreamClient(proxyRaw string) *http.Client {
+	proxyRaw = strings.TrimSpace(proxyRaw)
+	key := proxyRaw
+	if key == "" {
+		key = "direct"
+	}
+	if cached, ok := upstreamClients.Load(key); ok {
+		return cached.(*http.Client)
+	}
+	transport := &http.Transport{
+		MaxIdleConns:        128,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	if proxyRaw == "" {
+		transport.Proxy = http.ProxyFromEnvironment
+	} else if proxyURL, err := url.Parse(proxyRaw); err == nil && proxyURL.Host != "" {
+		transport.Proxy = http.ProxyURL(proxyURL)
+	} else {
+		// Fail closed: an invalid proxy configuration must not silently leak the
+		// default egress route (AUDIT RH-10). The proxy func errors before any
+		// connection is attempted.
+		transport.Proxy = func(*http.Request) (*url.URL, error) {
+			return nil, fmt.Errorf("invalid channel proxy_url %q", proxyRaw)
+		}
+	}
+	client := &http.Client{Transport: transport}
+	actual, _ := upstreamClients.LoadOrStore(key, client)
+	return actual.(*http.Client)
+}
+
 func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 	if err := ctx.Err(); err != nil {
 		return Response{}, err
@@ -145,13 +183,18 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 	}
 	client := u.Client
 	if client == nil {
-		client = http.DefaultClient
-	}
-	if proxyRaw := strings.TrimSpace(req.Decision.Channel.ProxyURL); proxyRaw != "" {
-		if proxyURL, err := url.Parse(proxyRaw); err == nil && proxyURL.Scheme != "" {
+		// Shared, cached clients keyed by proxy URL: the previous code built a
+		// brand-new Transport for every proxied gateway request (unbounded
+		// idle-connection growth, no reuse — AUDIT RH-20), and an invalid proxy
+		// URL silently degraded to a direct egress (AUDIT RH-10).
+		client = upstreamClient(req.Decision.Channel.ProxyURL)
+	} else if proxyRaw := strings.TrimSpace(req.Decision.Channel.ProxyURL); proxyRaw != "" {
+		if proxyURL, err := url.Parse(proxyRaw); err == nil && proxyURL.Host != "" {
 			cloned := *client
 			cloned.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 			client = &cloned
+		} else {
+			return Response{}, fmt.Errorf("invalid channel proxy_url %q", proxyRaw)
 		}
 	}
 	resp, err := client.Do(httpReq)
@@ -202,9 +245,13 @@ func New(cfg Config) *Handler {
 	return &Handler{cfg: cfg}
 }
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Latency accounting starts at request entry: measuring after the upstream
+	// response headers arrive hides queueing and connect time (AUDIT RH-17).
+	reqStart := time.Now()
+	reqNum := h.seq.Add(1)
 	if strings.TrimSpace(r.Header.Get("X-Request-ID")) == "" {
 		r = r.Clone(r.Context())
-		r.Header.Set("X-Request-ID", fmt.Sprintf("gw-%d", h.seq.Add(1)))
+		r.Header.Set("X-Request-ID", fmt.Sprintf("gw-%d", reqNum))
 	}
 	if h.cfg.Auth != nil && !h.cfg.Auth.Validate(extractKey(r)) {
 		writeGatewayError(w, r, http.StatusUnauthorized, "authentication_error", "local API key is invalid")
@@ -265,10 +312,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Protocol: protocol, Model: model,
 		ToolCallRequired: tools, VisionRequired: vision, ReasoningRequired: reasoning,
 		SessionKey: requestSessionKey(r.Header.Get("X-Session-Id"), input),
+		// A monotonically increasing source keeps weighted / round-robin /
+		// random strategies from collapsing onto the first candidate (P0-2 / RH-07).
+		Source: reqNum,
+	}
+	// Runaway protection must fire before any upstream spend (AUDIT RH-06):
+	// the guard was constructed and injected but never called on the hot path.
+	if h.cfg.Guard != nil && routeReq.SessionKey != "" && h.cfg.Guard.Trip(routeReq.SessionKey, input) {
+		h.recordFailure(r, protocol, model, router.Decision{}, http.StatusTooManyRequests, "rate_limit", reqStart)
+		writeGatewayError(w, r, http.StatusTooManyRequests, "rate_limit", "runaway request loop protection tripped: slow down identical requests in this session")
+		return
 	}
 	decision, err := h.cfg.Resolver.Resolve(r.Context(), routeReq)
 	if err != nil {
+		h.recordFailure(r, protocol, model, router.Decision{}, http.StatusBadRequest, classifyResolve(err), reqStart)
 		writeGatewayError(w, r, http.StatusBadRequest, classifyResolve(err), err.Error())
+		return
+	}
+	// Embeddings has no meaningful cross-protocol conversion: refuse instead of
+	// silently routing to an upstream whose semantics do not match (RH-12).
+	if endpoint == "embeddings" && normalizeProtocol(decision.ProviderModel.Protocol) != "openai-chat" {
+		h.recordFailure(r, protocol, model, decision, http.StatusBadRequest, "unsupported_conversion", reqStart)
+		writeGatewayError(w, r, http.StatusBadRequest, "unsupported_conversion", "embeddings cannot be converted to a non-OpenAI upstream")
 		return
 	}
 	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
@@ -278,6 +343,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamInput, err := transformRequest(protocol, endpoint, input, decision)
 	if err != nil {
+		h.recordFailure(r, protocol, model, decision, http.StatusBadRequest, "client_error", reqStart)
 		writeGatewayError(w, r, http.StatusBadRequest, "client_error", err.Error())
 		return
 	}
@@ -291,11 +357,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		upProto, upPath := upstreamEndpointAndProtocol(protocol, endpoint, decision)
-		limKey := last.CredentialKeyID
-		if limKey == "" {
-			limKey = decision.Channel.ID
-		}
-		if wait := h.cfg.Limiter.Wait(limKey); wait > 0 && wait <= 2*time.Second {
+		if wait := h.cfg.Limiter.Wait(h.limitKey(decision, last.CredentialKeyID)); wait > 0 && wait <= 2*time.Second {
 			timer := time.NewTimer(wait)
 			select {
 			case <-r.Context().Done():
@@ -319,11 +381,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		last, lastErr = h.cfg.Upstream.Do(r.Context(), Request{Protocol: upProto, Path: upPath, Headers: requestHeaders(r, upProto, stream, decision), Body: upstreamInput, Stream: stream, Decision: decision})
 		if lastErr == nil {
-			obsKey := last.CredentialKeyID
-			if obsKey == "" {
-				obsKey = decision.Channel.ID
-			}
-			h.cfg.Limiter.Observe(obsKey, last.StatusCode, last.RetryAfter, last.Header)
+			h.cfg.Limiter.Observe(h.limitKey(decision, last.CredentialKeyID), last.StatusCode, last.RetryAfter, last.Header)
 		}
 		if lastErr != nil {
 			if !retryableNetwork(lastErr) || attempt+1 == h.cfg.MaxAttempts {
@@ -387,6 +445,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		break
 	}
 	if lastErr != nil {
+		// The final failed attempt must reach the breaker too; previously
+		// failures were only recorded while another attempt remained, which
+		// made MaxAttempts=1 never trip and the last failure invisible (RH-18).
+		if h.cfg.Health != nil {
+			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+		}
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "network_error", reqStart)
 		writeGatewayError(w, r, http.StatusBadGateway, "network_error", "upstream request failed")
 		return
 	}
@@ -396,27 +461,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	if last.StatusCode < 200 || last.StatusCode >= 300 {
+		if h.cfg.Health != nil {
+			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+		}
+		// Upstream error statuses (429/5xx/...) previously never reached usage or
+		// trust-score sinks, so success rates and verify scores were skewed (RH-17).
+		h.recordFailure(r, protocol, model, decision, last.StatusCode, classifyUpstreamStatus(last.StatusCode), reqStart)
 		writeUpstreamError(w, r, last)
 		return
-	}
-	// A successful upstream response closes the circuit breaker and clears the
-	// failure count. Without this, a channel that tripped the breaker (or is
-	// half-open on a probe) would never return to Healthy even when working.
-	if h.cfg.Health != nil {
-		h.cfg.Health.RecordSuccess(decision.Channel.ID, 0, 1)
 	}
 	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
 		rr.Sticky.Remember(routeReq.SessionKey, decision.Channel.ID, last.CredentialKeyID)
 	}
-	startReq := time.Now()
 	if stream {
 		upProto := normalizeProtocol(decision.ProviderModel.Protocol)
 		meta, err := writeSSE(w, last.Body, protocol, upProto, decision.Model.ID)
 		if err != nil && !errors.Is(err, context.Canceled) {
+			if h.cfg.Health != nil {
+				h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+			}
+			rec := recordFor(r, protocol, decision, nil, http.StatusOK, h.cfg.Now())
+			rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
+			rec.ErrorClass = "stream_interrupted"
+			if h.cfg.Verify != nil {
+				h.cfg.Verify.Observe(rec)
+			}
+			if h.cfg.Recorder != nil {
+				_ = h.cfg.Recorder.Record(r.Context(), rec)
+			}
 			return
 		}
+		// Health success is only recorded once the stream body has been
+		// delivered, not when response headers merely looked OK (RH-18).
+		if err == nil && h.cfg.Health != nil {
+			h.cfg.Health.RecordSuccess(decision.Channel.ID, 0, 1)
+		}
 		rec := recordFor(r, protocol, decision, nil, http.StatusOK, h.cfg.Now())
-		rec.LatencyMS = int(time.Since(startReq).Milliseconds())
+		rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
 		rec.TTFTMS = meta.TTFTMS
 		rec.InputTokens = meta.InputTokens
 		rec.OutputTokens = meta.OutputTokens
@@ -425,6 +506,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rec.FinishReason = meta.FinishReason
 		if meta.UpstreamModel != "" {
 			rec.UpstreamModel = meta.UpstreamModel
+		}
+		if meta.Truncated {
+			rec.ErrorClass = "upstream_eof_no_finish"
 		}
 		if h.cfg.Verify != nil {
 			h.cfg.Verify.Observe(rec)
@@ -436,23 +520,108 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(io.LimitReader(last.Body, 16<<20))
 	if err != nil {
+		if h.cfg.Health != nil {
+			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+		}
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "provider_protocol", reqStart)
 		writeGatewayError(w, r, http.StatusBadGateway, "provider_protocol", "malformed upstream response")
 		return
 	}
 	transformed, err := transformResponse(protocol, body, decision, h.cfg.Now())
 	if err != nil {
+		if h.cfg.Health != nil {
+			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+		}
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "provider_protocol", reqStart)
 		writeGatewayError(w, r, http.StatusBadGateway, "provider_protocol", err.Error())
 		return
+	}
+	// Health success only after the body has been parsed and transformed
+	// successfully (RH-18); "success at headers, broken body" no longer passes.
+	if h.cfg.Health != nil {
+		h.cfg.Health.RecordSuccess(decision.Channel.ID, 0, 1)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(transformed)
-	h.record(r, protocol, decision, transformed, http.StatusOK, time.Since(startReq).Milliseconds())
+	h.record(r, protocol, decision, transformed, http.StatusOK, time.Since(reqStart).Milliseconds())
+}
+
+// recordFailure persists terminal non-success outcomes (resolve/transform
+// errors, guard trips, exhausted retries, upstream error statuses) so success
+// rates, latency percentiles and trust scores reflect reality (AUDIT RH-17).
+func (h *Handler) recordFailure(r *http.Request, protocol, model string, decision router.Decision, status int, errClass string, reqStart time.Time) {
+	if decision.Model.ID != "" {
+		model = decision.Model.ID
+	}
+	rec := usage.RequestRecord{
+		ID:         fmt.Sprintf("gw-%d", h.seq.Add(1)),
+		RequestID:  r.Header.Get("X-Request-ID"),
+		Protocol:   protocol,
+		ModelID:    model,
+		ChannelID:  decision.Channel.ID,
+		StatusCode: status,
+		ErrorClass: errClass,
+		CreatedAt:  h.cfg.Now(),
+		LatencyMS:  int(time.Since(reqStart).Milliseconds()),
+	}
+	if decision.ProviderModel.UpstreamModelName != "" {
+		rec.UpstreamModel = decision.ProviderModel.UpstreamModelName
+	}
+	if h.cfg.Verify != nil {
+		h.cfg.Verify.Observe(rec)
+	}
+	if h.cfg.Recorder != nil {
+		_ = h.cfg.Recorder.Record(r.Context(), rec)
+	}
+}
+
+// limitKey keeps Wait and Observe on the same limiting object (AUDIT RH-19):
+// the credential of the current attempt when known, otherwise the channel.
+func (h *Handler) limitKey(decision router.Decision, lastKeyID string) string {
+	if decision.PreferredKeyID != "" {
+		return decision.PreferredKeyID
+	}
+	if lastKeyID != "" {
+		return lastKeyID
+	}
+	return decision.Channel.ID
+}
+
+// classifyUpstreamStatus gives usage records a stable error class for upstream
+// non-2xx statuses.
+func classifyUpstreamStatus(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "rate_limit"
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "upstream_auth"
+	case status >= 500:
+		return "upstream_5xx"
+	default:
+		return "upstream_error"
+	}
 }
 
 func (h *Handler) record(r *http.Request, protocol string, decision router.Decision, body []byte, status int, latencyMS int64) {
 	rec := recordFor(r, protocol, decision, body, status, h.cfg.Now())
 	rec.LatencyMS = int(latencyMS)
+	if h.cfg.Verify != nil {
+		h.cfg.Verify.Observe(rec)
+	}
+	if h.cfg.Recorder != nil {
+		_ = h.cfg.Recorder.Record(r.Context(), rec)
+	}
+}
+
+// recordFailure is the failure-side companion of record: it observes the
+// attempt towards the verify registry and the usage recorder so that 4xx/5xx
+// walks, runaway trips and transform failures affect trust scores and stats
+// exactly like success records do (AUDIT RH-17).
+func (h *handler) recordFailure(r *http.Request, protocol, model string, decision router.Decision, status int, errorClass string, reqStart time.Time) {
+	rec := recordFor(r, protocol, decision, nil, status, h.cfg.Now())
+	rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
+	rec.ErrorClass = errorClass
 	if h.cfg.Verify != nil {
 		h.cfg.Verify.Observe(rec)
 	}
@@ -489,6 +658,13 @@ func requestHeaders(r *http.Request, protocol string, stream bool, decision rout
 	h.Del("Cookie")
 	h.Del("Set-Cookie")
 	h.Del("Proxy-Authorization")
+	// Clients may spoof forwarding headers; the gateway speaks to the upstream
+	// itself, so these must never be forwarded verbatim (AUDIT RH-11).
+	h.Del("X-Forwarded-For")
+	h.Del("X-Real-Ip")
+	h.Del("Cf-Connecting-Ip")
+	h.Del("X-Forwarded-Host")
+	h.Del("Forwarded")
 	if protocol == "anthropic" || protocol == "anthropic-messages" {
 		if h.Get("anthropic-version") == "" {
 			h.Set("anthropic-version", "2023-06-01")
