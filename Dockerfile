@@ -13,7 +13,14 @@ COPY cmd/ cmd/
 # deliberately not copied here.
 COPY internal/ internal/
 
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/relayhub ./cmd/relayhub
+# Build metadata is passed in by CI (docker/build-push-action build-args) so
+# the image reports a real version like every other artifact (AUDIT RH-33).
+ARG VERSION=0.0.0-dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+RUN CGO_ENABLED=0 go build \
+    -ldflags="-s -w -X relayhub/internal/buildinfo.version=${VERSION} -X relayhub/internal/buildinfo.commit=${COMMIT} -X relayhub/internal/buildinfo.date=${DATE}" \
+    -o /bin/relayhub ./cmd/relayhub
 
 # Final minimal runtime stage
 FROM alpine:3.20
@@ -31,8 +38,18 @@ RUN chmod +x /app/entrypoint.sh /app/healthcheck.sh && \
     mkdir -p /data && \
     chown -R relayhub:relayhub /data /app
 
+# Listen addresses. The management plane is loopback-only by design (reach it
+# with `docker exec` or run the container with host networking). The three
+# data-plane listeners default to loopback too; publish them through a bridge
+# network by overriding these to 0.0.0.0:<port> (AUDIT RH-04) — see
+# docs/deployment-docker.md. The gateway is protected by local API keys; the
+# proxies are NOT authenticated unless configured, so never publish them to a
+# non-loopback host interface.
 ENV DATA_DIR="/data" \
-    RELAYHUB_MANAGEMENT_ADDR="127.0.0.1:8790"
+    RELAYHUB_MANAGEMENT_ADDR="127.0.0.1:8790" \
+    RELAYHUB_HTTP_PROXY_ADDR="127.0.0.1:8787" \
+    RELAYHUB_SOCKS5_ADDR="127.0.0.1:8788" \
+    RELAYHUB_GATEWAY_ADDR="127.0.0.1:8789"
 
 VOLUME ["/data"]
 USER 10001:10001

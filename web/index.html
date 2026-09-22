@@ -97,7 +97,7 @@
             <div class="col list-col">
               <header class="col-h">
                 <h1>渠道</h1>
-                <button class="ghost" id="ch-new" type="button">新建</button>
+                <span class="hint" title="渠道的增删改通过管理 API 完成：POST /api/v1/channels">API 管理</span>
               </header>
               <input class="search" id="ch-q" placeholder="过滤名称 / 标签 / 上游">
               <ul class="rows" id="ch-rows"></ul>
@@ -112,7 +112,7 @@
         <article class="view" id="view-models">
           <div class="split">
             <div class="col list-col">
-              <header class="col-h"><h1>模型</h1><button class="ghost" id="md-new" type="button">新建</button></header>
+              <header class="col-h"><h1>模型</h1><span class="hint" title="模型的增删改通过管理 API 完成：POST /api/v1/models">API 管理</span></header>
               <ul class="rows" id="md-rows"></ul>
             </div>
             <div class="col inspector" id="md-ins"><div class="empty">选择逻辑模型，查看绑定与能力。</div></div>
@@ -146,15 +146,17 @@
         <article class="view" id="view-lab">
           <div class="split">
             <div class="col list-col">
-              <header class="col-h"><h1>实验室</h1></header>
-              <div class="seg" id="lab-seg">
-                <button class="on" data-lab="replay" type="button">回放</button>
-                <button data-lab="probe" type="button">探针</button>
-                <button data-lab="hedge" type="button">对冲</button>
-              </div>
+              <header class="col-h">
+                <h1>实验室</h1>
+                <span class="actions">
+                  <button class="ghost" id="lab-capture" type="button">开始捕获</button>
+                  <button class="ghost" id="lab-clear" type="button">清空</button>
+                </span>
+              </header>
+              <p class="lede">捕获经过网关的请求（单条最多 256 KiB，明文保存在内存）。回放 / 探针 / 对冲尚未实现。</p>
               <ul class="rows" id="lab-rows"></ul>
             </div>
-            <div class="col inspector" id="lab-ins"><div class="empty">捕获的请求可扇出到多渠道对比。</div></div>
+            <div class="col inspector" id="lab-ins"><div class="empty">选择一条捕获查看详情。</div></div>
           </div>
         </article>
 
@@ -186,10 +188,10 @@
           <div class="settings-sheet">
             <h1>设置</h1>
             <dl class="sheet">
-              <div><dt>Gateway</dt><dd id="set-gw">127.0.0.1:8789</dd></div>
-              <div><dt>HTTP 代理</dt><dd>127.0.0.1:8787</dd></div>
-              <div><dt>SOCKS5</dt><dd>127.0.0.1:8788</dd></div>
-              <div><dt>管理面</dt><dd>127.0.0.1:8790</dd></div>
+              <div><dt>Gateway</dt><dd id="set-gw">—</dd></div>
+              <div><dt>管理面</dt><dd id="set-mgmt">—</dd></div>
+              <div><dt>管理令牌</dt><dd id="set-token">—</dd></div>
+              <div><dt>浏览器运行时</dt><dd id="set-browser">—</dd></div>
             </dl>
             <p class="lede">桌面壳负责启停 Core、钥匙串、开机启动。本窗口是壳内唯一界面，不再提供浏览器后台管理页。</p>
           </div>

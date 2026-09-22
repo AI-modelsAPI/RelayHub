@@ -23,6 +23,18 @@ jobs:
           context: .
           load: true
           tags: relayhub:test
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
 
       - name: Run Container Smoke Test
         run: ./tests/docker/smoke.sh relayhub:test
+
+      - name: Image reports stamped version
+        run: |
+          OUT="$(docker run --rm relayhub:test -version)"
+          echo "$OUT"
+          case "$OUT" in
+            *"0.0.0-dev"*|*"commit unknown"*) echo "ERROR: image is not version-stamped"; exit 1 ;;
+          esac

@@ -1,23 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Optional launch-at-login agent for the RelayHub desktop shell.
+
+  Install:  cp desktop/macos/LaunchAgent.plist ~/Library/LaunchAgents/com.relayhub.desktop.plist
+            launchctl load ~/Library/LaunchAgents/com.relayhub.desktop.plist
+  Remove:   launchctl unload ~/Library/LaunchAgents/com.relayhub.desktop.plist
+
+  The program is the shell executable (Contents/MacOS/RelayHub), not the Core:
+  the shell owns the Core lifecycle (flock, ownership token, watchdog) and
+  launches Contents/Resources/relayhub-core itself. A previous version pointed
+  at Contents/MacOS/relayhub, a path the bundle never contained (AUDIT RH-33).
+
+  KeepAlive is deliberately off: with it on, quitting the menu bar app makes
+  launchd relaunch it immediately. Logs go to the unified log (NSLog); launchd
+  does not expand "~" in StandardOutPath, so no file paths are configured here.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.relayhub.core</string>
+    <string>com.relayhub.desktop</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/RelayHub.app/Contents/MacOS/relayhub</string>
-        <string>-full-stack</string>
+        <string>/Applications/RelayHub.app/Contents/MacOS/RelayHub</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
-    <!-- Logs previously went to world-readable /tmp paths (AUDIT RH-04/RH-31 hygiene);
-         ~/Library/Logs keeps them inside the installing user's home. -->
-    <key>StandardOutPath</key>
-    <string>~/Library/Logs/relayhub.stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>~/Library/Logs/relayhub.stderr.log</string>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>

@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"relayhub/internal/auth"
+	"relayhub/internal/clisync"
 	"relayhub/internal/domain"
 	"relayhub/internal/repository"
 	"relayhub/internal/secrets"
@@ -100,11 +101,14 @@ func TestP1_6_CLISyncLifecycleRedToGreen(t *testing.T) {
 	if !previewResp.Diff.HasChanges || len(previewResp.Diff.ChangedKeys) == 0 {
 		t.Fatalf("expected diff with changes, got: %+v", previewResp)
 	}
-	if previewResp.Diff.APIKey == "" {
-		t.Fatalf("expected real local api key issued in preview, got empty")
+	// Preview is read-only: it must not mint a live gateway key (an abandoned
+	// preview would leave a valid credential behind, AUDIT RH-23/24). The diff
+	// carries a placeholder that apply replaces with a real key.
+	if previewResp.Diff.APIKey != clisync.PlaceholderAPIKey {
+		t.Fatalf("preview must carry the placeholder key, got %q", previewResp.Diff.APIKey)
 	}
-	if !localKeys.Validate(previewResp.Diff.APIKey) {
-		t.Fatalf("issued preview APIKey is not valid in localKeys: %s", previewResp.Diff.APIKey)
+	if keys, _ := localKeys.List(); len(keys) != 0 {
+		t.Fatalf("preview minted %d local api key(s); it must mint none", len(keys))
 	}
 
 	// 3. Apply hermes: POST /api/v1/cli-sync with action=apply
@@ -130,6 +134,9 @@ func TestP1_6_CLISyncLifecycleRedToGreen(t *testing.T) {
 	}
 	if applyResp.Status != "success" {
 		t.Fatalf("expected status=success, got %s", applyResp.Status)
+	}
+	if keys, _ := localKeys.List(); len(keys) != 1 {
+		t.Fatalf("apply must mint exactly one local api key, got %d", len(keys))
 	}
 
 	// Check that hermes config and .env actually exist on disk

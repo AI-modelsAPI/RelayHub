@@ -855,6 +855,7 @@ func nullString(v string) any {
 	}
 	return v
 }
+
 const requestColumns = `id,request_id,protocol,model_id,provider_id,channel_id,status_code,latency_ms,input_tokens,output_tokens,error_class,created_at,ttft_ms,cache_read_tokens,cache_write_tokens,finish_reason,upstream_model`
 
 func scanRequest(row interface{ Scan(...any) error }) (domain.RequestRecord, error) {

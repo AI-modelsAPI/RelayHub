@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -138,8 +139,7 @@ func (s *HTTPServer) handleConnect(ctx context.Context, c net.Conn, br *bufio.Re
 	}
 	up, host, port, err := s.dialTarget(ctx, r.Host, "", true, s.cfg.TargetPolicy)
 	if err != nil {
-		s.log("warn", "proxy_connect_denied", requestID, map[string]any{"host": host, "port": port, "error": err.Error()})
-		_, _ = fmt.Fprint(c, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		s.rejectDial(c, requestID, "proxy_connect", host, port, err)
 		return
 	}
 	defer up.Close()
@@ -212,7 +212,7 @@ func (s *HTTPServer) handleHTTP(ctx context.Context, c net.Conn, r *http.Request
 	}
 	up, host, port, err := s.dialTarget(ctx, authority, "80", false, s.cfg.TargetPolicy)
 	if err != nil {
-		s.log("warn", "proxy_http_denied", requestID, map[string]any{"host": host, "port": port, "error": err.Error()})
+		s.rejectDial(c, requestID, "proxy_http", host, port, err)
 		return
 	}
 	defer up.Close()
@@ -227,6 +227,21 @@ func (s *HTTPServer) handleHTTP(ctx context.Context, c net.Conn, r *http.Request
 	defer response.Body.Close()
 	_ = response.Write(c)
 	s.log("info", "proxy_http", requestID, map[string]any{"host": host, "port": port, "method": r.Method})
+}
+
+// rejectDial answers a request whose upstream could not be reached. A policy
+// denial and an unreachable target used to share one 403 on CONNECT (and a
+// silent close on plain HTTP), so clients could not tell "blocked by RelayHub"
+// from "upstream down" and tests could not assert policy without the public
+// internet (AUDIT RH-21). Policy verdicts stay 403; dial/resolve failures are
+// 502 Bad Gateway.
+func (s *HTTPServer) rejectDial(c net.Conn, requestID, kind, host string, port int, err error) {
+	status, suffix := "502 Bad Gateway", "_failed"
+	if errors.Is(err, errInvalidTarget) {
+		status, suffix = "403 Forbidden", "_denied"
+	}
+	s.log("warn", kind+suffix, requestID, map[string]any{"host": host, "port": port, "error": err.Error()})
+	_, _ = fmt.Fprintf(c, "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status)
 }
 
 func (s *HTTPServer) log(level, kind, requestID string, fields map[string]any) {

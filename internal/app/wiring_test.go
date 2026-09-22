@@ -66,3 +66,29 @@ func TestFullStackWiringLifecycle(t *testing.T) {
 		t.Fatalf("expected 0 listeners after shutdown, got %d", app.Listeners())
 	}
 }
+
+func TestAdvertisedAddrRewritesWildcardHosts(t *testing.T) {
+	for in, want := range map[string]string{
+		"0.0.0.0:8789":   "127.0.0.1:8789",
+		"[::]:8789":      "127.0.0.1:8789",
+		":8789":          "127.0.0.1:8789",
+		"127.0.0.1:8789": "127.0.0.1:8789",
+		"192.168.1.4:1":  "192.168.1.4:1",
+		"garbage":        "garbage",
+	} {
+		if got := advertisedAddr(in); got != want {
+			t.Errorf("advertisedAddr(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIsLoopbackListen(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:8787": true, "localhost:8787": true, "[::1]:8787": true,
+		"0.0.0.0:8787": false, ":8787": false, "192.168.1.4:8787": false, "bad": false,
+	} {
+		if got := isLoopbackListen(addr); got != want {
+			t.Errorf("isLoopbackListen(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}

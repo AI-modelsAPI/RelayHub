@@ -6,12 +6,12 @@ services:
     image: relayhub:latest
     container_name: relayhub
     restart: unless-stopped
-    # By default, management API is bound to 127.0.0.1 to prevent public internet exposure
-    ports:
-      - "8787:8787"       # HTTP / HTTPS CONNECT transparent proxy
-      - "8788:8788"       # SOCKS5 proxy
-      - "8789:8789"       # OpenAI / Anthropic Gateway
-      - "127.0.0.1:8790:8790" # Local management console / Web UI
+    # RelayHub is local-first: every listener binds loopback inside the
+    # container. With a bridge network + `ports:` those sockets are unreachable
+    # from the host (AUDIT RH-04), so the default deployment shares the host
+    # network stack — the four services then appear on the host's 127.0.0.1
+    # exactly like a native install (Linux; Docker Desktop >= 4.34 on macOS).
+    network_mode: host
     volumes:
       - relayhub-data:/data
     healthcheck:
@@ -20,6 +20,23 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  # Bridge-network alternative (no host networking): bind the data-plane
+  # listeners to the container's interfaces and publish them ONLY on the host's
+  # loopback. The management UI stays inside the container (docker exec).
+  #
+  # relayhub-bridge:
+  #   image: relayhub:latest
+  #   environment:
+  #     RELAYHUB_HTTP_PROXY_ADDR: "0.0.0.0:8787"
+  #     RELAYHUB_SOCKS5_ADDR: "0.0.0.0:8788"
+  #     RELAYHUB_GATEWAY_ADDR: "0.0.0.0:8789"
+  #   ports:
+  #     - "127.0.0.1:8787:8787"
+  #     - "127.0.0.1:8788:8788"
+  #     - "127.0.0.1:8789:8789"
+  #   volumes:
+  #     - relayhub-data:/data
 
 volumes:
   relayhub-data:

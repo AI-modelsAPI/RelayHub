@@ -260,6 +260,16 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	browserRt := browser.NewRuntime()
 	sched.SetBrowserExecutor(browser.NewCDPExecutor(browserRt, absDataDir, browser.Detect))
 
+	// The address handed to CLI sync / settings must be dialable by a local
+	// client: the *bound* port (a ":0" listener picks one) with any wildcard
+	// host rewritten to loopback (a container binds 0.0.0.0, AUDIT RH-04).
+	advertisedGW := advertisedAddr(gwL.Addr().String())
+	for _, l := range []struct{ name, addr string }{{"http proxy", httpPAddr}, {"socks5 proxy", socksAddr}, {"gateway", gwAddr}} {
+		if !isLoopbackListen(l.addr) {
+			log.Printf("relayhub: WARNING %s listens on %s, which is reachable beyond this machine; only do this behind a firewall or a container port mapping bound to 127.0.0.1", l.name, l.addr)
+		}
+	}
+
 	apiServer, err := api.NewConfiguredServer(api.Config{
 		Management:     apiAddr,
 		LocalOnly:      true,
@@ -270,7 +280,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		OnConfigChange: refreshResolver,
 		Logger:         logging.New(os.Stdout),
 		BackupDir:      filepath.Join(absDataDir, "backups"),
-		GatewayAddr:    gwAddr,
+		GatewayAddr:    advertisedGW,
 		BrowserRuntime: browserRt,
 		Scheduler:      sched,
 	})
@@ -395,6 +405,33 @@ func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepos
 
 // describeTargetPolicy renders a proxy target policy for operator-facing logs.
 // The policy is a struct of booleans, so it must never be formatted with %s.
+// advertisedAddr converts a bound listener address into one a local client
+// can dial: wildcard hosts (0.0.0.0, ::, empty) become 127.0.0.1.
+func advertisedAddr(bound string) string {
+	host, port, err := net.SplitHostPort(bound)
+	if err != nil {
+		return bound
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return bound
+}
+
+// isLoopbackListen reports whether a listen address can only be reached from
+// this machine ("localhost", 127.0.0.0/8, ::1).
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func describeTargetPolicy(p proxy.TargetPolicy) string {
 	switch {
 	case p.AllowPublic && p.AllowPrivate && p.AllowLocal:

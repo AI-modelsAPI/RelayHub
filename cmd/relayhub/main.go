@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -44,12 +45,22 @@ func run(args []string) error {
 		dataDir        string
 		fullStack      bool
 		managementAddr string
+		httpProxyAddr  string
+		socks5Addr     string
+		gatewayAddr    string
 	)
 	managementDefault := config.DefaultManagementAddr
 	if value, present := os.LookupEnv("RELAYHUB_MANAGEMENT_ADDR"); present {
 		managementDefault = value
 	}
 	fs.StringVar(&managementAddr, "management-addr", managementDefault, "loopback management address (overrides RELAYHUB_MANAGEMENT_ADDR)")
+	// The three data-plane listeners accept non-loopback addresses so a
+	// container can publish them (AUDIT RH-04: every listener was pinned to
+	// the container's own loopback, making `-p 8789:8789` unreachable). The
+	// management plane stays loopback-only by design.
+	fs.StringVar(&httpProxyAddr, "http-proxy-addr", envOr("RELAYHUB_HTTP_PROXY_ADDR", config.DefaultHTTPProxyAddr), "HTTP/HTTPS CONNECT proxy listen address (overrides RELAYHUB_HTTP_PROXY_ADDR)")
+	fs.StringVar(&socks5Addr, "socks5-addr", envOr("RELAYHUB_SOCKS5_ADDR", config.DefaultSOCKS5Addr), "SOCKS5 proxy listen address (overrides RELAYHUB_SOCKS5_ADDR)")
+	fs.StringVar(&gatewayAddr, "gateway-addr", envOr("RELAYHUB_GATEWAY_ADDR", config.DefaultGatewayAddr), "AI gateway listen address (overrides RELAYHUB_GATEWAY_ADDR)")
 	fs.BoolVar(&showVersion, "version", false, "print version information and exit")
 	fs.StringVar(&dataDir, "data-dir", defaultDataDir(), "directory for RelayHub state")
 	fs.BoolVar(&fullStack, "full-stack", false, "start full stack (proxies, gateway, management API)")
@@ -71,8 +82,18 @@ func run(args []string) error {
 	if err := validateManagementAddress(managementAddr); err != nil {
 		return err
 	}
+	for _, l := range []struct{ name, addr string }{
+		{"http proxy", httpProxyAddr}, {"socks5 proxy", socks5Addr}, {"gateway", gatewayAddr},
+	} {
+		if err := validateListenAddress(l.name, l.addr); err != nil {
+			return err
+		}
+	}
 	a, err := app.New(app.Config{
 		DataDir:        dataDir,
+		HTTPProxyAddr:  httpProxyAddr,
+		SOCKS5Addr:     socks5Addr,
+		GatewayAddr:    gatewayAddr,
 		ManagementAddr: managementAddr,
 		WireFullStack:  fullStack,
 	})
@@ -102,6 +123,15 @@ func run(args []string) error {
 	}
 	log.Printf("relayhub: stopped cleanly")
 	return nil
+}
+
+// envOr returns the environment value for key, or fallback when the variable
+// is unset or empty.
+func envOr(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // defaultDataDir returns a per-user default state directory. It never fails; if

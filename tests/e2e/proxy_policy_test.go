@@ -2,8 +2,8 @@ package e2e
 
 import (
 	"context"
-	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,14 +13,56 @@ import (
 	"relayhub/internal/app"
 )
 
-func TestProxyDefaultAllowsPublicTarget(t *testing.T) {
-	// A mock server simulating a public upstream service (bound to loopback in test, but we test target policy behavior)
-	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("proxied-ok"))
-	}))
-	defer targetServer.Close()
+// nonLoopbackTarget serves a tiny HTTP fixture on a LAN (non-loopback, non
+// link-local) interface of this host. That gives the "open" proxy policy a
+// real non-local address to admit without depending on the public internet,
+// which made the previous version of this test fail on any machine whose
+// network drops 1.1.1.1:443 (the 301 → https redirect turned the request into
+// a CONNECT that timed out). Returns "" when no such interface exists.
+func nonLoopbackTarget(t *testing.T) string {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipn.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			ln, err := net.Listen("tcp", net.JoinHostPort(ip.String(), "0"))
+			if err != nil {
+				continue
+			}
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("proxied-ok"))
+			}))
+			srv.Listener = ln
+			srv.Start()
+			t.Cleanup(srv.Close)
+			return srv.URL
+		}
+	}
+	return ""
+}
 
+// TestProxyDefaultAllowsPublicTarget verifies the out-of-the-box proxy policy
+// is "open": non-loopback targets are admitted (the explicit local_only policy
+// is covered by TestProxyLocalOnlyExplicitPolicyBlocksPublicTarget).
+func TestProxyDefaultAllowsPublicTarget(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := app.Config{
 		DataDir:        dataDir,
@@ -59,22 +101,37 @@ func TestProxyDefaultAllowsPublicTarget(t *testing.T) {
 			Proxy: http.ProxyURL(proxyURL),
 		},
 		Timeout: 5 * time.Second,
+		// Never follow redirects: a 301 to https:// would become a CONNECT to
+		// port 443, which is exactly the network dependency this test avoids.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
-	// 1.1.1.1 or 8.8.8.8 represents a public target IP.
-	// When default policy is LocalOnly, requesting an external IP returns 403 / target blocked by policy / EOF.
-	// With the fix, public targets are permitted by default policy.
-	// We can test by sending a request to 1.1.1.1:80 via proxy and asserting proxy doesn't block it with 403 Forbidden.
+	if target := nonLoopbackTarget(t); target != "" {
+		resp, err := client.Get(target)
+		if err != nil {
+			t.Fatalf("request to LAN target %s via HTTP proxy failed: %v", target, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK || string(body) != "proxied-ok" {
+			t.Fatalf("expected 200 proxied-ok from %s via proxy, got %d %q", target, resp.StatusCode, string(body))
+		}
+		return
+	}
+
+	// No usable LAN interface on this host: fall back to a public address. The
+	// only assertion is that the proxy does not *deny* it. 403 is a policy
+	// verdict; 200/301 (reachable) or 502 (network offline) both prove the open
+	// policy let the dial proceed.
 	req, _ := http.NewRequest(http.MethodGet, "http://1.1.1.1:80/", nil)
 	resp, err := client.Do(req)
 	if err != nil {
-		// If proxy rejected connection with 403, http client sees EOF or 403
-		t.Fatalf("request to public target via HTTP proxy failed: %v", err)
+		t.Skipf("no non-loopback interface and public fallback target unreachable through proxy: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden {
 		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("HTTP proxy blocked public target with 403: %s", string(b))
+		t.Fatalf("HTTP proxy blocked public target with 403 under default policy: %s", string(b))
 	}
-	fmt.Printf("resp status from public IP via proxy: %d\n", resp.StatusCode)
+	t.Logf("public fallback target via proxy answered %d (open policy admitted the dial)", resp.StatusCode)
 }

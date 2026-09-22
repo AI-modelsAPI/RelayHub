@@ -93,7 +93,7 @@ func (s *Service) Preview(ctx context.Context, cli string, desired DesiredState)
 	// orphaned if Apply were never called (AUDIT RH-23/24). A marker keeps the
 	// diff honest without touching the key service.
 	if desired.APIKey == "" {
-		desired.APIKey = "<<issued-on-apply>>"
+		desired.APIKey = PlaceholderAPIKey
 	}
 	return syncer.Preview(ctx, desired)
 }

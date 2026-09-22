@@ -614,22 +614,6 @@ func (h *Handler) record(r *http.Request, protocol string, decision router.Decis
 	}
 }
 
-// recordFailure is the failure-side companion of record: it observes the
-// attempt towards the verify registry and the usage recorder so that 4xx/5xx
-// walks, runaway trips and transform failures affect trust scores and stats
-// exactly like success records do (AUDIT RH-17).
-func (h *handler) recordFailure(r *http.Request, protocol, model string, decision router.Decision, status int, errorClass string, reqStart time.Time) {
-	rec := recordFor(r, protocol, decision, nil, status, h.cfg.Now())
-	rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
-	rec.ErrorClass = errorClass
-	if h.cfg.Verify != nil {
-		h.cfg.Verify.Observe(rec)
-	}
-	if h.cfg.Recorder != nil {
-		_ = h.cfg.Recorder.Record(r.Context(), rec)
-	}
-}
-
 func extractKey(r *http.Request) string {
 	if key := strings.TrimSpace(r.Header.Get("x-api-key")); key != "" {
 		return key

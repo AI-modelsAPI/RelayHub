@@ -17,7 +17,6 @@ import (
 	"relayhub/internal/verify"
 )
 
-
 func (s *Server) usageSummary(w http.ResponseWriter, r *http.Request) {
 	if !s.methodAllowed(w, r, http.MethodGet) {
 		return

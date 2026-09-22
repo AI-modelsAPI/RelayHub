@@ -94,7 +94,17 @@ vm.runInContext(fs.readFileSync("web/app.js", "utf8"), sandbox);
              "custom_headers absent from migrated channels schema")
         db.execute("INSERT INTO request_records(id,request_id,created_at,cache_read_tokens,ttft_ms,upstream_model) VALUES('audit','audit','2026-09-22T00:00:00Z',81,123,'upstream')")
         repo = source("internal/repository/repository.go")
-        read_sql = re.search(r'`(SELECT [^`]+ FROM request_records ORDER BY created_at DESC)`', repo).group(1)
+        # The read SQL may be a literal or may splice a shared column-list
+        # constant (`SELECT `+requestColumns+` FROM ...`); resolve either
+        # form instead of crashing when the source shape changes.
+        read_match = re.search(r'`(SELECT [^`]*?) ?`\s*\+\s*(\w+)\s*\+\s*`( FROM request_records[^`]*?ORDER BY created_at DESC)', repo)
+        if read_match:
+            const_name = read_match.group(2)
+            const_val = re.search(r'const ' + const_name + r' = `([^`]+)`', repo).group(1)
+            read_sql = read_match.group(1).rstrip() + " " + const_val + read_match.group(3)
+        else:
+            read_sql = re.search(r'`(SELECT [^`]+ FROM request_records ORDER BY created_at DESC)`', repo).group(1)
+        read_sql = re.sub(r'\bLIMIT \?', 'LIMIT 100', read_sql)
         cur = db.execute(read_sql)
         fields = [col[0] for col in cur.description]
         cur.fetchall()
@@ -117,8 +127,14 @@ vm.runInContext(fs.readFileSync("web/app.js", "utf8"), sandbox);
 
     server = source("internal/api/server.go")
     routes = section(server, "func (s *Server) managementRoutes()", "func (s *Server) peerAllowed(")
-    emit("V08 / RH-05: extras route registration", "s.extras" not in routes,
-         "managementRoutes does not register s.extras")
+    # The fix registers each extras endpoint on its own pattern (there is no
+    # single s.extras dispatcher any more), so probe the concrete paths the
+    # frontend and the MCP bridge call.
+    extras_paths = ["/api/v1/usage/summary", "/api/v1/verify/scores", "/api/v1/identity",
+                    "/api/v1/lab", "/api/v1/lab/capture", "/api/v1/routes/explain", "/api/v1/mcp"]
+    missing = [path for path in extras_paths if f'"{path}"' not in routes]
+    emit("V08 / RH-05: extras route registration", bool(missing),
+         {"unregistered": missing} if missing else "all extras paths registered in managementRoutes")
     gateway = source("internal/gateway/gateway.go")
     emit("V09 / RH-06: runaway guard invocation", "Guard" in gateway and ".Trip(" not in gateway,
          "Guard declared in Config; no Trip call in gateway.go")

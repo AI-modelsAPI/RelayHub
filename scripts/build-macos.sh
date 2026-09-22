@@ -5,6 +5,15 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 mkdir -p "$DIST_DIR"
 
+# Stamp the Core with the same metadata the Makefile injects, so a packaged
+# app reports a real version/commit instead of "0.0.0-dev (commit unknown)"
+# (AUDIT RH-33: release builds used bare -s -w).
+VERSION="${VERSION:-$(git -C "$ROOT_DIR" describe --tags --always --dirty 2>/dev/null || echo 0.0.0-dev)}"
+COMMIT="${COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+DATE="${DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+LDFLAGS="-s -w -X relayhub/internal/buildinfo.version=$VERSION -X relayhub/internal/buildinfo.commit=$COMMIT -X relayhub/internal/buildinfo.date=$DATE"
+echo "==> Build metadata: version=$VERSION commit=$COMMIT date=$DATE"
+
 build_arch() {
     local ARCH="$1"
     local DMG_ARCH=""
@@ -29,7 +38,7 @@ build_arch() {
 
     # 1. Build Go Core binary into Contents/Resources/relayhub-core
     echo "  Building Go Core for $ARCH..."
-    CGO_ENABLED=0 GOOS=darwin GOARCH="$ARCH" go build -ldflags="-s -w" -o "$APP_DIR/Contents/Resources/relayhub-core" "$ROOT_DIR/cmd/relayhub"
+    CGO_ENABLED=0 GOOS=darwin GOARCH="$ARCH" go build -ldflags="$LDFLAGS" -o "$APP_DIR/Contents/Resources/relayhub-core" "$ROOT_DIR/cmd/relayhub"
 
     # 2. Compile native Objective-C/Cocoa desktop shell executable into Contents/MacOS/RelayHub
     echo "  Compiling native macOS shell for $CLANG_ARCH..."

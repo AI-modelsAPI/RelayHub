@@ -202,7 +202,7 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 	}
 
 	// Run inside atomic transaction
-	err = repo.WithTx(ctx, func(tx *repository.Tx) error {
+	err := repo.WithTx(ctx, func(tx *repository.Tx) error {
 		for _, p := range provs {
 			existing, err := tx.GetProvider(ctx, p.ID)
 			if err == nil && existing.ID != "" {

@@ -1,11 +1,11 @@
 package lab
 
-// maxCaptureBody caps a single captured request body (256 KiB).
-const maxCaptureBody = 256 << 10
-
 import (
 	"sync"
 )
+
+// maxCaptureBody caps a single captured request body (256 KiB).
+const maxCaptureBody = 256 << 10
 
 type Capture struct {
 	ID        string `json:"id"`
@@ -14,6 +14,9 @@ type Capture struct {
 	ChannelID string `json:"channel_id"`
 	Body      []byte `json:"-"`
 	Size      int    `json:"size"`
+	// Truncated reports that Body was cut to maxCaptureBody; Size still
+	// carries the original request length so callers can see the loss.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type Ring struct {
@@ -66,6 +69,7 @@ func (r *Ring) Push(c Capture) {
 	// stored body and note truncation on the record.
 	if len(c.Body) > maxCaptureBody {
 		c.Body = c.Body[:maxCaptureBody]
+		c.Truncated = true
 	}
 	r.items = append(r.items, c)
 	if len(r.items) > r.max {
@@ -85,6 +89,17 @@ func (r *Ring) List() []Capture {
 		out[i].Body = nil
 	}
 	return out
+}
+
+// Clear drops every stored capture. The enabled flag is left untouched so a
+// DELETE on the lab endpoint empties the buffer without changing capture mode.
+func (r *Ring) Clear() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items = nil
 }
 
 func (r *Ring) Get(id string) (Capture, bool) {

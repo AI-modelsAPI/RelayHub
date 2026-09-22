@@ -99,6 +99,20 @@ func TestCodexSyncCycle(t *testing.T) {
 		t.Fatalf("preview failed: %v, diff=%+v", err, diff)
 	}
 
+	// config.toml only names env_key; without the variable actually delivered
+	// Codex fails auth on first use (AUDIT RH-23), so apply must refuse a
+	// keyless diff rather than write a half-configured provider.
+	if _, err := syncer.Apply(ctx, diff); err == nil {
+		t.Fatal("expected apply to refuse writing without an api key, got nil error")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, ".env")); statErr == nil {
+		t.Fatal("refused apply must not leave a .env behind")
+	}
+	if got, _ := os.ReadFile(cfgFile); string(got) != initial {
+		t.Fatalf("refused apply must not touch config.toml, got: %s", string(got))
+	}
+
+	diff.APIKey = "rh_test-local-key"
 	_, err = syncer.Apply(ctx, diff)
 	if err != nil {
 		t.Fatalf("apply failed: %v", err)
@@ -111,6 +125,13 @@ func TestCodexSyncCycle(t *testing.T) {
 	updated, _ := os.ReadFile(cfgFile)
 	if !contains(string(updated), "approval_policy") || !contains(string(updated), "model_providers.relayhub") {
 		t.Fatalf("codex config invalid: %s", string(updated))
+	}
+	if contains(string(updated), "rh_test-local-key") {
+		t.Fatalf("the api key must never be written into config.toml: %s", string(updated))
+	}
+	envData, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil || !contains(string(envData), "RELAYHUB_API_KEY=rh_test-local-key") {
+		t.Fatalf("codex .env must deliver RELAYHUB_API_KEY (err=%v): %s", err, string(envData))
 	}
 }
 

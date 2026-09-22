@@ -21,3 +21,7 @@ go.work.sum
 *.swp
 .idea/
 .vscode/
+
+# Python bytecode from the macOS real-device suite
+__pycache__/
+*.pyc

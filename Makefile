@@ -18,11 +18,11 @@ LDFLAGS := -X $(BUILDINFO).version=$(VERSION) \
 
 .DEFAULT_GOAL := build
 
-.PHONY: format test vet build smoke clean check-web
+.PHONY: format test vet build smoke clean check-web test-real-device test-macos vuln
 
-## format: rewrite Go source with gofmt.
+## format: rewrite Go source with gofmt (same scope CI checks: cmd internal tests).
 format:
-	gofmt -w cmd internal
+	gofmt -w cmd internal tests
 
 ## test: run the unit tests, then verify the web assets have not diverged.
 test: check-web test-web
@@ -65,4 +65,21 @@ smoke: build
 
 ## clean: remove build artifacts.
 clean:
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) dist
+
+## test-real-device: on-machine acceptance — unit/race suite, live full-stack
+## smoke over real sockets, and on macOS the packaged-app lifecycle suite.
+## Needs Go 1.27, curl, python3; macOS additionally needs Xcode CLT.
+test-real-device: check-web test-web
+	go test -race ./... -count=1 -timeout=15m
+	./scripts/smoke-local.sh
+	@if [ "$$(uname -s)" = "Darwin" ]; then $(MAKE) test-macos; else echo "skipping macOS desktop suite (host is not Darwin)"; fi
+
+## test-macos: build both arches, package DMGs, verify, and run the desktop
+## shell lifecycle tests against the native-arch bundle.
+test-macos:
+	./tests/macos/test_full_suite.sh
+
+## vuln: Go dependency vulnerability scan (needs network).
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...

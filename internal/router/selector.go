@@ -304,6 +304,7 @@ func (r Resolver) resolve(ctx context.Context, req Request, excluded map[string]
 	d.Candidate, d.ProviderModel, d.Channel, d.Transform = chosen, chosen.ProviderModel, chosen.Channel, chosen.ProviderModel
 	return d, nil
 }
+
 // aliasMatch reports whether name is registered as an alias of m.
 func aliasMatch(m domain.Model, name string) bool {
 	for _, a := range m.Aliases {

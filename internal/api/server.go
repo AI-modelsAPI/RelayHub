@@ -33,9 +33,9 @@ import (
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/ratelimit"
-	"relayhub/internal/verify"
 	"relayhub/internal/repository"
 	"relayhub/internal/secrets"
+	"relayhub/internal/verify"
 	webassets "relayhub/internal/web"
 )
 
@@ -259,6 +259,10 @@ func (s *Server) listenerHandler() http.Handler {
 	}))
 }
 
+// unknownEndpointMessage is the 404 message for paths with no handler; tests
+// use it to tell "route missing" from a handler's own not-found answer.
+const unknownEndpointMessage = "no such management endpoint"
+
 func (s *Server) managementRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
@@ -312,10 +316,13 @@ func (s *Server) managementRoutes() http.Handler {
 	mux.HandleFunc("/api/v1/lab/replay", s.labReplay)
 	mux.HandleFunc("/api/v1/routes/explain", s.routeExplain)
 	mux.HandleFunc("/api/v1/mcp", s.mcpRPC)
-	// Unknown /api/ paths must return a JSON 404, not the SPA document.
+	// Unknown /api/ paths must return a JSON 404, not the SPA document. This
+	// has to be a typed fault: a bare error is encoded as a 500
+	// internal_error, which hid "route not registered" behind "server broken"
+	// (caught by TestManagementRouteTableIsComplete on the real toolchain).
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
-			s.fail(w, r, errors.New(http.StatusText(http.StatusNotFound)))
+			s.fail(w, r, notFound(unknownEndpointMessage))
 			return
 		}
 		http.FileServer(http.FS(webassets.Assets)).ServeHTTP(w, r)
@@ -2187,6 +2194,7 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 	s.write(w, r, 200, map[string]any{
 		"local_only":          s.LocalOnly,
 		"management_address":  s.Management,
+		"gateway_address":     s.GatewayAddr,
 		"token_configured":    s.Token != "",
 		"supported_mutations": false,
 		"browser":             bInfo,
@@ -2681,8 +2689,8 @@ func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 // of domain objects. CredentialRef is deliberately retained as a reference.
 // Proxy credentials embedded in proxy_url are masked before any API echo
 // (AUDIT RH-31: the management API previously returned proxy passwords).
-func safeProvider(p domain.Provider) domain.Provider                { return p }
-func safeProviders(v []domain.Provider) []domain.Provider           { return v }
+func safeProvider(p domain.Provider) domain.Provider      { return p }
+func safeProviders(v []domain.Provider) []domain.Provider { return v }
 func safeChannel(c domain.Channel) domain.Channel {
 	c.ProxyURL = maskProxyUserinfo(c.ProxyURL)
 	return c

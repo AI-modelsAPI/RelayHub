@@ -20,6 +20,12 @@ jobs:
       - name: Verify Release Artifacts
         run: ./scripts/verify-release.sh
 
+      # The packaged shell is exercised on the runner's native architecture
+      # (process ownership, health, fail-closed port conflict, flock, crash
+      # watchdog). Release job previously never ran the desktop suite (RH-33).
+      - name: Desktop lifecycle suite (native-arch bundle)
+        run: python3 -m unittest -v tests.macos.test_desktop_lifecycle
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:

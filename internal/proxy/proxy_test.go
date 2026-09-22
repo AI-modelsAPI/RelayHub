@@ -461,3 +461,31 @@ func portOf(raw string) string {
 	u, _ := url.Parse(raw)
 	return u.Port()
 }
+
+// An allowed-but-unreachable target must be reported as 502, not as the 403
+// that is reserved for policy denials, on both the CONNECT and plain-HTTP
+// paths. Port 1 on loopback is allowed by every policy and refuses instantly.
+func TestHTTPProxyUnreachableTargetIs502NotPolicyDenial(t *testing.T) {
+	proxy, _ := startHTTP(t, HTTPConfig{Addr: "127.0.0.1:0"})
+
+	conn, err := net.Dial("tcp", proxy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fmt.Fprintf(conn, "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+	line, _ := bufio.NewReader(conn).ReadString('\n')
+	_ = conn.Close()
+	if !strings.Contains(line, "502") {
+		t.Fatalf("unreachable CONNECT target should be 502, got %q", line)
+	}
+
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxy.Addr().String()})}}
+	resp, err := client.Get("http://127.0.0.1:1/")
+	if err != nil {
+		t.Fatalf("plain-HTTP dial failure must produce a response, not a closed connection: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("unreachable plain-HTTP target should be 502, got %d", resp.StatusCode)
+	}
+}

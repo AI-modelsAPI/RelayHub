@@ -34,15 +34,20 @@ docker compose up -d
 ### 3. Run Tests & Validation
 
 ```bash
-# Unit & integration tests
-go test ./... -count=1
+# Everything CI runs, on this machine: web asset contract + frontend tests,
+# unit/integration tests with the race detector, live full-stack smoke over
+# real sockets, and (on macOS) the packaged desktop app lifecycle suite.
+make test-real-device
 
-# Race detection
-go test -race ./... -count=1
-
-# Smoke test
-./scripts/smoke-local.sh
+# Pieces
+make check-web test-web          # web/ == internal/web/, frontend<->API route contract
+go test -race ./... -count=1     # unit, integration, e2e (real Chrome CDP test runs if Chrome is installed)
+./scripts/smoke-local.sh         # proxies + gateway on the real ports 8787-8790
+make test-macos                  # build both arches, verify, run the .app lifecycle tests
+make vuln                        # govulncheck
 ```
+
+Real-device audit and evidence: `docs/audit/REAL-DEVICE-AUDIT-2026-09-22.md`.
 
 ## Documentation
 

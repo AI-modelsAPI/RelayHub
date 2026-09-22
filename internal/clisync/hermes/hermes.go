@@ -2,15 +2,16 @@ package hermes
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 	"relayhub/internal/clisync"
 )
+
+// envKeyName is the variable Hermes reads the provider credential from.
+const envKeyName = "HERMES_CUSTOM_RELAYHUB_API_KEY"
 
 type Syncer struct {
 	Engine *clisync.Engine
@@ -108,7 +109,7 @@ func (s *Syncer) Preview(ctx context.Context, desired clisync.DesiredState) (cli
 
 	relayhubProvider["name"] = "RelayHub"
 	relayhubProvider["base_url"] = baseURL
-	relayhubProvider["key_env"] = "HERMES_CUSTOM_RELAYHUB_API_KEY"
+	relayhubProvider["key_env"] = envKeyName
 	relayhubProvider["transport"] = "chat_completions"
 	relayhubProvider["model"] = model
 	changedKeys = append(changedKeys, "providers.relayhub")
@@ -151,46 +152,22 @@ func (s *Syncer) Apply(ctx context.Context, diff clisync.Diff) (clisync.Backup, 
 		}
 	}
 
+	// A placeholder key would produce a config that looks synced but fails
+	// with 401 on first use, so refuse before writing anything.
+	if clisync.IsPlaceholderKey(diff.APIKey) {
+		return b, clisync.ErrNoRealAPIKey
+	}
+
 	// Write config.yaml
 	err := s.Engine.WriteAtomic(diff.Target.ConfigPath, []byte(diff.NewContent))
 	if err != nil {
 		return b, err
 	}
 
-	// Ensure .env has the key variable without exposing plain key in config
-	envPath := s.EnvPath()
-	envContent := ""
-	if existing, err := os.ReadFile(envPath); err == nil {
-		envContent = string(existing)
+	// The key lives in .env only, never in config.yaml.
+	if err := s.Engine.UpsertEnvVar(s.EnvPath(), envKeyName, diff.APIKey); err != nil {
+		return b, fmt.Errorf("write hermes .env: %w", err)
 	}
-
-	// A placeholder key here would produce a config that looks synced but fails
-	// with 401 on first use, so refuse to write instead of inventing one.
-	apiKey := diff.APIKey
-	if apiKey == "" {
-		return b, errors.New("refusing to write hermes .env without a real gateway api key")
-	}
-	keyLine := fmt.Sprintf("HERMES_CUSTOM_RELAYHUB_API_KEY=%s\n", apiKey)
-	if !strings.Contains(envContent, "HERMES_CUSTOM_RELAYHUB_API_KEY=") {
-		envContent += "\n" + keyLine
-		if err := s.Engine.WriteAtomic(envPath, []byte(envContent)); err != nil {
-			return b, fmt.Errorf("write hermes .env: %w", err)
-		}
-	} else {
-		// Replace existing key with updated key
-		var lines []string
-		for _, line := range strings.Split(envContent, "\n") {
-			if strings.HasPrefix(line, "HERMES_CUSTOM_RELAYHUB_API_KEY=") {
-				lines = append(lines, fmt.Sprintf("HERMES_CUSTOM_RELAYHUB_API_KEY=%s", apiKey))
-			} else {
-				lines = append(lines, line)
-			}
-		}
-		if err := s.Engine.WriteAtomic(envPath, []byte(strings.Join(lines, "\n"))); err != nil {
-			return b, fmt.Errorf("write hermes .env: %w", err)
-		}
-	}
-
 	return b, nil
 }
 
@@ -207,6 +184,13 @@ func (s *Syncer) Verify(ctx context.Context, desired clisync.DesiredState) error
 	providers, ok := current["providers"].(map[string]interface{})
 	if !ok || providers["relayhub"] == nil {
 		return fmt.Errorf("relayhub provider missing in %s", p)
+	}
+	env, err := os.ReadFile(s.EnvPath())
+	if err != nil {
+		return fmt.Errorf("hermes .env missing (%s): %w", s.EnvPath(), err)
+	}
+	if !clisync.HasEnvVar(string(env), envKeyName) {
+		return fmt.Errorf("%s is not set in %s", envKeyName, s.EnvPath())
 	}
 	return nil
 }
