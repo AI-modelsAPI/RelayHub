@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -10,32 +11,70 @@ import (
 	"time"
 )
 
-// runMCPStdio forwards one JSON-RPC body from stdin to the management MCP endpoint.
+// runMCPStdio bridges the management MCP endpoint over stdio as a persistent
+// MCP session: each newline-delimited JSON-RPC request on stdin is forwarded
+// and its response written back on one line, until EOF (AUDIT RH-25: the
+// previous implementation waited for full stdin EOF and served one request).
 func runMCPStdio(managementAddr string) error {
-	body, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
-	if err != nil {
-		return err
-	}
-	if len(bytes.TrimSpace(body)) == 0 {
-		body = []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
-	}
 	addr := strings.TrimSpace(managementAddr)
 	if addr == "" {
 		addr = "127.0.0.1:8790"
 	}
 	url := "http://" + addr + "/api/v1/mcp"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
+	token := strings.TrimSpace(os.Getenv("RELAYHUB_MANAGEMENT_TOKEN"))
+	client := &http.Client{Timeout: 120 * time.Second}
+
+	forward := func(body []byte) ([]byte, error) {
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("mcp: %w", err)
+		}
+		out, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		return bytes.TrimSpace(out), nil
+	}
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 4<<20)
+	served := 0
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		out, err := forward(line)
+		if err != nil {
+			return err
+		}
+		if len(out) == 0 {
+			continue
+		}
+		if _, err := os.Stdout.Write(append(out, '\n')); err != nil {
+			return err
+		}
+		served++
+	}
+	if err := scanner.Err(); err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("mcp: %w", err)
+	if served == 0 {
+		// Empty stdin (e.g. `relayhub mcp < /dev/null`): keep the old one-shot
+		// behaviour so the command still prints something useful.
+		out, err := forward([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stdout.Write(append(out, '\n')); err != nil {
+			return err
+		}
 	}
-	defer resp.Body.Close()
-	out, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	_, err = os.Stdout.Write(out)
-	return err
+	return nil
 }

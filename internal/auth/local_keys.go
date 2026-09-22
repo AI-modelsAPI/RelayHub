@@ -93,18 +93,21 @@ func (s *LocalKeyService) Create() (string, error) {
 	return "", errors.New("could not allocate unique local api key")
 }
 
-func (s *LocalKeyService) Revoke(key string) {
+// Revoke deletes a key by raw value or by rh_ id. Persistence failures are
+// returned so callers cannot report "revoked" for a key that still validates
+// (AUDIT RH-30).
+func (s *LocalKeyService) Revoke(key string) error {
 	if s == nil || s.backend == nil {
-		return
+		return ErrInvalidKey
 	}
 	if id, ok := keyID(key); ok {
-		_ = s.backend.Delete(id)
-		return
+		return s.backend.Delete(id)
 	}
 	// Also allow revoking by key ID directly (e.g. from management API)
 	if len(key) == 11 && key[:3] == "rh_" {
-		_ = s.backend.Delete(key)
+		return s.backend.Delete(key)
 	}
+	return ErrInvalidKey
 }
 
 func (s *LocalKeyService) List() ([]string, error) {

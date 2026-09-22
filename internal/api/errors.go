@@ -44,6 +44,9 @@ func unsupported(message string) error {
 func unavailable(message string) error {
 	return fault{status: http.StatusServiceUnavailable, code: "service_unavailable", message: message}
 }
+func methodNotAllowed() error {
+	return fault{status: http.StatusMethodNotAllowed, code: "method_not_allowed", message: "method not allowed for this endpoint"}
+}
 func internal(err error) error {
 	return fault{status: http.StatusInternalServerError, code: "internal_error", message: "internal management error", cause: err}
 }

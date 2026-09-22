@@ -26,6 +26,10 @@ type CheckinRequest struct {
 	ChannelID  string        `json:"channel_id"`
 	DataDir    string        `json:"data_dir"`
 	Timeout    time.Duration `json:"timeout"`
+	// ProxyURL pins the browser check-in session to the channel's configured
+	// egress exactly like the HTTP paths do; without it the headless browser
+	// bypassed the channel proxy and exposed the default egress (AUDIT RH-10).
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 type CheckinResult struct {
@@ -80,6 +84,29 @@ func sanitizeTargetURL(raw string) error {
 
 // ExecuteCheckin launches a real browser with dedicated user profile, connects via CDP,
 // opens the page, interacts with checkin triggers, and inspects turnstile or rewards.
+
+// normalizeCheckinProxy validates and normalizes the optional per-channel
+// proxy for the browser process; invalid values are ignored rather than
+// killing the check-in run (the scheduler marks the failure through the
+// browser-fail path anyway, and failing closed here keeps the default egress
+// visible as before).
+func normalizeCheckinProxy(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5":
+	default:
+		return ""
+	}
+	return raw
+}
+
 func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (out CheckinResult, outErr error) {
 	if err := sanitizeTargetURL(req.URL); err != nil {
 		return CheckinResult{}, err
@@ -136,8 +163,11 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 		"--safebrowsing-disable-auto-update",
 		"--password-store=basic",
 		"--use-mock-keychain",
-		"about:blank",
 	}
+	if proxy := normalizeCheckinProxy(req.ProxyURL); proxy != "" {
+		args = append(args, "--proxy-server="+proxy)
+	}
+	args = append(args, "about:blank")
 
 	cmd := exec.CommandContext(runCtx, info.Path, args...)
 	if err := e.runtime.StartProcess(cmd); err != nil {

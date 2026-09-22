@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,6 +40,9 @@ type Client struct {
 	eventChans map[string][]chan json.RawMessage
 	closeCh    chan struct{}
 	closeOnce  sync.Once
+	// writeMu serializes frame writes: two concurrent writers interleaving
+	// bytes on the shared bufio.Writer corrupt both frames (AUDIT RH-03).
+	writeMu sync.Mutex
 }
 
 type cdpRequest struct {
@@ -185,6 +189,10 @@ func Connect(ctx context.Context, wsURL string) (*Client, error) {
 	return c, nil
 }
 
+// maxWSFrame caps a single incoming WebSocket frame (CDP events can be large
+// but never tens of megabytes).
+const maxWSFrame = 32 << 20
+
 func computeAccept(key string) string {
 	const magicGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	h := sha1.New()
@@ -197,12 +205,16 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
 		c.conn.Close()
+		// Do NOT close pending channels: dispatch may already hold a reference
+		// to one of them, and sending on a closed channel panics (AUDIT RH-03).
+		// Waiters are released through closeCh in Call's select instead.
 		c.pendingMu.Lock()
-		for _, ch := range c.pending {
-			close(ch)
-		}
 		c.pending = make(map[uint64]chan cdpResponse)
 		c.pendingMu.Unlock()
+
+		// Wake any blocked waits by draining known channels via a non-blocking
+		// signal is not possible here; Call selects on closeCh, so closed waiters
+		// exit without needing closed response channels.
 	})
 	return nil
 }
@@ -287,8 +299,16 @@ func (c *Client) writeFrame(opcode byte, payload []byte) error {
 		masked[i] = payload[i] ^ maskKey[i%4]
 	}
 
-	c.rw.Writer.Write(header)
-	c.rw.Writer.Write(masked)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	// Previously the two Write calls ignored errors and raced with other
+	// writers; a partial header followed by another frame corrupts the stream.
+	if _, err := c.rw.Writer.Write(header); err != nil {
+		return err
+	}
+	if _, err := c.rw.Writer.Write(masked); err != nil {
+		return err
+	}
 	return c.rw.Writer.Flush()
 }
 
@@ -321,7 +341,18 @@ func (c *Client) readLoop() {
 			if _, err := io.ReadFull(c.rw, b[:]); err != nil {
 				return
 			}
-			payloadLen = int64(binary.BigEndian.Uint64(b[:]))
+			u := binary.BigEndian.Uint64(b[:])
+			// Reject frames with the top bit set: they overflow int64 and the
+			// sign flip would panic make() below (AUDIT RH-03).
+			if u > math.MaxInt64 {
+				return
+			}
+			payloadLen = int64(u)
+		}
+		// Bound frame size: a hostile/buggy WS peer could request arbitrary
+		// allocation here (AUDIT RH-03).
+		if payloadLen < 0 || payloadLen > maxWSFrame {
+			return
 		}
 
 		var mask [4]byte

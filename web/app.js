@@ -38,9 +38,11 @@ function fmtUptime(s) {
 }
 
 function rowHTML(id, title, meta, tag, extraClass = "") {
-  return `<li class="row ${extraClass}" data-id="${id}">
+  // Every interpolated field is server-controlled data: id/tag/meta can carry
+  // quotes and markup, so all of them must be escaped like title is (AUDIT RH-01).
+  return `<li class="row ${extraClass}" data-id="${esc(id)}">
     <span class="n">${esc(title)}</span>
-    <span class="t">${tag || ""}</span>
+    <span class="t">${esc(tag || "")}</span>
     <span class="m">${esc(meta || "")}</span>
   </li>`;
 }
@@ -64,7 +66,7 @@ function renderPulse() {
     ["路由", counts.routes ?? "—"],
     ["运行", fmtUptime(o.uptime_seconds)],
   ]
-    .map(([k, v]) => `<div><span>${k}</span><b>${v}</b></div>`)
+    .map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`)
     .join("");
   const feed = (state.usage || []).slice(0, 12);
   $("#pulse-feed").innerHTML = feed.length
@@ -129,9 +131,9 @@ function renderModels() {
       if (!m) return;
       $("#md-ins").innerHTML = `<header class="col-h"><h2>${esc(m.id)}</h2></header>
         <div class="ins-block"><dl class="kv">
-          <dt>工具</dt><dd>${m.tool_call_support ?? "—"}</dd>
-          <dt>视觉</dt><dd>${m.vision_support ?? "—"}</dd>
-          <dt>推理</dt><dd>${m.reasoning_support ?? "—"}</dd>
+          <dt>工具</dt><dd>${esc(m.tool_call_support ?? "—")}</dd>
+          <dt>视觉</dt><dd>${esc(m.vision_support ?? "—")}</dd>
+          <dt>推理</dt><dd>${esc(m.reasoning_support ?? "—")}</dd>
         </dl></div>`;
     })
   );
@@ -164,7 +166,7 @@ function renderUsage() {
     ["请求", rec.length],
     ["渠道", state.channels.length],
   ]
-    .map(([k, v]) => `<div><span>${k}</span><b>${v}</b></div>`)
+    .map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`)
     .join("");
   $("#usage-rows").innerHTML = rec.length
     ? rec.map((u, i) => rowHTML(String(i), u.model || "req", u.channel_id || "", (u.latency_ms || "") + "ms")).join("")

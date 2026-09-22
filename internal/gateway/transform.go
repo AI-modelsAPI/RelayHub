@@ -68,6 +68,15 @@ func transformRequest(protocol, endpoint string, body []byte, decision router.De
 		upProto = reqProto
 	}
 
+	if reqProto != upProto {
+		// The converters cannot carry these semantics losslessly; silently
+		// dropping them previously made clients pay for degraded responses
+		// (AUDIT RH-12). Refuse instead.
+		if reason := unsupportedForConversion(obj, reqProto); reason != "" {
+			return nil, fmt.Errorf("cross-protocol conversion (%s -> %s) %s", reqProto, upProto, reason)
+		}
+	}
+
 	// Cross protocol conversion: Anthropic client -> OpenAI upstream
 	if reqProto == "anthropic-messages" && upProto == "openai-chat" {
 		return transformAnthropicToOpenAIRequest(obj, model)
@@ -79,6 +88,47 @@ func transformRequest(protocol, endpoint string, body []byte, decision router.De
 	}
 
 	return json.Marshal(obj)
+}
+
+// unsupportedForConversion returns a human-readable reason when the request
+// carries semantics the cross-protocol converters would silently drop, or ""
+// when the conversion is safe (AUDIT RH-12).
+func unsupportedForConversion(obj map[string]any, reqProto string) string {
+	if msgs, ok := obj["messages"].([]any); ok {
+		for _, m := range msgs {
+			msg, _ := m.(map[string]any)
+			if msg == nil {
+				continue
+			}
+			content, _ := msg["content"].([]any)
+			for _, c := range content {
+				block, _ := c.(map[string]any)
+				if block == nil {
+					continue
+				}
+				switch block["type"] {
+				case "image", "image_url", "input_image", "input_audio", "document", "thinking":
+					return "does not support multimodal/thinking content blocks"
+				}
+			}
+		}
+	}
+	if stream, _ := obj["stream"].(bool); stream {
+		if tools, ok := obj["tools"].([]any); ok && len(tools) > 0 {
+			return "does not support streamed tool calls"
+		}
+	}
+	if reqProto == "openai-chat" {
+		if choice, ok := obj["tool_choice"]; ok && choice != nil {
+			if s, _ := choice.(string); s != "" && s != "auto" && s != "none" {
+				return "does not preserve a forced tool_choice"
+			}
+			if _, isMap := choice.(map[string]any); isMap {
+				return "does not preserve a forced tool_choice"
+			}
+		}
+	}
+	return ""
 }
 
 func transformAnthropicToOpenAIRequest(src map[string]any, model string) ([]byte, error) {
@@ -400,6 +450,11 @@ func transformResponse(protocol string, body []byte, decision router.Decision, n
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, errors.New("malformed upstream JSON response")
 	}
+	if obj == nil {
+		// A JSON "null" is valid but not a protocol response; passing it through
+		// produced a literal null reply to the client.
+		return nil, errors.New("empty upstream response")
+	}
 	if _, ok := obj["error"]; ok {
 		return nil, errors.New("upstream returned an error response")
 	}
@@ -696,7 +751,11 @@ func recordFor(r *http.Request, protocol string, decision router.Decision, body 
 			record.CacheReadTokens = obj.Usage.PromptTokensDetails.CachedTokens
 		}
 		record.CacheWriteTokens = obj.Usage.CacheCreationInputTokens
-		if obj.Model != "" {
+		if obj.Model != "" && obj.Model != decision.Model.ID {
+			// The transformed response echoes the logical model id; adopting it
+			// as the upstream model name produced false "model mismatch" trust
+			// penalties for every alias-mapped request (AUDIT RH-17). Only a
+			// name that actually came from the upstream counts.
 			record.UpstreamModel = obj.Model
 		}
 		if obj.StopReason != "" {

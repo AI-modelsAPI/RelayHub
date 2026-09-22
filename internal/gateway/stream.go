@@ -22,6 +22,10 @@ type streamMeta struct {
 	TTFTMS           int
 	FinishReason     string
 	UpstreamModel    string
+	// Truncated is set when the upstream stream ended without any explicit
+	// finish/stop reason, so telemetry can flag "EOF instead of completion"
+	// instead of disguising truncation as a normal end_turn (AUDIT RH-12).
+	Truncated bool
 }
 
 func writeSSE(w http.ResponseWriter, body io.Reader, clientProto, upProto, logicalModel string) (streamMeta, error) {
@@ -101,6 +105,28 @@ func absorbUsage(payload []byte, meta *streamMeta) {
 	}
 	if m, ok := obj["model"].(string); ok && m != "" {
 		meta.UpstreamModel = m
+	}
+	// Anthropic carries the bulk of its usage on message_start.message.usage;
+	// parsing only the top-level usage event loses input/cache tokens entirely
+	// (AUDIT RH-17).
+	if msg, ok := obj["message"].(map[string]any); ok {
+		if m, ok := msg["model"].(string); ok && m != "" {
+			meta.UpstreamModel = m
+		}
+		if u, ok := msg["usage"].(map[string]any); ok {
+			if v, ok := asInt(u["input_tokens"]); ok {
+				meta.InputTokens = v
+			}
+			if v, ok := asInt(u["output_tokens"]); ok {
+				meta.OutputTokens = v
+			}
+			if v, ok := asInt(u["cache_read_input_tokens"]); ok {
+				meta.CacheReadTokens = v
+			}
+			if v, ok := asInt(u["cache_creation_input_tokens"]); ok {
+				meta.CacheWriteTokens = v
+			}
+		}
 	}
 	if u, ok := obj["usage"].(map[string]any); ok {
 		if v, ok := asInt(u["prompt_tokens"]); ok {
@@ -241,6 +267,10 @@ func convertOpenAIStreamToAnthropic(body io.Reader, model string, emit func(stri
 		}
 	}
 	if started && meta.FinishReason == "" {
+		// The client still needs protocol termination events, but the missing
+		// finish reason is flagged so it is not disguised as a normal
+		// completion in telemetry (AUDIT RH-12).
+		meta.Truncated = true
 		_ = emitAnthropic(emit, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
 		_ = emitAnthropic(emit, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}})
 		_ = emitAnthropic(emit, "message_stop", map[string]any{"type": "message_stop"})
@@ -274,6 +304,7 @@ func convertAnthropicStreamToOpenAI(body io.Reader, model string, emit func(stri
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	var eventName string
+	sawEvent := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event:") {
@@ -291,6 +322,7 @@ func convertAnthropicStreamToOpenAI(body io.Reader, model string, emit func(stri
 			return *meta, errors.New("malformed upstream SSE event")
 		}
 		markFirst()
+		sawEvent = true
 		absorbUsage([]byte(payload), meta)
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
@@ -354,6 +386,11 @@ func convertAnthropicStreamToOpenAI(body io.Reader, model string, emit func(stri
 			}
 		}
 		eventName = ""
+	}
+	if sawEvent && meta.FinishReason == "" {
+		// Anthropic upstream ended without message_delta/stop_reason — truncated
+		// rather than completed (AUDIT RH-12).
+		meta.Truncated = true
 	}
 	return *meta, scanner.Err()
 }

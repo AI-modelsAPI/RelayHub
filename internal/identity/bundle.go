@@ -2,10 +2,12 @@ package identity
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"relayhub/internal/domain"
@@ -45,20 +47,48 @@ func ApplyToChannel(ch *domain.Channel, b Bundle) {
 	}
 }
 
-func HTTPClient(proxyRaw string, timeout time.Duration) *http.Client {
+// clientCache shares transports per proxy configuration so check-in, probes
+// and management fetches reuse connections instead of building a fresh
+// Transport per call (AUDIT RH-20). Keyed by proxy URL + timeout; both are
+// operator-configured, so cardinality is bounded in practice.
+var clientCache sync.Map // string -> *http.Client
+
+// HTTPClientE is HTTPClient with error reporting: an invalid proxy URL is a
+// configuration failure (fail closed), never a silent direct egress
+// (AUDIT RH-10).
+func HTTPClientE(proxyRaw string, timeout time.Duration) (*http.Client, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	c := &http.Client{Timeout: timeout}
 	proxyRaw = strings.TrimSpace(proxyRaw)
-	if proxyRaw == "" {
-		return c
+	key := proxyRaw + "|" + timeout.String()
+	if cached, ok := clientCache.Load(key); ok {
+		return cached.(*http.Client), nil
 	}
-	u, err := url.Parse(proxyRaw)
-	if err != nil || u.Scheme == "" {
-		return c
+	c := &http.Client{Timeout: timeout}
+	if proxyRaw != "" {
+		u, err := url.Parse(proxyRaw)
+		if err != nil || u.Scheme == "" {
+			return nil, fmt.Errorf("invalid proxy url %q", proxyRaw)
+		}
+		c.Transport = &http.Transport{
+			Proxy:           http.ProxyURL(u),
+			MaxIdleConns:    32,
+			IdleConnTimeout: 90 * time.Second,
+		}
 	}
-	c.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+	actual, _ := clientCache.LoadOrStore(key, c)
+	return actual.(*http.Client), nil
+}
+
+func HTTPClient(proxyRaw string, timeout time.Duration) *http.Client {
+	c, err := HTTPClientE(proxyRaw, timeout)
+	if err != nil {
+		// Legacy callers that cannot surface the error keep the previous
+		// degrade-to-direct behaviour; new call sites must use HTTPClientE.
+		fallback, _ := HTTPClientE("", timeout)
+		return fallback
+	}
 	return c
 }
 

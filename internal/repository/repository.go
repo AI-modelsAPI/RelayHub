@@ -51,6 +51,7 @@ type ProviderModelRepository interface {
 	ListProviderModels(context.Context, string) ([]domain.ProviderModel, error)
 	UpdateProviderModel(context.Context, domain.ProviderModel) error
 	DeleteProviderModel(context.Context, string) error
+	DeleteProviderModelsByChannel(context.Context, string) error
 }
 
 type ModelGroupRepository interface {
@@ -76,12 +77,17 @@ type StatusRepository interface {
 	CreateCheckinRecord(context.Context, domain.CheckinRecord) error
 	GetCheckinRecord(context.Context, string) (domain.CheckinRecord, error)
 	ListCheckinRecords(context.Context, string) ([]domain.CheckinRecord, error)
+	ListCheckinRecordsMulti(context.Context, []string, int) ([]domain.CheckinRecord, error)
 	CreateHealthRecord(context.Context, domain.HealthRecord) error
 	GetHealthRecord(context.Context, string) (domain.HealthRecord, error)
 	ListHealthRecords(context.Context, string) ([]domain.HealthRecord, error)
 	CreateRequestRecord(context.Context, domain.RequestRecord) error
 	GetRequestRecord(context.Context, string) (domain.RequestRecord, error)
 	ListRequestRecords(context.Context) ([]domain.RequestRecord, error)
+	ListRequestRecordsLimit(context.Context, int) ([]domain.RequestRecord, error)
+	ListRequestRecordsByChannel(context.Context, string, int) ([]domain.RequestRecord, error)
+	RequestUsageTotals(context.Context) (int64, int64, int64, error)
+	PruneRequestRecords(context.Context, time.Time) (int64, error)
 	CreateCLISyncRecord(context.Context, domain.CLISyncRecord) error
 	GetCLISyncRecord(context.Context, string) (domain.CLISyncRecord, error)
 	ListCLISyncRecords(context.Context) ([]domain.CLISyncRecord, error)
@@ -222,12 +228,15 @@ func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 func scanChannel(row interface{ Scan(...any) error }) (domain.Channel, error) {
 	var c domain.Channel
 	var checkin, routing, enabled, autoSync int
-	var created, updated string
-	err := row.Scan(&c.ID, &c.ProviderID, &c.Name, &c.BaseURL, &c.CredentialRef, &c.AccountRef, &c.RoutingTags, &c.QuotaState, &c.HealthState, &c.RateLimitState, &c.Priority, &c.Weight, &checkin, &routing, &enabled, &c.Status, &c.ManualModels, &autoSync, &c.AutoSyncPattern, &c.DefaultTestModel, &c.StreamPolicy, &c.ErrorMessage, &c.Remark, &c.ProxyURL, &c.CheckinMode, &created, &updated)
+	var created, updated, customHeaders string
+	err := row.Scan(&c.ID, &c.ProviderID, &c.Name, &c.BaseURL, &c.CredentialRef, &c.AccountRef, &c.RoutingTags, &c.QuotaState, &c.HealthState, &c.RateLimitState, &c.Priority, &c.Weight, &checkin, &routing, &enabled, &c.Status, &c.ManualModels, &autoSync, &c.AutoSyncPattern, &c.DefaultTestModel, &c.StreamPolicy, &c.ErrorMessage, &c.Remark, &c.ProxyURL, &c.CheckinMode, &customHeaders, &created, &updated)
 	if err != nil {
 		return c, err
 	}
 	c.CheckinEnabled, c.RoutingEnabled, c.Enabled, c.AutoSync = checkin != 0, routing != 0, enabled != 0, autoSync != 0
+	if customHeaders != "" {
+		_ = json.Unmarshal([]byte(customHeaders), &c.CustomHeaders)
+	}
 	if c.Status == "" {
 		if c.Enabled {
 			c.Status = "enabled"
@@ -241,7 +250,19 @@ func scanChannel(row interface{ Scan(...any) error }) (domain.Channel, error) {
 	return c, scanTimePair(created, updated, &c.CreatedAt, &c.UpdatedAt)
 }
 
-const channelColumns = `id,provider_id,name,base_url,credential_ref,account_ref,routing_tags,quota_state,health_state,rate_limit_state,priority,weight,checkin_enabled,routing_enabled,enabled,status,manual_models,auto_sync,auto_sync_pattern,default_test_model,stream_policy,error_message,remark,proxy_url,checkin_mode,created_at,updated_at`
+const channelColumns = `id,provider_id,name,base_url,credential_ref,account_ref,routing_tags,quota_state,health_state,rate_limit_state,priority,weight,checkin_enabled,routing_enabled,enabled,status,manual_models,auto_sync,auto_sync_pattern,default_test_model,stream_policy,error_message,remark,proxy_url,checkin_mode,custom_headers,created_at,updated_at`
+
+// jsonOrEmpty encodes a header map for the custom_headers column.
+func jsonOrEmpty(m map[string]string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
 
 func (s *Store) CreateChannel(ctx context.Context, c domain.Channel) error {
 	if err := ctx.Err(); err != nil {
@@ -264,8 +285,8 @@ func (s *Store) CreateChannel(ctx context.Context, c domain.Channel) error {
 	if c.CheckinMode == "" {
 		c.CheckinMode = "auto"
 	}
-	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO channels(`+channelColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, stamp(created), stamp(created))
+	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO channels(`+channelColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, jsonOrEmpty(c.CustomHeaders), stamp(created), stamp(created))
 	return err
 }
 func (s *Store) GetChannel(ctx context.Context, id string) (domain.Channel, error) {
@@ -305,8 +326,8 @@ func (s *Store) UpdateChannel(ctx context.Context, c domain.Channel) error {
 	if c.CheckinMode == "" {
 		c.CheckinMode = "auto"
 	}
-	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE channels SET provider_id=?,name=?,base_url=?,credential_ref=?,account_ref=?,routing_tags=?,quota_state=?,health_state=?,rate_limit_state=?,priority=?,weight=?,checkin_enabled=?,routing_enabled=?,enabled=?,status=?,manual_models=?,auto_sync=?,auto_sync_pattern=?,default_test_model=?,stream_policy=?,error_message=?,remark=?,proxy_url=?,checkin_mode=?,updated_at=? WHERE id=?`,
-		c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, stamp(time.Now()), c.ID)
+	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE channels SET provider_id=?,name=?,base_url=?,credential_ref=?,account_ref=?,routing_tags=?,quota_state=?,health_state=?,rate_limit_state=?,priority=?,weight=?,checkin_enabled=?,routing_enabled=?,enabled=?,status=?,manual_models=?,auto_sync=?,auto_sync_pattern=?,default_test_model=?,stream_policy=?,error_message=?,remark=?,proxy_url=?,checkin_mode=?,custom_headers=?,updated_at=? WHERE id=?`,
+		c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, jsonOrEmpty(c.CustomHeaders), stamp(time.Now()), c.ID)
 	return requireAffected(result, err)
 }
 func (s *Store) DeleteChannel(ctx context.Context, id string) error {
@@ -525,6 +546,14 @@ func (s *Store) DeleteProviderModel(ctx context.Context, id string) error {
 	return requireAffected(result, err)
 }
 
+// DeleteProviderModelsByChannel removes every provider-model binding of one
+// channel in a single statement. Used by model sync so the replace step can
+// run inside one transaction (AUDIT RH-15).
+func (s *Store) DeleteProviderModelsByChannel(ctx context.Context, channelID string) error {
+	_, err := s.repositoryExecutor().ExecContext(ctx, `DELETE FROM provider_models WHERE channel_id=?`, channelID)
+	return err
+}
+
 func scanModelGroup(row interface{ Scan(...any) error }) (domain.ModelGroup, error) {
 	var g domain.ModelGroup
 	var enabled int
@@ -730,7 +759,43 @@ func (s *Store) GetCheckinRecord(ctx context.Context, id string) (domain.Checkin
 	return scanCheckin(s.repositoryExecutor().QueryRowContext(ctx, `SELECT id,channel_id,started_at,finished_at,status,reward,error_code,error_message FROM checkin_records WHERE id=?`, id))
 }
 func (s *Store) ListCheckinRecords(ctx context.Context, channelID string) ([]domain.CheckinRecord, error) {
-	rows, err := s.repositoryExecutor().QueryContext(ctx, `SELECT id,channel_id,started_at,finished_at,status,reward,error_code,error_message FROM checkin_records WHERE channel_id=? ORDER BY started_at DESC`, channelID)
+	// Bounded to recent history (AUDIT RH-32).
+	rows, err := s.repositoryExecutor().QueryContext(ctx, `SELECT id,channel_id,started_at,finished_at,status,reward,error_code,error_message FROM checkin_records WHERE channel_id=? ORDER BY started_at DESC LIMIT 200`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.CheckinRecord
+	for rows.Next() {
+		r, e := scanCheckin(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListCheckinRecordsMulti returns the newest records across the given channels
+// in one query, replacing the per-channel N+1 loop in the management API
+// (AUDIT RH-32). An empty channel list means "all channels".
+func (s *Store) ListCheckinRecordsMulti(ctx context.Context, channelIDs []string, limit int) ([]domain.CheckinRecord, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	query := `SELECT id,channel_id,started_at,finished_at,status,reward,error_code,error_message FROM checkin_records`
+	args := []any{}
+	if len(channelIDs) > 0 {
+		marks := strings.Repeat("?,", len(channelIDs))
+		marks = marks[:len(marks)-1]
+		query += ` WHERE channel_id IN (` + marks + `)`
+		for _, id := range channelIDs {
+			args = append(args, id)
+		}
+	}
+	query += ` ORDER BY started_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.repositoryExecutor().QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -790,11 +855,16 @@ func nullString(v string) any {
 	}
 	return v
 }
+const requestColumns = `id,request_id,protocol,model_id,provider_id,channel_id,status_code,latency_ms,input_tokens,output_tokens,error_class,created_at,ttft_ms,cache_read_tokens,cache_write_tokens,finish_reason,upstream_model`
+
 func scanRequest(row interface{ Scan(...any) error }) (domain.RequestRecord, error) {
 	var r domain.RequestRecord
 	var model, provider, channel sql.NullString
 	var created string
-	err := row.Scan(&r.ID, &r.RequestID, &r.Protocol, &model, &provider, &channel, &r.StatusCode, &r.LatencyMS, &r.InputTokens, &r.OutputTokens, &r.ErrorClass, &created)
+	// Migration 008 added these five columns as write-only: the SELECT lists and
+	// this scanner only knew the old twelve, so everything read back was zero
+	// (AUDIT RH-16 / P1-1).
+	err := row.Scan(&r.ID, &r.RequestID, &r.Protocol, &model, &provider, &channel, &r.StatusCode, &r.LatencyMS, &r.InputTokens, &r.OutputTokens, &r.ErrorClass, &created, &r.TTFTMS, &r.CacheReadTokens, &r.CacheWriteTokens, &r.FinishReason, &r.UpstreamModel)
 	if err != nil {
 		return r, err
 	}
@@ -811,10 +881,24 @@ func scanRequest(row interface{ Scan(...any) error }) (domain.RequestRecord, err
 	return r, err
 }
 func (s *Store) GetRequestRecord(ctx context.Context, id string) (domain.RequestRecord, error) {
-	return scanRequest(s.repositoryExecutor().QueryRowContext(ctx, `SELECT id,request_id,protocol,model_id,provider_id,channel_id,status_code,latency_ms,input_tokens,output_tokens,error_class,created_at FROM request_records WHERE id=?`, id))
+	return scanRequest(s.repositoryExecutor().QueryRowContext(ctx, `SELECT `+requestColumns+` FROM request_records WHERE id=?`, id))
 }
+
+// requestRecordCap bounds every unbounded history read. Telemetry listing is
+// "recent history", and scanning the whole table on each sync/aggregation was
+// a documented capacity-governance gap (AUDIT RH-32 / P1-2).
+const requestRecordCap = 5000
+
 func (s *Store) ListRequestRecords(ctx context.Context) ([]domain.RequestRecord, error) {
-	rows, err := s.repositoryExecutor().QueryContext(ctx, `SELECT id,request_id,protocol,model_id,provider_id,channel_id,status_code,latency_ms,input_tokens,output_tokens,error_class,created_at FROM request_records ORDER BY created_at DESC`)
+	return s.ListRequestRecordsLimit(ctx, requestRecordCap)
+}
+
+// ListRequestRecordsLimit returns the newest request records, capped.
+func (s *Store) ListRequestRecordsLimit(ctx context.Context, limit int) ([]domain.RequestRecord, error) {
+	if limit <= 0 {
+		limit = requestRecordCap
+	}
+	rows, err := s.repositoryExecutor().QueryContext(ctx, `SELECT `+requestColumns+` FROM request_records ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -828,6 +912,46 @@ func (s *Store) ListRequestRecords(ctx context.Context) ([]domain.RequestRecord,
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ListRequestRecordsByChannel returns the newest records for one channel with
+// a hard bound, replacing "scan everything then keep 100" (AUDIT RH-32).
+func (s *Store) ListRequestRecordsByChannel(ctx context.Context, channelID string, limit int) ([]domain.RequestRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.repositoryExecutor().QueryContext(ctx, `SELECT `+requestColumns+` FROM request_records WHERE channel_id=? ORDER BY created_at DESC LIMIT ?`, channelID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.RequestRecord
+	for rows.Next() {
+		r, e := scanRequest(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RequestUsageTotals computes aggregates in SQL instead of loading the full
+// history into memory (AUDIT RH-32).
+func (s *Store) RequestUsageTotals(ctx context.Context) (total int64, inputTokens int64, cacheReadTokens int64, err error) {
+	err = s.repositoryExecutor().QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0) FROM request_records`).Scan(&total, &inputTokens, &cacheReadTokens)
+	return total, inputTokens, cacheReadTokens, err
+}
+
+// PruneRequestRecords deletes records older than the cutoff and reports how
+// many were removed. Called periodically by the runtime (AUDIT RH-32 / P1-2).
+func (s *Store) PruneRequestRecords(ctx context.Context, olderThan time.Time) (int64, error) {
+	result, err := s.repositoryExecutor().ExecContext(ctx, `DELETE FROM request_records WHERE created_at < ?`, stamp(olderThan))
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	return affected, err
 }
 
 func (s *Store) CreateCLISyncRecord(ctx context.Context, r domain.CLISyncRecord) error {

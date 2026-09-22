@@ -25,3 +25,6 @@ jobs:
         with:
           name: macos-dmgs
           path: dist/*.dmg
+          # Default artifact retention is 90 days; release binaries do not need
+          # to linger that long on shared runners (AUDIT RH-04 CI hygiene).
+          retention-days: 7

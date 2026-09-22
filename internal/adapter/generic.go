@@ -15,14 +15,36 @@ import (
 // GenericAdapter handles standard OpenAI/Anthropic/Gemini compatible endpoints.
 // It explicitly refuses check-in operations.
 type GenericAdapter struct {
-	Client *http.Client
+	Client  *http.Client
+	Secrets SecretResolver
 }
 
+// NewGenericAdapter keeps the original signature for existing callers (tests).
+// Production wiring must use NewGenericAdapterWithSecrets so CredentialRef
+// values resolve via the secret store instead of being sent as bearer tokens
+// (AUDIT RH-26).
 func NewGenericAdapter(client *http.Client) *GenericAdapter {
+	return NewGenericAdapterWithSecrets(client, nil)
+}
+
+func NewGenericAdapterWithSecrets(client *http.Client, secrets SecretResolver) *GenericAdapter {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &GenericAdapter{Client: client}
+	return &GenericAdapter{Client: client, Secrets: secrets}
+}
+
+// bearerToken resolves the channel credential; without a secret resolver the
+// ref is a locator, not a token, so the adapter must not send it.
+func (g *GenericAdapter) bearerToken(ctx context.Context, channel domain.Channel) string {
+	if channel.CredentialRef == "" || g.Secrets == nil {
+		return ""
+	}
+	secret, err := g.Secrets.Get(ctx, channel.CredentialRef)
+	if err != nil {
+		return ""
+	}
+	return string(secret)
 }
 
 func (g *GenericAdapter) Validate(ctx context.Context, channel domain.Channel) error {
@@ -57,11 +79,13 @@ func (g *GenericAdapter) Models(ctx context.Context, channel domain.Channel) ([]
 	if err != nil {
 		return nil, err
 	}
-	if channel.CredentialRef != "" {
-		req.Header.Set("Authorization", "Bearer "+channel.CredentialRef)
+	if token := g.bearerToken(ctx, channel); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := g.Client.Do(req)
+	// Honour the channel proxy instead of always using the process-wide
+	// client (AUDIT RH-10).
+	resp, err := clientForChannel(g.Client, channel).Do(req)
 	if err != nil {
 		return nil, err
 	}

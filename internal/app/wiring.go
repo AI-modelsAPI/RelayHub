@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -58,6 +60,9 @@ type Runtime struct {
 	GatewaySrv  *http.Server
 	GWListener  net.Listener
 	AuditLogger *audit.Logger
+	// MgmtHTTP is the management http.Server itself (kept so Shutdown can wait
+	// for in-flight management requests instead of hard-cutting the listener).
+	MgmtHTTP *http.Server
 
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -117,6 +122,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		Routes:         routeList,
 		Health:         healthReg,
 		Sticky:         sticky,
+		// The "random" strategy selects by r.Rand when set; a counter source
+		// would rotate deterministically instead (AUDIT RH-07).
+		Rand: router.NewCryptoSource(),
 	}
 
 	// Secret Store
@@ -143,7 +151,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	// the secret store; passing a CredentialRef straight to an upstream as a
 	// bearer token was a confirmed defect (AUDIT-REPORT P1-9).
 	adpReg := adapter.NewRegistry()
-	_ = adpReg.Register("generic", adapter.NewGenericAdapter(nil))
+	_ = adpReg.Register("generic", adapter.NewGenericAdapterWithSecrets(nil, secStore))
 	_ = adpReg.Register("agentrouter", agentrouter.NewWithSecrets(nil, secStore))
 	_ = adpReg.Register("gorouter", gorouter.NewWithSecrets(nil, secStore))
 	_ = adpReg.Register("justdowork", justdowork.NewWithSecrets(nil, secStore))
@@ -304,7 +312,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 				return
 			}
 			k.Disabled = true
-			_ = repo.UpdateChannelKey(ctx, k)
+			if err := repo.UpdateChannelKey(ctx, k); err != nil {
+				slog.Default().Warn("disable leaked/failed channel key", "key_id", keyID, "error", err)
+			}
 		},
 		Recorder: usage.RepositoryRecorder{Repo: repo},
 		Limiter:  aimd,
@@ -314,7 +324,11 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	})
 
 	gwServer := &http.Server{
-		Handler: gwHandler,
+		Handler:           gwHandler,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       0, // streaming completions may be long-lived; no hard read deadline
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	rt := &Runtime{
@@ -397,16 +411,35 @@ func (r *Runtime) Start(ctx context.Context) error {
 	go func() { _ = r.SOCKSProxy.Start(ctx) }()
 	go func() { _ = r.Scheduler.Start(ctx) }()
 
-	apiSrv := &http.Server{Handler: r.APIServer.Handler()}
-	go func() { _ = apiSrv.Serve(r.APIListener) }()
-
-	go func() { _ = r.GatewaySrv.Serve(r.GWListener) }()
+	apiSrv := &http.Server{
+		Handler:           r.APIServer.Handler(),
+		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	} // read/write timeouts bound slowloris-style abuse (AUDIT RH-28).
+	r.MgmtHTTP = apiSrv
+	// Serve errors used to be discarded: a post-listen failure (or unexpected
+	// exit) left the runtime "running" with no observable signal (RH-22).
+	go func() {
+		if err := apiSrv.Serve(r.APIListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("relayhub: management server exited unexpectedly: %v", err)
+		}
+	}()
+	go func() {
+		if err := r.GatewaySrv.Serve(r.GWListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("relayhub: gateway server exited unexpectedly: %v", err)
+		}
+	}()
 
 	return nil
 }
 
 func (r *Runtime) Shutdown(ctx context.Context) error {
 	_ = r.Scheduler.Stop(ctx)
+	if r.MgmtHTTP != nil {
+		_ = r.MgmtHTTP.Shutdown(ctx)
+	}
 	if r.APIServer != nil && r.APIServer.BrowserRuntime != nil {
 		_ = r.APIServer.BrowserRuntime.Close(ctx)
 	}
