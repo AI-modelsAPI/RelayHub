@@ -10,5 +10,7 @@ if [ "$#" -eq 0 ]; then
     set -- -full-stack -data-dir "$DATA_DIR"
 fi
 
-echo "==> Starting RelayHub Core in container (UID: $(id -u))..."
+# Log to stderr: stdout must stay clean so `docker run relayhub -version`
+# (release verification, CI version assertion) sees only the version line.
+echo "==> Starting RelayHub Core in container (UID: $(id -u))..." >&2
 exec /app/relayhub "$@"

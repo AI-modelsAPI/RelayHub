@@ -4,6 +4,10 @@ FROM golang:1.27-alpine AS builder
 WORKDIR /src
 RUN apk add --no-cache git ca-certificates
 
+# Module proxy is overridable for networks where proxy.golang.org is blocked
+# (e.g. --build-arg GOPROXY=https://goproxy.cn,direct). Default is unchanged.
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 COPY go.mod go.sum ./
 RUN go mod download
 

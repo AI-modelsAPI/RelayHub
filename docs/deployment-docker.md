@@ -63,6 +63,29 @@ A non-loopback listener is logged as a `WARNING` at startup.
 - `/data/relayhub.db`: SQLite database holding resources, check-in records, and audit logs.
 - `/data/master.key`: 32-byte secret encryption key with `0600` permissions.
 
+## Building behind a restricted network
+
+`go mod download` inside the build stage talks to `proxy.golang.org`. Where
+that host is unreachable, point the build at a mirror:
+
+```bash
+docker build --build-arg GOPROXY=https://goproxy.cn,direct \
+  --build-arg VERSION=$(git describe --tags --always --dirty) \
+  --build-arg COMMIT=$(git rev-parse --short HEAD) \
+  --build-arg DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  -t relayhub:latest .
+```
+
+## Verified on macOS with Colima
+
+Both shapes above were exercised on a Mac running Docker via Colima
+(`colima start --vm-type vz`): in host-network mode the sockets live on the
+Colima VM's loopback and Colima forwards them to the Mac's `127.0.0.1`, so
+`curl http://127.0.0.1:8790/healthz` works from the Mac; in bridge mode the
+published ports reach the container's `0.0.0.0` listeners and traffic
+provably transits the container (the container-internal management API is
+reachable *only* through the container's proxies).
+
 ## Verifying an image
 
 ```bash

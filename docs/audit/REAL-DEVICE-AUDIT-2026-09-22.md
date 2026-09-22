@@ -1,7 +1,7 @@
 # RelayHub 真机审计与修复报告 — 2026-09-22
 
 - **审计基线**：GitHub `AI-modelsAPI/RelayHub` `main @ ea49fec`（PR #2、#3 合并后）
-- **真机环境**：macOS 14.8.5 (x86_64) · Go 1.27.1 · Node 22.23.1 · Python 3.13.12 · Apple clang 16 · Google Chrome 已安装 · **无 Docker**
+- **真机环境**：macOS 14.8.5 (x86_64) · Go 1.27.1 · Node 22.23.1 · Python 3.13.12 · Apple clang 16 · Google Chrome 已安装 · Docker：首轮无，同日补装 Colima + Docker CLI 后完成 §7
 - **工作分支**：`fix/real-device-audit-2026-09-22`
 - **前置文档**：`docs/audit/AUDIT-2026-09-22.md`（报告 A）、`docs/audit/AUDIT-REPORT-rh-01..33.md`（报告 B）、`docs/dev/STATUS-2026-09-22.md`（沙箱修复记录）。三份均**未修改**（STATUS 只加了一段后记）。
 - **方法**：与前两份报告不同，本次全部结论来自真机执行：`go build/vet/test -race`、真实端口冒烟、真实 Chrome CDP、打包 `.app/.dmg` 并驱动、`govulncheck`、GitHub CI 日志。
@@ -91,7 +91,7 @@
 
 | 项 | 原因 / 状态 |
 |---|---|
-| Docker 镜像构建与容器冒烟（`tests/docker/smoke.sh`） | 本机无 Docker。`tests/docker/red_test.go` 的两个测试在真实二进制上通过；镜像层面由 CI `docker.yml` 验证（已加版本断言），**本报告不声称容器内验证通过** |
+| ~~Docker 镜像构建与容器冒烟~~ | **已补做**（同日，本机安装 Colima 0.10.3 + Docker 29.x 后），见 §7 |
 | arm64 `.app` 实际启动 | 宿主为 x86_64，只做了 lipo 架构校验与 DMG 打包；amd64 包完整驱动通过。CI `macos-latest`（arm64）会跑另一半 |
 | `release.yml` 里的桌面生命周期套件在 GitHub runner 上是否稳定 | 本机 GUI 会话下 4/4 通过；无头 runner 上 Cocoa 应用行为**未验证** |
 | 真实 Claude Code / Codex / Hermes 二进制互操作 | 只验证到落盘文件形态（settings.json / config.toml + .env / config.yaml + .env）符合各 CLI 文档与源码，未启动这三个 CLI |
@@ -132,6 +132,19 @@ curl -x 127.0.0.1:8787 http://1.1.1.1/        → 301（普通 HTTP 经代理可
 curl -x 127.0.0.1:8787 https://www.baidu.com/ → 200（CONNECT 隧道正常）
 curl --socks5 127.0.0.1:8788 https://www.baidu.com/ → 200
 ```
+
+## 7. 补充：本机 Docker 真机验证（同日追加）
+
+环境：Homebrew 安装 `docker` 29.8.1 CLI + `colima` 0.10.3（vz 虚拟机，Ubuntu 24.04 x86_64，4 CPU / 6 GB）。
+
+| 检查 | 结果 |
+|---|---|
+| `docker build`（默认 `GOPROXY`） | **失败**：容器内 `proxy.golang.org` 不可达（`dial tcp 142.250.77.209:443: i/o timeout`）。Dockerfile 新增 `ARG GOPROXY` 可覆盖；用 `goproxy.cn` 构建成功，镜像 64 MB |
+| `docker run --rm relayhub:test -version` | 暴露新问题 **RD-9**：`entrypoint.sh` 的启动横幅写在 stdout，`verify-release.sh` 与 CI 的版本断言拿到的是"横幅+版本"两行。已改为 stderr；修复后 `verify-release.sh` 报 `Docker image version matched` |
+| `tests/docker/smoke.sh relayhub:test` | 通过（UID 10001、容器内 healthcheck） |
+| **bridge 模式**（`RELAYHUB_*_ADDR=0.0.0.0:…` + `-p 127.0.0.1:1878x:878x`） | 从 Mac 经发布端口：网关无 key 401 / 带 key 200；HTTP 代理与 SOCKS5 都能访问到**容器内回环独有**的 `127.0.0.1:8790/healthz`（Mac 本身 8790 无监听 → 证明流量真正穿过容器）；CONNECT 到公网 HTTPS 200；不可达目标 `127.0.0.1:1` 返回 **502**（RD-2 修复在真实容器上生效）；容器日志打出三条非回环 WARNING |
+| **host 模式**（`docker compose up`） | 容器健康；套接字落在 Colima VM 的 `127.0.0.1:8787-8790`，Colima 自动转发到 Mac，`curl 127.0.0.1:8790/healthz` → 200、`8789/v1/models` → 401。注意：这依赖 Colima/Docker Desktop 的 host 网络转发，纯 Linux 上则直接是宿主回环 |
+| `go test -race ./tests/docker/` | 2/2 通过 |
 
 ## 6. 建议的放行门禁（替代 STATUS 第四节）
 
