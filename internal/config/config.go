@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 const (
@@ -29,6 +30,48 @@ type Config struct {
 	// "local_only" limits targets to loopback/link-local.
 	HTTPProxyTargetPolicy string `json:"http_proxy_target_policy"`
 	SOCKS5TargetPolicy    string `json:"socks5_target_policy"`
+	// EgressProxyURL is the global default exit for outbound AI gateway,
+	// check-in and browser traffic (http://, https://, socks5://, or
+	// "direct"). A channel's own proxy_url takes precedence. Empty means the
+	// process environment (HTTPS_PROXY etc.) decides. Env: RELAYHUB_EGRESS_PROXY.
+	EgressProxyURL string `json:"egress_proxy_url"`
+	// Notify configures outbound notifications (check-in failures, quota
+	// low, breaker open). All fields optional; env overrides see ApplyEnv.
+	Notify NotifyConfig `json:"notify"`
+}
+
+// NotifyConfig holds notification sinks. Values are non-secret endpoints or
+// bot tokens the user chose to put in the config file; the file lives in the
+// data directory and should be mode 0600.
+type NotifyConfig struct {
+	WebhookURL       string  `json:"webhook_url"`
+	BarkURL          string  `json:"bark_url"`
+	TelegramBotToken string  `json:"telegram_bot_token"`
+	TelegramChatID   string  `json:"telegram_chat_id"`
+	QuotaLowUSD      float64 `json:"quota_low_usd"`
+}
+
+// ConfigFileName is the optional JSON file looked up inside the data directory.
+const ConfigFileName = "config.json"
+
+// ApplyEnv overlays environment variables onto cfg. It is applied after the
+// file so that deployment environments can override without editing files.
+func ApplyEnv(cfg *Config) {
+	set := func(dst *string, key string) {
+		if v, ok := os.LookupEnv(key); ok && v != "" {
+			*dst = v
+		}
+	}
+	set(&cfg.EgressProxyURL, "RELAYHUB_EGRESS_PROXY")
+	set(&cfg.Notify.WebhookURL, "RELAYHUB_NOTIFY_WEBHOOK_URL")
+	set(&cfg.Notify.BarkURL, "RELAYHUB_NOTIFY_BARK_URL")
+	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
+	set(&cfg.Notify.TelegramChatID, "RELAYHUB_NOTIFY_TELEGRAM_CHAT_ID")
+	if v, ok := os.LookupEnv("RELAYHUB_NOTIFY_QUOTA_LOW_USD"); ok && v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.Notify.QuotaLowUSD = f
+		}
+	}
 }
 
 func Defaults(dataDir string) Config {
@@ -56,6 +99,10 @@ func Load(path string) (Config, error) {
 	if st, err := os.Stat(path); err == nil {
 		if st.IsDir() {
 			dataDir = path
+			// A data directory may carry an optional config.json.
+			if candidate := filepath.Join(path, ConfigFileName); fileExists(candidate) {
+				file = candidate
+			}
 		} else {
 			file, dataDir = path, filepath.Dir(path)
 		}
@@ -84,6 +131,11 @@ func Load(path string) (Config, error) {
 	merge(&cfg, loaded)
 	normalizeConfigPaths(&cfg)
 	return cfg, nil
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 func defaultDataDir() string {
@@ -158,5 +210,23 @@ func merge(dst *Config, src Config) {
 	}
 	if src.SOCKS5TargetPolicy != "" {
 		dst.SOCKS5TargetPolicy = src.SOCKS5TargetPolicy
+	}
+	if src.EgressProxyURL != "" {
+		dst.EgressProxyURL = src.EgressProxyURL
+	}
+	if src.Notify.WebhookURL != "" {
+		dst.Notify.WebhookURL = src.Notify.WebhookURL
+	}
+	if src.Notify.BarkURL != "" {
+		dst.Notify.BarkURL = src.Notify.BarkURL
+	}
+	if src.Notify.TelegramBotToken != "" {
+		dst.Notify.TelegramBotToken = src.Notify.TelegramBotToken
+	}
+	if src.Notify.TelegramChatID != "" {
+		dst.Notify.TelegramChatID = src.Notify.TelegramChatID
+	}
+	if src.Notify.QuotaLowUSD != 0 {
+		dst.Notify.QuotaLowUSD = src.Notify.QuotaLowUSD
 	}
 }

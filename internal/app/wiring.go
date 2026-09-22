@@ -28,11 +28,13 @@ import (
 	"relayhub/internal/catalog"
 	"relayhub/internal/checkin"
 	"relayhub/internal/domain"
+	"relayhub/internal/egress"
 	"relayhub/internal/gateway"
 	"relayhub/internal/guard"
 	"relayhub/internal/health"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
+	"relayhub/internal/notify"
 	"relayhub/internal/proxy"
 	"relayhub/internal/ratelimit"
 	"relayhub/internal/repository"
@@ -63,6 +65,7 @@ type Runtime struct {
 	// MgmtHTTP is the management http.Server itself (kept so Shutdown can wait
 	// for in-flight management requests instead of hard-cutting the listener).
 	MgmtHTTP *http.Server
+	Notifier *notify.Dispatcher
 
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -97,6 +100,34 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 
 	repo := repository.New(db.DB)
 	healthReg := health.NewRegistry()
+	// Operator notifications (Webhook / Bark / Telegram). Disabled unless at
+	// least one sink is configured; events are rate-limited per channel.
+	notifier := notify.FromSettings(notify.Settings{
+		WebhookURL:       cfg.Notify.WebhookURL,
+		BarkURL:          cfg.Notify.BarkURL,
+		TelegramBotToken: cfg.Notify.TelegramBotToken,
+		TelegramChatID:   cfg.Notify.TelegramChatID,
+	}, log.Printf)
+	if notifier.Enabled() {
+		log.Printf("relayhub: notifications enabled via %v", notifier.Sinks())
+	}
+	// One egress policy for every outbound path (gateway, check-in adapters,
+	// browser): Channel.ProxyURL > global default > environment.
+	egressSel := egress.New(cfg.EgressProxyURL)
+	if cfg.EgressProxyURL != "" {
+		if _, err := egress.Normalize(cfg.EgressProxyURL); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("invalid egress_proxy_url: %w", err)
+		}
+		log.Printf("relayhub: default egress via %s", egress.Describe(cfg.EgressProxyURL))
+	}
+	// Status transitions (breaker trips, quota exhaustion, recoveries) are
+	// persisted so that history survives a restart and pushed to the
+	// operator; per-request outcomes are not (they live in request_records).
+	healthReg.SetObserver(composeHealthObservers(
+		healthPersister(repo, log.Printf),
+		healthNotifier(notifier, repoChannelLookup(repo)),
+	))
 	catalogSvc := catalog.NewService(repo)
 	_ = catalogSvc.Load(ctx)
 
@@ -157,12 +188,24 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	_ = adpReg.Register("justdowork", justdowork.NewWithSecrets(nil, secStore))
 	_ = adpReg.Register("kktoken", kktoken.NewWithSecrets(nil, secStore))
 	_ = adpReg.Register("seekai", seekai.NewWithSecrets(nil, secStore))
+	adpReg.SetClientProvider(egressSel)
 
 	// Scheduler
 	sched := checkin.NewScheduler(checkin.Config{
 		Interval:     24 * time.Hour,
 		RandomJitter: 10 * time.Minute,
 	}, adpReg, repo)
+	// Balance observations (check-in follow-ups and the hourly poll) become a
+	// routing signal: quota-first reads them from the health registry.
+	quotaLow := quotaLowNotifier(notifier, cfg.Notify.QuotaLowUSD)
+	sched.SetQuotaObserver(func(ch domain.Channel, q domain.QuotaSnapshot) {
+		healthReg.SetQuota(ch.ID, quotaUpdateFrom(q), q.UpdatedAt)
+		quotaLow(ch, q)
+	})
+	sched.SetEventSink(notifier.Notify)
+	// Seed the registry from the last persisted snapshots so routing does not
+	// start blind after a restart (stale snapshots are ignored).
+	seedQuotaFromChannels(healthReg, rChannels, time.Now())
 
 	// Proxies
 	httpPAddr := cfg.HTTPProxyAddr
@@ -259,6 +302,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 
 	browserRt := browser.NewRuntime()
 	sched.SetBrowserExecutor(browser.NewCDPExecutor(browserRt, absDataDir, browser.Detect))
+	sched.SetProxyResolver(egressSel.ProxyFor)
 
 	// The address handed to CLI sync / settings must be dialable by a local
 	// client: the *bound* port (a ":0" listener picks one) with any wildcard
@@ -283,6 +327,10 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		GatewayAddr:    advertisedGW,
 		BrowserRuntime: browserRt,
 		Scheduler:      sched,
+		Health:         healthReg,
+		DefaultEgress:  cfg.EgressProxyURL,
+		Egress:         egressSel,
+		Notifier:       notifier,
 	})
 	if err != nil {
 		_ = browserRt.Close(ctx)
@@ -313,6 +361,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 				token, keyID, err := resolveChannelCredential(ctx, repo, secStore, &keyRotation, d.Channel, d.PreferredKeyID)
 				return gateway.CredentialPick{Token: token, KeyID: keyID}, err
 			},
+			// Streaming responses must not be cut by a client timeout; the
+			// request context bounds the call instead.
+			ClientFor: egressSel.StreamingClientFor,
 		},
 		Health: healthReg,
 		Auth:   localKeys,
@@ -358,6 +409,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		GatewaySrv:  gwServer,
 		GWListener:  gwL,
 		AuditLogger: auditLog,
+		Notifier:    notifier,
 		stopCh:      make(chan struct{}),
 		stopped:     make(chan struct{}),
 	}
@@ -485,5 +537,8 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 	_ = r.HTTPProxy.Shutdown(ctx)
 	_ = r.SOCKSProxy.Shutdown(ctx)
 	_ = r.DB.Close()
+	if r.Notifier != nil {
+		r.Notifier.Flush(3 * time.Second)
+	}
 	return nil
 }

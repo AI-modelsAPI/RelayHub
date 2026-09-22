@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"relayhub/internal/domain"
+	"relayhub/internal/egress"
 	"relayhub/internal/identity"
 )
 
@@ -51,7 +52,9 @@ const (
 
 // BaseNewAPIAdapter provides shared HTTP logic for all New API family adapters.
 type BaseNewAPIAdapter struct {
-	Client         *http.Client
+	Client *http.Client
+	// Clients, when set, overrides Client per channel (per-channel egress).
+	Clients        ClientProvider
 	Secrets        SecretResolver
 	SiteKey        string
 	SiteName       string
@@ -60,6 +63,32 @@ type BaseNewAPIAdapter struct {
 	DisableCheckin bool
 
 	refreshLocks sync.Map // accountRef -> *sync.Mutex
+}
+
+// SetClientProvider implements EgressAware.
+func (b *BaseNewAPIAdapter) SetClientProvider(p ClientProvider) { b.Clients = p }
+
+// defaultEgress serves adapters that were constructed without a wired
+// ClientProvider (tests, ad-hoc API use): a channel proxy is still honoured.
+var defaultEgress = egress.New("")
+
+// HTTPClient returns the client to use for a channel: the per-channel egress
+// client when a provider is installed, else a per-channel proxy client when
+// the channel declares one, else the adapter's Client, else a default with
+// the given timeout.
+func (b *BaseNewAPIAdapter) HTTPClient(channel domain.Channel, timeout time.Duration) *http.Client {
+	if b.Clients != nil {
+		if c := b.Clients.ClientFor(channel, timeout); c != nil {
+			return c
+		}
+	}
+	if strings.TrimSpace(channel.ProxyURL) != "" {
+		return defaultEgress.ClientFor(channel, timeout)
+	}
+	if b.Client != nil {
+		return b.Client
+	}
+	return &http.Client{Timeout: timeout}
 }
 
 func (b *BaseNewAPIAdapter) getLock(accountKey string) *sync.Mutex {
@@ -233,8 +262,7 @@ func (b *BaseNewAPIAdapter) RefreshAccessToken(ctx context.Context, channel doma
 	req.Header.Set("Referer", baseURL+"/")
 	req.Header.Set("Cookie", cred.SiteCookie)
 
-	client := clientForChannel(b.Client, channel)
-	resp, err := client.Do(req)
+	resp, err := b.HTTPClient(channel, 15*time.Second).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -299,13 +327,11 @@ func (b *BaseNewAPIAdapter) CallWithAuth(ctx context.Context, channel domain.Cha
 		if len(reqBody) > 0 {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		// The actual account call must use the channel's configured egress
-		// (proxy / identity headers) exactly like refresh & status paths do;
-		// using the bare b.Client here bypassed the channel proxy and exposed
-		// the default egress to the upstream (AUDIT RH-10).
-		client := clientForChannel(b.Client, channel)
+		// The account call exits through the channel's egress and carries the
+		// channel identity headers exactly like refresh & status paths do
+		// (AUDIT RH-10): a bare b.Client here bypassed the channel proxy.
 		identity.ApplyRequestHeaders(req.Header, channel)
-		resp, err := client.Do(req)
+		resp, err := b.HTTPClient(channel, 15*time.Second).Do(req)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -337,8 +363,7 @@ func (b *BaseNewAPIAdapter) FetchStatusQuotaPerUnit(ctx context.Context, channel
 	if err != nil {
 		return DefaultQuotaPerUnit
 	}
-	client := clientForChannel(b.Client, channel)
-	resp, err := client.Do(req)
+	resp, err := b.HTTPClient(channel, 10*time.Second).Do(req)
 	if err != nil {
 		return DefaultQuotaPerUnit
 	}
@@ -616,6 +641,46 @@ func (b *BaseNewAPIAdapter) Refresh(ctx context.Context, channel domain.Channel)
 	return nil
 }
 
+// VerifyCheckin implements CheckinVerifier using the same server-side
+// judgement the HTTP check-in path uses: the check-in calendar first, the
+// bonus log second, and (for sites without relogin semantics) the user's
+// checked_in flag last. It never reports CheckedIn without a server record.
+func (b *BaseNewAPIAdapter) VerifyCheckin(ctx context.Context, channel domain.Channel) (CheckinVerification, error) {
+	unit := b.FetchStatusQuotaPerUnit(ctx, channel)
+	csChecked, csUSD, csKnown, csErr := b.CheckinStatus(ctx, channel, unit)
+	if csChecked {
+		return CheckinVerification{CheckedIn: true, Reward: formatUSD(csUSD, csKnown), RewardUSD: csUSD, RewardKnown: csKnown, Message: "server calendar shows today's check-in"}, nil
+	}
+	tbChecked, tbUSD, tbKnown, tbErr := b.TodayBonus(ctx, channel)
+	if tbChecked {
+		return CheckinVerification{CheckedIn: true, Reward: formatUSD(tbUSD, tbKnown), RewardUSD: tbUSD, RewardKnown: tbKnown, Message: "server bonus log shows today's reward"}, nil
+	}
+	code, body, err := b.CallWithAuth(ctx, channel, http.MethodGet, "/api/user/self", nil)
+	if err != nil {
+		return CheckinVerification{}, fmt.Errorf("verify check-in: %w", err)
+	}
+	if code != http.StatusOK {
+		return CheckinVerification{}, fmt.Errorf("verify check-in: site responded HTTP %d", code)
+	}
+	if !b.NeedsRelogin {
+		if uData, pErr := ParseUserSelf(body); pErr == nil && uData != nil && uData.CheckedIn {
+			return CheckinVerification{CheckedIn: true, Message: "server marks the account as checked in today"}, nil
+		}
+	}
+	// Both evidence endpoints answered but neither has today's record.
+	if csErr != nil && tbErr != nil {
+		return CheckinVerification{}, fmt.Errorf("verify check-in: calendar (%v) and bonus log (%v) unavailable", csErr, tbErr)
+	}
+	return CheckinVerification{CheckedIn: false, Message: "no server-side record of today's check-in"}, nil
+}
+
+func formatUSD(usd float64, known bool) string {
+	if !known || usd <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("$%.2f", usd)
+}
+
 // Common Balance implementation.
 func (b *BaseNewAPIAdapter) Balance(ctx context.Context, channel domain.Channel) (BalanceResult, error) {
 	unit := b.FetchStatusQuotaPerUnit(ctx, channel)
@@ -769,14 +834,4 @@ func (b *BaseNewAPIAdapter) CheckIn(ctx context.Context, channel domain.Channel)
 		Already: false,
 		Message: "登录保活完成（未检测到今日签到记录，未标记已签）",
 	}, nil
-}
-
-func clientForChannel(fallback *http.Client, ch domain.Channel) *http.Client {
-	if strings.TrimSpace(ch.ProxyURL) != "" {
-		return identity.HTTPClient(ch.ProxyURL, 15*time.Second)
-	}
-	if fallback != nil {
-		return fallback
-	}
-	return &http.Client{Timeout: 15 * time.Second}
 }

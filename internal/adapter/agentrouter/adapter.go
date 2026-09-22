@@ -82,11 +82,7 @@ func (a *Adapter) AffTransfer(ctx context.Context, channel domain.Channel) (bool
 		req.Header.Set("Cookie", cred.SiteCookie)
 	}
 
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
-	resp, err := client.Do(req)
+	resp, err := a.HTTPClient(channel, 15*time.Second).Do(req)
 	if err != nil {
 		return false, "", err
 	}

@@ -28,10 +28,13 @@ import (
 	"relayhub/internal/clisync/codex"
 	"relayhub/internal/clisync/hermes"
 	"relayhub/internal/domain"
+	"relayhub/internal/egress"
 	"relayhub/internal/export"
+	"relayhub/internal/health"
 	"relayhub/internal/identity"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
+	"relayhub/internal/notify"
 	"relayhub/internal/ratelimit"
 	"relayhub/internal/repository"
 	"relayhub/internal/secrets"
@@ -68,6 +71,18 @@ type Server struct {
 	// BrowserRuntime manages child browser processes.
 	BrowserRuntime *browser.Runtime
 	Scheduler      *checkin.Scheduler
+	Health         *health.Registry
+	// DefaultEgress is the global egress proxy (display; also the fallback
+	// for admin probes when no Egress selector is injected).
+	DefaultEgress string
+	// Egress hands out cached, fail-closed upstream clients for the
+	// management-plane probes (model fetch / connectivity test). Wiring passes
+	// the selector shared with the gateway and adapters so every outbound
+	// path resolves identically: channel proxy_url > global default >
+	// environment; "direct" bypasses both.
+	Egress *egress.Selector
+	// Notifier delivers operator events; nil or disabled means "not configured".
+	Notifier *notify.Dispatcher
 
 	// CLISync performs CLI configuration synchronisation. When nil the
 	// management API reports the feature unsupported rather than pretending a
@@ -132,6 +147,13 @@ type Config struct {
 
 	BrowserRuntime *browser.Runtime
 	Scheduler      *checkin.Scheduler
+	// Health exposes the live routing view (breaker, latency, quota) so the
+	// UI can explain why a channel is or is not receiving traffic.
+	Health        *health.Registry
+	DefaultEgress string
+	// Egress is the shared egress selector (see Server.Egress).
+	Egress   *egress.Selector
+	Notifier *notify.Dispatcher
 }
 
 func NewConfiguredServer(cfg Config) (*Server, error) {
@@ -203,6 +225,10 @@ func NewConfiguredServer(cfg Config) (*Server, error) {
 		GatewayAddr:    cfg.GatewayAddr,
 		BrowserRuntime: cfg.BrowserRuntime,
 		Scheduler:      cfg.Scheduler,
+		Health:         cfg.Health,
+		DefaultEgress:  cfg.DefaultEgress,
+		Egress:         cfg.Egress,
+		Notifier:       cfg.Notifier,
 		CLISync:        cliSyncSvc,
 	}, nil
 }
@@ -284,6 +310,7 @@ func (s *Server) managementRoutes() http.Handler {
 	mux.HandleFunc("/api/v1/logs", s.logs)
 	mux.HandleFunc("/api/v1/usage", s.usage)
 	mux.HandleFunc("/api/v1/settings", s.settings)
+	mux.HandleFunc("/api/v1/notify/test", s.notifyTest)
 	mux.HandleFunc("/api/v1/browser", s.browserHandler)
 	mux.HandleFunc("/api/v1/cli-sync", s.cliSync)
 	mux.HandleFunc("/api/v1/import-export", s.importExport)
@@ -585,12 +612,7 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 	// (AUDIT RH-10); draft-channel probes have no channel identity to apply.
 	client := &http.Client{Timeout: 20 * time.Second}
 	if haveChannel {
-		proxyClient, cerr := identity.HTTPClientE(ch.ProxyURL, 20*time.Second)
-		if cerr != nil {
-			s.fail(w, r, badRequest("validation_error", cerr.Error()))
-			return
-		}
-		client = proxyClient
+		client = s.upstreamProbeClient(ch, 20*time.Second)
 	}
 	endpoints := []string{baseURL + "/v1/models", baseURL + "/models"}
 	var lastErr error
@@ -1284,7 +1306,7 @@ func (s *Server) channelStats(w http.ResponseWriter, r *http.Request) {
 	if h, err := s.Repo.ListHealthRecords(ctx, channelID); err == nil && len(h) > 0 {
 		lastChecked = h[0].CheckedAt
 	}
-	s.write(w, r, http.StatusOK, map[string]any{"stats": map[string]any{
+	stats := map[string]any{
 		"channel_id":        channelID,
 		"health_state":      ch.HealthState,
 		"quota_state":       ch.QuotaState,
@@ -1297,7 +1319,63 @@ func (s *Server) channelStats(w http.ResponseWriter, r *http.Request) {
 		"recent_errors":     recentErr,
 		"avg_latency_ms":    avgLatency,
 		"last_checked_at":   lastChecked,
-	}})
+	}
+	if q, ok := domain.ParseQuotaSnapshot(ch.QuotaState); ok {
+		stats["quota"] = q
+	}
+	if s.Health != nil {
+		stats["live"] = liveHealthView(s.Health, channelID, time.Now())
+	}
+	stats["egress"] = s.egressView(ch)
+	s.write(w, r, http.StatusOK, map[string]any{"stats": stats})
+}
+
+// egressView explains which exit a channel's traffic takes (credentials are
+// never echoed). "source" tells the operator where the setting came from.
+func (s *Server) egressView(ch domain.Channel) map[string]any {
+	source, proxy := "environment", ""
+	if strings.TrimSpace(ch.ProxyURL) != "" {
+		source, proxy = "channel", ch.ProxyURL
+	} else if s.DefaultEgress != "" {
+		source, proxy = "global", s.DefaultEgress
+	}
+	return map[string]any{
+		"source": source,
+		"via":    egress.Describe(proxy),
+	}
+}
+
+// liveHealthView renders the in-memory routing state of one channel.
+func liveHealthView(reg *health.Registry, channelID string, now time.Time) map[string]any {
+	st := reg.Get(channelID)
+	status := string(st.Status)
+	if status == "" {
+		status = "unknown"
+	}
+	view := map[string]any{
+		"status":         status,
+		"available":      reg.Available(channelID, now),
+		"latency_ms":     int(st.Latency / time.Millisecond),
+		"success_rate":   st.SuccessRate,
+		"window_total":   st.WindowTotal,
+		"window_success": st.WindowSuccess,
+		"failure_count":  st.FailureCount,
+		"quota_known":    st.QuotaKnown,
+		"quota_usd":      st.QuotaUSD,
+	}
+	if !reg.Available(channelID, now) {
+		view["reason"] = reg.Reason(channelID, now)
+	}
+	if !st.CooldownUntil.IsZero() && now.Before(st.CooldownUntil) {
+		view["cooldown_until"] = st.CooldownUntil.UTC()
+	}
+	if st.LastError != "" {
+		view["last_error"] = st.LastError
+	}
+	if !st.QuotaUpdatedAt.IsZero() {
+		view["quota_updated_at"] = st.QuotaUpdatedAt.UTC()
+	}
+	return view
 }
 
 // channelTest tests a channel's connectivity using its default_test_model (or first model).
@@ -1394,6 +1472,20 @@ func (s *Server) channelTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// upstreamProbeClient returns the client an admin probe must use for a
+// channel. identity.HTTPClientE used to build it, which neither knew the
+// global egress default nor the "direct" sentinel the egress package accepts
+// on write, so a channel saved with proxy_url="direct" failed its own
+// connectivity test with a 400.
+func (s *Server) upstreamProbeClient(ch domain.Channel, timeout time.Duration) *http.Client {
+	if s.Egress != nil {
+		return s.Egress.ClientFor(ch, timeout)
+	}
+	// No shared selector injected (tests, embedded use): resolve against the
+	// current DefaultEgress on demand so a late change is never ignored.
+	return egress.New(s.DefaultEgress).ClientFor(ch, timeout)
+}
+
 // fetchUpstreamModelList GETs {base}/v1/models (fallback /models) through the
 // channel's configured egress (proxy + identity headers). Model fetch/test
 // previously used a fresh direct client and ignored channel ProxyURL,
@@ -1405,10 +1497,7 @@ func (s *Server) fetchUpstreamModelList(ctx context.Context, ch domain.Channel, 
 	if base == "" {
 		return nil, errors.New("base_url is empty")
 	}
-	client, err := identity.HTTPClientE(ch.ProxyURL, 20*time.Second)
-	if err != nil {
-		return nil, err
-	}
+	client := s.upstreamProbeClient(ch, 20*time.Second)
 	var lastErr error
 	for _, ep := range []string{base + "/v1/models", base + "/models"} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
@@ -1693,6 +1782,12 @@ func (s *Server) channelResource(w http.ResponseWriter, r *http.Request, ctx con
 		if r.Method == http.MethodPost && id == "" {
 			e = s.Repo.CreateChannel(ctx, c)
 		} else {
+			// quota_state / health_state / rate_limit_state / error_message are
+			// written by the scheduler and gateway, not by the form. A client
+			// that omits them must not erase the last observation.
+			if existing, gErr := s.Repo.GetChannel(ctx, c.ID); gErr == nil {
+				preserveSystemFields(&c, existing)
+			}
 			e = s.Repo.UpdateChannel(ctx, c)
 		}
 		if e != nil {
@@ -2198,7 +2293,40 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 		"token_configured":    s.Token != "",
 		"supported_mutations": false,
 		"browser":             bInfo,
+		"egress": map[string]any{
+			"default": egress.Describe(s.DefaultEgress),
+			"source":  map[bool]string{true: "config", false: "environment"}[s.DefaultEgress != ""],
+		},
+		"notify": map[string]any{
+			"enabled": s.Notifier.Enabled(),
+			"sinks":   s.Notifier.Sinks(),
+			"stats":   s.Notifier.Stats(),
+		},
 	})
+}
+
+// notifyTest sends a test event through every configured sink so the
+// operator can confirm delivery before relying on it at 08:00 tomorrow.
+func (s *Server) notifyTest(w http.ResponseWriter, r *http.Request) {
+	if !s.authorize(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		s.fail(w, r, badRequest("method_not_allowed", "POST is required"))
+		return
+	}
+	if !s.Notifier.Enabled() {
+		s.fail(w, r, unsupported("no notification sink configured (set notify.* in config.json or RELAYHUB_NOTIFY_* env)"))
+		return
+	}
+	s.Notifier.Notify(notify.Event{
+		Kind:      notify.KindTest,
+		Severity:  notify.SeverityInfo,
+		Title:     "RelayHub 通知测试",
+		Body:      "如果你看到这条消息，签到失败 / 额度告急 / 渠道熔断 的提醒都会送达这里。",
+		ChannelID: "test-" + time.Now().UTC().Format("150405"),
+	})
+	s.write(w, r, http.StatusAccepted, map[string]any{"queued": true, "sinks": s.Notifier.Sinks()})
 }
 
 func (s *Server) browserHandler(w http.ResponseWriter, r *http.Request) {
@@ -2525,6 +2653,9 @@ func validateChannel(c domain.Channel) error {
 	if c.CheckinMode != "" && c.CheckinMode != "auto" && c.CheckinMode != "manual" {
 		return badRequest("validation_error", "channel checkin_mode must be 'auto' or 'manual'")
 	}
+	if _, err := egress.Normalize(c.ProxyURL); err != nil {
+		return badRequest("validation_error", "channel proxy_url: "+err.Error()+" (use http://, https://, socks5:// or \"direct\")")
+	}
 	return nil
 }
 func validateModel(m domain.Model) error {
@@ -2691,6 +2822,24 @@ func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 // (AUDIT RH-31: the management API previously returned proxy passwords).
 func safeProvider(p domain.Provider) domain.Provider      { return p }
 func safeProviders(v []domain.Provider) []domain.Provider { return v }
+
+// preserveSystemFields carries scheduler/gateway-owned observations over from
+// the stored channel when an update request leaves them empty.
+func preserveSystemFields(c *domain.Channel, existing domain.Channel) {
+	if c.QuotaState == "" {
+		c.QuotaState = existing.QuotaState
+	}
+	if c.HealthState == "" {
+		c.HealthState = existing.HealthState
+	}
+	if c.RateLimitState == "" {
+		c.RateLimitState = existing.RateLimitState
+	}
+	if c.ErrorMessage == "" {
+		c.ErrorMessage = existing.ErrorMessage
+	}
+}
+
 func safeChannel(c domain.Channel) domain.Channel {
 	c.ProxyURL = maskProxyUserinfo(c.ProxyURL)
 	return c

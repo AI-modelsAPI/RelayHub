@@ -17,6 +17,21 @@ type Config struct {
 	HTTPProxyTargetPolicy string
 	SOCKS5TargetPolicy    string
 	WireFullStack         bool
+	// EgressProxyURL is the global default exit for outbound traffic; a
+	// channel's proxy_url overrides it. See internal/egress.
+	EgressProxyURL string
+	// Notify configures outbound notification sinks (see internal/notify).
+	Notify NotifyConfig
+}
+
+// NotifyConfig mirrors config.NotifyConfig without importing the config
+// package into app (main maps one onto the other).
+type NotifyConfig struct {
+	WebhookURL       string
+	BarkURL          string
+	TelegramBotToken string
+	TelegramChatID   string
+	QuotaLowUSD      float64
 }
 
 type App struct {

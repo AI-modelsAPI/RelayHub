@@ -146,6 +146,23 @@ curl --socks5 127.0.0.1:8788 https://www.baidu.com/ → 200
 | **host 模式**（`docker compose up`） | 容器健康；套接字落在 Colima VM 的 `127.0.0.1:8787-8790`，Colima 自动转发到 Mac，`curl 127.0.0.1:8790/healthz` → 200、`8789/v1/models` → 401。注意：这依赖 Colima/Docker Desktop 的 host 网络转发，纯 Linux 上则直接是宿主回环 |
 | `go test -race ./tests/docker/` | 2/2 通过 |
 
+## 8. 补充：PR #1（`arena/01a0c0fa-relayhub`，09-22 06:35/06:51）合并记录
+
+PR #1 是今天凌晨基于 09-21 归档快照做的 P0 功能线（健康数据求真 / 额度优先路由 / 统一出口 `internal/egress` / CDP 服务端证据 / 通知），作者在 Go 1.27.1 上真正跑过测试、其 CI 为绿。与真机修复后的 `main` 合并：**10 个文件 18 处冲突**，全部手工解决，原则是功能取 PR #1、审计修复取 `main`：
+
+| 文件 | 取舍 |
+|---|---|
+| `cmd/relayhub/main.go` | 两者都留：监听地址校验（RH-04）+ `config.Load/ApplyEnv`（egress/notify） |
+| `internal/app/wiring.go` | 两者都留：`MgmtHTTP` 优雅关闭 + `Notifier` |
+| `internal/adapter/{base,generic,declarative}.go` | 客户端改走 PR #1 的 `HTTPClient/ClientProvider`（`clientForChannel` 已被 PR #1 删除）；保留 `identity.ApplyRequestHeaders`；generic/declarative 的回退逻辑对齐 base：注入的 selector → 渠道代理 → 适配器 client，不会静默回到默认出口（RH-10） |
+| `internal/gateway/gateway.go` | 取 PR #1 的 egress 选择器与"每次尝试记一次健康结果"；删除 `main` 的 `upstreamClient` 缓存（被 egress 取代）；保留 `limitKey`（RH-19）与 `recordFailure` 用量/信任记账（RH-17）；**删掉沙箱在 transform/流结束后的第二次 `RecordSuccess`**——两段代码没有直接冲突却被 git 自动合并成双重计数，`TestGatewayRecordsMeasuredUpstreamLatency` 在真机上抓到（`WindowTotal:2`） |
+| `internal/api/server.go` | 保留代理密码脱敏（RH-31）+ PR #1 的 `preserveSystemFields`；**新发现 RD-10**：管理探针（`fetch-models`、`channels/test`）仍用 `identity.HTTPClientE`，不认识 PR #1 的 `"direct"` 哨兵和全局出口默认值——渠道存 `proxy_url=direct` 后自己的连通性测试会 400。改为注入 wiring 共用的 `egress.Selector`；新增 `TestAdminProbesHonourDirectEgressSentinel` |
+| `internal/browser/executor.go` | 取 PR #1 的 `launchArgs`（拒绝带凭据的代理，支持 direct）；删除 `main` 的 `normalizeCheckinProxy`（会重复追加 `--proxy-server`） |
+| `internal/checkin/scheduler.go` | 取 PR #1 的 resolver + Selectors；无 resolver 时仍回退到渠道自身代理 |
+| `.gitignore`、`.github/workflows/test.yml` | 并集（PR #1 的失败摘要注解保留） |
+
+真机验���（合并树）：`go test -race` 38 包全过、node 8/8、`smoke-local.sh`、`make test-macos`（双架构 + verify-release + 4 生命周期）、Docker 镜像构建 + 容器冒烟 + bridge 模式（`RELAYHUB_EGRESS_PROXY=direct` 生效，settings 报 `egress.default=direct`）。
+
 ## 6. 建议的放行门禁（替代 STATUS 第四节）
 
 `make test-real-device` 在一台有 Go 1.27 + Chrome 的 Mac 上退出码为 0，且 GitHub CI 三个工作流全绿。任何"已修复"的声明，若没有这两条证据，按本次经验应视为未修复。

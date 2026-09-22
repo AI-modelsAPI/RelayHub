@@ -31,6 +31,25 @@ func (r *Registry) Register(name string, adapter ProviderAdapter) error {
 	return nil
 }
 
+// Each visits every registered adapter (in unspecified order).
+func (r *Registry) Each(fn func(name string, a ProviderAdapter)) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for name, a := range r.adapters {
+		fn(name, a)
+	}
+}
+
+// SetClientProvider installs the per-channel client selector on every
+// registered adapter that supports it.
+func (r *Registry) SetClientProvider(p ClientProvider) {
+	r.Each(func(_ string, a ProviderAdapter) {
+		if ea, ok := a.(EgressAware); ok {
+			ea.SetClientProvider(p)
+		}
+	})
+}
+
 func (r *Registry) Resolve(p domain.Provider) (ProviderAdapter, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

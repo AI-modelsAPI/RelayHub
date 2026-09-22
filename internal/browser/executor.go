@@ -26,10 +26,13 @@ type CheckinRequest struct {
 	ChannelID  string        `json:"channel_id"`
 	DataDir    string        `json:"data_dir"`
 	Timeout    time.Duration `json:"timeout"`
-	// ProxyURL pins the browser check-in session to the channel's configured
-	// egress exactly like the HTTP paths do; without it the headless browser
-	// bypassed the channel proxy and exposed the default egress (AUDIT RH-10).
+	// ProxyURL is the channel's egress proxy ("" = system, "direct" = none).
+	// The browser must exit through the same path as the gateway and the
+	// HTTP adapters (AUDIT RH-10), otherwise a site sees the account from two
+	// networks.
 	ProxyURL string `json:"proxy_url,omitempty"`
+	// Selectors override the default DOM hooks (see SelectorsFromCapabilities).
+	Selectors Selectors `json:"selectors,omitempty"`
 }
 
 type CheckinResult struct {
@@ -85,28 +88,6 @@ func sanitizeTargetURL(raw string) error {
 // ExecuteCheckin launches a real browser with dedicated user profile, connects via CDP,
 // opens the page, interacts with checkin triggers, and inspects turnstile or rewards.
 
-// normalizeCheckinProxy validates and normalizes the optional per-channel
-// proxy for the browser process; invalid values are ignored rather than
-// killing the check-in run (the scheduler marks the failure through the
-// browser-fail path anyway, and failing closed here keeps the default egress
-// visible as before).
-func normalizeCheckinProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ""
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https", "socks5":
-	default:
-		return ""
-	}
-	return raw
-}
-
 func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (out CheckinResult, outErr error) {
 	if err := sanitizeTargetURL(req.URL); err != nil {
 		return CheckinResult{}, err
@@ -142,32 +123,13 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Launch headless browser with remote debugging port
-	args := []string{
-		"--headless=new",
-		fmt.Sprintf("--remote-debugging-port=%d", port),
-		fmt.Sprintf("--user-data-dir=%s", userDataDir),
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-background-networking",
-		"--disable-background-timer-throttling",
-		"--disable-client-side-phishing-detection",
-		"--disable-default-apps",
-		"--disable-extensions",
-		"--disable-hang-monitor",
-		"--disable-popup-blocking",
-		"--disable-prompt-on-repost",
-		"--disable-sync",
-		"--disable-translate",
-		"--metrics-recording-only",
-		"--safebrowsing-disable-auto-update",
-		"--password-store=basic",
-		"--use-mock-keychain",
+	// Launch headless browser with remote debugging port, exiting through
+	// the channel's egress proxy when one is configured (launchArgs refuses
+	// credentialed proxies rather than silently going direct).
+	args, err := launchArgs(port, userDataDir, req.ProxyURL)
+	if err != nil {
+		return CheckinResult{}, err
 	}
-	if proxy := normalizeCheckinProxy(req.ProxyURL); proxy != "" {
-		args = append(args, "--proxy-server="+proxy)
-	}
-	args = append(args, "about:blank")
 
 	cmd := exec.CommandContext(runCtx, info.Path, args...)
 	if err := e.runtime.StartProcess(cmd); err != nil {
@@ -227,42 +189,10 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 	pollTicker := time.NewTicker(200 * time.Millisecond)
 	defer pollTicker.Stop()
 
-	// JS expression to probe page state. Order is fail-closed: any unresolved
-	// human-verification gate yields to manual BEFORE any automated action.
-	const probeScript = `(() => {
-		// 1. Turnstile-style widget present without solved evidence -> yield
-		const turnstileEl = document.querySelector('.cf-turnstile, [data-turnstile-status], iframe[src*="challenges.cloudflare.com"]');
-		if (turnstileEl) {
-			const status = (turnstileEl.getAttribute('data-turnstile-status') || '').toLowerCase();
-			const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-			const solved = status === 'success' || !!(tokenInput && tokenInput.value);
-			if (!solved) {
-				return { state: 'turnstile_blocked', reason: 'turnstile verification not solved' };
-			}
-		}
-
-		// 2. Explicit manual gate text
-		if (document.body && document.body.innerText && (document.body.innerText.includes('Turnstile verification required') || document.body.innerText.includes('人机验证'))) {
-			return { state: 'turnstile_blocked', reason: 'human turnstile verification required' };
-		}
-
-		// 3. Visible success evidence
-		const successEl = document.querySelector('.checkin-success, #checkin-success, [data-checkin-status="success"]');
-		if (successEl && successEl.getClientRects().length && getComputedStyle(successEl).visibility !== 'hidden') {
-			return {
-				state: 'success',
-				reward: successEl.getAttribute('data-reward') || successEl.innerText || ''
-			};
-		}
-
-		// 4. Visible, enabled action button -> report ready (no in-probe click)
-		const btn = document.querySelector('#checkin-btn, .checkin-btn, button[data-action="checkin"]');
-		if (btn && !btn.disabled && btn.getClientRects().length) {
-			return { state: 'ready' };
-		}
-
-		return { state: 'waiting' };
-	})()`
+	// JS expression to probe page state (see probeScript for the fail-closed
+	// ordering). Selectors come from the request so sites can override them.
+	probe := probeScript(req.Selectors)
+	click := clickScript(req.Selectors)
 
 	clicked := false
 	for {
@@ -271,7 +201,7 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 			return CheckinResult{}, fmt.Errorf("checkin flow timed out: %w", runCtx.Err())
 		case <-pollTicker.C:
 			resRaw, err := client.Call(runCtx, "Runtime.evaluate", map[string]interface{}{
-				"expression":    probeScript,
+				"expression":    probe,
 				"returnByValue": true,
 				"awaitPromise":  true,
 			})
@@ -299,7 +229,7 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 					// Mark before sending: an ambiguous CDP reply must not repeat a mutation.
 					clicked = true
 					_, err := client.Call(runCtx, "Runtime.evaluate", map[string]interface{}{
-						"expression": `(() => { const b=document.querySelector('#checkin-btn, .checkin-btn, button[data-action="checkin"]'); if(b && !b.disabled && b.getClientRects().length) b.click(); })()`,
+						"expression": click,
 					})
 					if err != nil {
 						return CheckinResult{}, fmt.Errorf("checkin click outcome unknown: %w", err)

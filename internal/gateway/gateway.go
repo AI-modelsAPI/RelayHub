@@ -10,12 +10,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"relayhub/internal/auth"
 	"relayhub/internal/domain"
+	"relayhub/internal/egress"
 	"relayhub/internal/guard"
 	"relayhub/internal/health"
 	"relayhub/internal/lab"
@@ -78,49 +78,21 @@ type HTTPUpstream struct {
 	Client         *http.Client
 	Credential     func(context.Context, router.Decision) (string, error)
 	PickCredential func(context.Context, router.Decision) (CredentialPick, error)
-	MaxBodyBytes   int64
+	// ClientFor, when set, picks the client per channel so that requests
+	// exit through the channel's egress proxy (Channel.ProxyURL > global
+	// default > environment). It takes precedence over Client; returning nil
+	// falls back to Client. Without it, a channel proxy is still honoured via
+	// an ad-hoc transport.
+	ClientFor    func(domain.Channel) *http.Client
+	MaxBodyBytes int64
 }
+
+// fallbackEgress backs HTTPUpstream when no ClientFor is wired.
+var fallbackEgress = egress.New("")
 
 type boundedReadCloser struct {
 	io.Reader
 	io.Closer
-}
-
-// upstreamClients caches one http.Client per proxy configuration so gateway
-// requests reuse connections (AUDIT RH-20). The zero-value cache covers the
-// process lifetime; proxy configurations are operator-defined, so cardinality
-// is bounded in practice.
-var upstreamClients sync.Map // string -> *http.Client
-
-func upstreamClient(proxyRaw string) *http.Client {
-	proxyRaw = strings.TrimSpace(proxyRaw)
-	key := proxyRaw
-	if key == "" {
-		key = "direct"
-	}
-	if cached, ok := upstreamClients.Load(key); ok {
-		return cached.(*http.Client)
-	}
-	transport := &http.Transport{
-		MaxIdleConns:        128,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-	if proxyRaw == "" {
-		transport.Proxy = http.ProxyFromEnvironment
-	} else if proxyURL, err := url.Parse(proxyRaw); err == nil && proxyURL.Host != "" {
-		transport.Proxy = http.ProxyURL(proxyURL)
-	} else {
-		// Fail closed: an invalid proxy configuration must not silently leak the
-		// default egress route (AUDIT RH-10). The proxy func errors before any
-		// connection is attempted.
-		transport.Proxy = func(*http.Request) (*url.URL, error) {
-			return nil, fmt.Errorf("invalid channel proxy_url %q", proxyRaw)
-		}
-	}
-	client := &http.Client{Transport: transport}
-	actual, _ := upstreamClients.LoadOrStore(key, client)
-	return actual.(*http.Client)
 }
 
 func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
@@ -182,20 +154,21 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 		}
 	}
 	client := u.Client
-	if client == nil {
-		// Shared, cached clients keyed by proxy URL: the previous code built a
-		// brand-new Transport for every proxied gateway request (unbounded
-		// idle-connection growth, no reuse — AUDIT RH-20), and an invalid proxy
-		// URL silently degraded to a direct egress (AUDIT RH-10).
-		client = upstreamClient(req.Decision.Channel.ProxyURL)
-	} else if proxyRaw := strings.TrimSpace(req.Decision.Channel.ProxyURL); proxyRaw != "" {
-		if proxyURL, err := url.Parse(proxyRaw); err == nil && proxyURL.Host != "" {
-			cloned := *client
-			cloned.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-			client = &cloned
-		} else {
-			return Response{}, fmt.Errorf("invalid channel proxy_url %q", proxyRaw)
+	switch {
+	case u.ClientFor != nil:
+		if c := u.ClientFor(req.Decision.Channel); c != nil {
+			client = c
 		}
+	case strings.TrimSpace(req.Decision.Channel.ProxyURL) != "":
+		// No selector wired (tests, embedded use): still honour the channel
+		// proxy, through the shared cached transports.
+		client = fallbackEgress.StreamingClientFor(req.Decision.Channel)
+	}
+	if client == nil {
+		// No selector, no channel proxy, no injected client: the process
+		// default. Proxied channels never reach here — the egress selector
+		// above hands out cached, fail-closed transports (AUDIT RH-10/RH-20).
+		client = http.DefaultClient
 	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -209,7 +182,7 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 		Header:          resp.Header,
 		Body:            resp.Body,
 		CredentialKeyID: pick.KeyID,
-		RetryAfter:      parseRetryAfter(resp.Header),
+		RetryAfter:      retryAfterHeader(resp.Header),
 	}, nil
 }
 
@@ -351,12 +324,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	attempted := map[string]bool{decision.Channel.ID: true}
 	var last Response
 	var lastErr error
+	// switchChannel moves to the next candidate (pre-first-byte failover).
+	// It returns false when no other candidate exists.
+	switchChannel := func() bool {
+		resolver, ok := h.cfg.Resolver.(excludingResolver)
+		if !ok {
+			return false
+		}
+		next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted)
+		if resolveErr != nil {
+			return false
+		}
+		decision = next
+		attempted[decision.Channel.ID] = true
+		upstreamInput, err = transformRequest(protocol, endpoint, input, decision)
+		return err == nil
+	}
 	for attempt := 0; attempt < h.cfg.MaxAttempts; attempt++ {
 		if err := r.Context().Err(); err != nil {
 			writeGatewayError(w, r, http.StatusRequestTimeout, "timeout", "request canceled")
 			return
 		}
 		upProto, upPath := upstreamEndpointAndProtocol(protocol, endpoint, decision)
+		// Local AIMD pacing: short waits are absorbed here, longer ones
+		// switch channel before spending an attempt. Wait and Observe use the
+		// same limiting object (AUDIT RH-19).
 		if wait := h.cfg.Limiter.Wait(h.limitKey(decision, last.CredentialKeyID)); wait > 0 && wait <= 2*time.Second {
 			timer := time.NewTimer(wait)
 			select {
@@ -367,50 +359,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case <-timer.C:
 			}
 		} else if wait > 2*time.Second {
-			if resolver, ok := h.cfg.Resolver.(excludingResolver); ok {
-				if next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted); resolveErr == nil {
-					decision = next
-					attempted[decision.Channel.ID] = true
-					upstreamInput, err = transformRequest(protocol, endpoint, input, decision)
-					if err != nil {
-						break
-					}
-					continue
-				}
+			if switchChannel() {
+				continue
+			}
+			if err != nil {
+				break
 			}
 		}
+		attemptStart := time.Now()
 		last, lastErr = h.cfg.Upstream.Do(r.Context(), Request{Protocol: upProto, Path: upPath, Headers: requestHeaders(r, upProto, stream, decision), Body: upstreamInput, Stream: stream, Decision: decision})
+		ttfb := time.Since(attemptStart)
 		if lastErr == nil {
 			h.cfg.Limiter.Observe(h.limitKey(decision, last.CredentialKeyID), last.StatusCode, last.RetryAfter, last.Header)
 		}
-		if lastErr != nil {
-			if !retryableNetwork(lastErr) || attempt+1 == h.cfg.MaxAttempts {
-				break
+		// Every attempt outcome is fed to the health registry exactly once,
+		// including the final one: a channel whose last try failed used to
+		// stay "healthy" because only retried failures were recorded.
+		retry, sameChannel := false, false
+		switch {
+		case lastErr != nil:
+			if retryableNetwork(lastErr) {
+				h.observeFailure(decision, "network: "+lastErr.Error(), nil)
+				retry = attempt+1 < h.cfg.MaxAttempts
 			}
+		case last.StatusCode == http.StatusUnauthorized:
+			if h.cfg.DisableKey != nil && last.CredentialKeyID != "" {
+				h.cfg.DisableKey(r.Context(), last.CredentialKeyID)
+			}
+			h.observeFailure(decision, "upstream status 401", last.Header)
+		case retryableStatus(last.StatusCode):
+			h.observeFailure(decision, fmt.Sprintf("upstream status %d", last.StatusCode), last.Header)
+			retry = attempt+1 < h.cfg.MaxAttempts
+			// A short Retry-After is cheaper to honour than to fail over.
+			sameChannel = last.StatusCode == http.StatusTooManyRequests && last.RetryAfter > 0 && last.RetryAfter <= 2*time.Second
+		case last.StatusCode >= 200 && last.StatusCode < 300:
+			// A successful upstream response closes the circuit breaker and
+			// clears the failure count. Without this, a channel that tripped
+			// the breaker (or is half-open on a probe) would never return to
+			// Healthy even when working.
 			if h.cfg.Health != nil {
-				h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+				h.cfg.Health.RecordOutcome(decision.Channel.ID, true, ttfb, h.cfg.Now())
 			}
-			if resolver, ok := h.cfg.Resolver.(excludingResolver); ok {
-				next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted)
-				if resolveErr != nil {
-					break
-				}
-				decision = next
-				attempted[decision.Channel.ID] = true
-				upstreamInput, err = transformRequest(protocol, endpoint, input, decision)
-				if err != nil {
-					break
-				}
-			}
-			continue
 		}
-		if last.StatusCode == 401 && h.cfg.DisableKey != nil && last.CredentialKeyID != "" {
-			h.cfg.DisableKey(r.Context(), last.CredentialKeyID)
+		if !retry {
+			break
 		}
-		if last.StatusCode == 429 && last.RetryAfter > 0 && last.RetryAfter <= 2*time.Second && attempt+1 < h.cfg.MaxAttempts {
-			if last.Body != nil {
-				_ = last.Body.Close()
-			}
+		if last.Body != nil {
+			_ = last.Body.Close()
+			last.Body = nil
+		}
+		if sameChannel {
 			timer := time.NewTimer(last.RetryAfter)
 			select {
 			case <-r.Context().Done():
@@ -421,36 +419,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		if retryableStatus(last.StatusCode) && attempt+1 < h.cfg.MaxAttempts {
-			if last.Body != nil {
-				_ = last.Body.Close()
+		if !switchChannel() {
+			if err != nil {
+				break
 			}
-			if h.cfg.Health != nil {
-				h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
-			}
-			if resolver, ok := h.cfg.Resolver.(excludingResolver); ok {
-				next, resolveErr := resolver.ResolveExcluding(r.Context(), routeReq, attempted)
-				if resolveErr != nil {
-					break
-				}
-				decision = next
-				attempted[decision.Channel.ID] = true
-				upstreamInput, err = transformRequest(protocol, endpoint, input, decision)
-				if err != nil {
-					break
-				}
-			}
+			// No alternative candidate: retry the same channel.
 			continue
 		}
-		break
 	}
 	if lastErr != nil {
-		// The final failed attempt must reach the breaker too; previously
-		// failures were only recorded while another attempt remained, which
-		// made MaxAttempts=1 never trip and the last failure invisible (RH-18).
-		if h.cfg.Health != nil {
-			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
-		}
+		// Health already saw every attempt (observeFailure in the loop); this
+		// feeds the usage/verify sinks so success rates and trust scores
+		// reflect the failure (AUDIT RH-17).
 		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "network_error", reqStart)
 		writeGatewayError(w, r, http.StatusBadGateway, "network_error", "upstream request failed")
 		return
@@ -461,9 +441,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	if last.StatusCode < 200 || last.StatusCode >= 300 {
-		if h.cfg.Health != nil {
-			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
-		}
 		// Upstream error statuses (429/5xx/...) previously never reached usage or
 		// trust-score sinks, so success rates and verify scores were skewed (RH-17).
 		h.recordFailure(r, protocol, model, decision, last.StatusCode, classifyUpstreamStatus(last.StatusCode), reqStart)
@@ -491,11 +468,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		// Health success is only recorded once the stream body has been
-		// delivered, not when response headers merely looked OK (RH-18).
-		if err == nil && h.cfg.Health != nil {
-			h.cfg.Health.RecordSuccess(decision.Channel.ID, 0, 1)
-		}
+		// The 2xx outcome (with measured TTFB) was already fed to health in
+		// the attempt loop; a broken body above is recorded as a separate
+		// failure so "success at headers, broken stream" still penalises the
+		// channel (RH-18) without double-counting the success.
 		rec := recordFor(r, protocol, decision, nil, http.StatusOK, h.cfg.Now())
 		rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
 		rec.TTFTMS = meta.TTFTMS
@@ -536,11 +512,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, r, http.StatusBadGateway, "provider_protocol", err.Error())
 		return
 	}
-	// Health success only after the body has been parsed and transformed
-	// successfully (RH-18); "success at headers, broken body" no longer passes.
-	if h.cfg.Health != nil {
-		h.cfg.Health.RecordSuccess(decision.Channel.ID, 0, 1)
-	}
+	// Health already holds the 2xx outcome from the attempt loop; the
+	// read/transform failures above add a failure on top of it (RH-18).
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(transformed)
@@ -601,6 +574,52 @@ func classifyUpstreamStatus(status int) string {
 	default:
 		return "upstream_error"
 	}
+}
+
+// maxRetryAfter caps how long an upstream Retry-After hint may park a channel;
+// a misbehaving upstream must not be able to disable a channel for days.
+const maxRetryAfter = 10 * time.Minute
+
+// observeFailure feeds one failed attempt into the health registry and applies
+// an upstream Retry-After hint when present.
+func (h *Handler) observeFailure(decision router.Decision, reason string, hdr http.Header) {
+	if h.cfg.Health == nil {
+		return
+	}
+	now := h.cfg.Now()
+	h.cfg.Health.RecordFailureReason(decision.Channel.ID, 0, now, reason)
+	if hdr != nil {
+		if d := parseRetryAfter(hdr.Get("Retry-After"), now); d > 0 {
+			h.cfg.Health.ApplyRetryAfter(decision.Channel.ID, d, now)
+		}
+	}
+}
+
+// parseRetryAfter understands both delta-seconds and HTTP-date forms. Values in
+// the past or unparsable return 0; large values are capped to maxRetryAfter.
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		d = time.Duration(secs) * time.Second
+	} else if at, err := http.ParseTime(v); err == nil {
+		d = at.Sub(now)
+	} else {
+		return 0
+	}
+	if d <= 0 {
+		return 0
+	}
+	if d > maxRetryAfter {
+		d = maxRetryAfter
+	}
+	return d
 }
 
 func (h *Handler) record(r *http.Request, protocol string, decision router.Decision, body []byte, status int, latencyMS int64) {
@@ -675,24 +694,12 @@ func retryableNetwork(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
-func parseRetryAfter(h http.Header) time.Duration {
+// retryAfterHeader reads Retry-After from a response header (0 when absent).
+func retryAfterHeader(h http.Header) time.Duration {
 	if h == nil {
 		return 0
 	}
-	v := strings.TrimSpace(h.Get("Retry-After"))
-	if v == "" {
-		return 0
-	}
-	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-		return time.Duration(n) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		d := time.Until(t)
-		if d > 0 {
-			return d
-		}
-	}
-	return 0
+	return parseRetryAfter(h.Get("Retry-After"), time.Now())
 }
 func classifyResolve(err error) string {
 	if errors.Is(err, router.ErrModelNotFound) {

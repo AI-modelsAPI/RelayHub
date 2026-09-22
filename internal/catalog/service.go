@@ -50,7 +50,7 @@ func required(kind, id string) error {
 }
 func validStrategy(s string) bool {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "", "priority", "fixed", "weighted", "weighted-round-robin", "round-robin", "latency", "success-rate", "quota-aware", "random":
+	case "", "priority", "fixed", "weighted", "weighted-round-robin", "round-robin", "latency", "success-rate", "quota-aware", "quota-first", "random":
 		return true
 	}
 	return false

@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
 	"relayhub/internal/domain"
@@ -56,6 +57,35 @@ type HealthResult struct {
 type SecretResolver interface {
 	Get(ctx context.Context, ref string) ([]byte, error)
 	Put(ctx context.Context, ref string, plaintext []byte) error
+}
+
+// ClientProvider selects the HTTP client used to reach a channel. Production
+// wiring supplies the egress selector so adapters exit through the channel's
+// proxy exactly like the gateway does; nil means "use the adapter's Client".
+type ClientProvider interface {
+	ClientFor(ch domain.Channel, timeout time.Duration) *http.Client
+}
+
+// EgressAware is implemented by adapters that can take a ClientProvider.
+type EgressAware interface {
+	SetClientProvider(ClientProvider)
+}
+
+// CheckinVerification is the server-side answer to "is today's check-in on
+// record for this account?". It is the only evidence the scheduler accepts
+// after a browser-driven check-in; DOM state is never trusted on its own.
+type CheckinVerification struct {
+	CheckedIn   bool
+	Reward      string
+	RewardUSD   float64
+	RewardKnown bool
+	Message     string
+}
+
+// CheckinVerifier is implemented by adapters that can confirm a check-in
+// against the site's own records (calendar / bonus log / user flags).
+type CheckinVerifier interface {
+	VerifyCheckin(ctx context.Context, channel domain.Channel) (CheckinVerification, error)
 }
 
 // ProviderAdapter defines the common operations supported by upstream adapters.

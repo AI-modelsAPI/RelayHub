@@ -33,6 +33,32 @@ type DeclarativeAdapter struct {
 	Config  DeclarativeConfig
 	Client  *http.Client
 	Secrets SecretResolver
+	Clients ClientProvider
+}
+
+// SetClientProvider implements EgressAware.
+func (d *DeclarativeAdapter) SetClientProvider(p ClientProvider) { d.Clients = p }
+
+// httpClient mirrors BaseNewAPIAdapter.HTTPClient: wired egress first, then
+// the channel's own proxy (never silently the default egress, AUDIT RH-10),
+// then the adapter client.
+func (d *DeclarativeAdapter) httpClient(ch domain.Channel) *http.Client {
+	timeout := d.Config.Timeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	if d.Clients != nil {
+		if c := d.Clients.ClientFor(ch, timeout); c != nil {
+			return c
+		}
+	}
+	if strings.TrimSpace(ch.ProxyURL) != "" {
+		return defaultEgress.ClientFor(ch, timeout)
+	}
+	if d.Client != nil {
+		return d.Client
+	}
+	return &http.Client{Timeout: timeout}
 }
 
 func NewDeclarativeAdapter(cfg DeclarativeConfig, client *http.Client) (*DeclarativeAdapter, error) {
@@ -175,7 +201,7 @@ func (d *DeclarativeAdapter) executeStep(ctx context.Context, channel domain.Cha
 		}
 	}
 
-	resp, err := clientForChannel(d.Client, channel).Do(req)
+	resp, err := d.httpClient(channel).Do(req)
 	if err != nil {
 		return nil, err
 	}

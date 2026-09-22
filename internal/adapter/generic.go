@@ -17,6 +17,29 @@ import (
 type GenericAdapter struct {
 	Client  *http.Client
 	Secrets SecretResolver
+	Clients ClientProvider
+}
+
+// SetClientProvider implements EgressAware.
+func (g *GenericAdapter) SetClientProvider(p ClientProvider) { g.Clients = p }
+
+// httpClient mirrors BaseNewAPIAdapter.HTTPClient: wired egress first, then
+// the channel's own proxy (never silently the default egress, AUDIT RH-10),
+// then the adapter client.
+func (g *GenericAdapter) httpClient(ch domain.Channel) *http.Client {
+	const timeout = 15 * time.Second
+	if g.Clients != nil {
+		if c := g.Clients.ClientFor(ch, timeout); c != nil {
+			return c
+		}
+	}
+	if strings.TrimSpace(ch.ProxyURL) != "" {
+		return defaultEgress.ClientFor(ch, timeout)
+	}
+	if g.Client != nil {
+		return g.Client
+	}
+	return &http.Client{Timeout: timeout}
 }
 
 // NewGenericAdapter keeps the original signature for existing callers (tests).
@@ -83,9 +106,7 @@ func (g *GenericAdapter) Models(ctx context.Context, channel domain.Channel) ([]
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	// Honour the channel proxy instead of always using the process-wide
-	// client (AUDIT RH-10).
-	resp, err := clientForChannel(g.Client, channel).Do(req)
+	resp, err := g.httpClient(channel).Do(req)
 	if err != nil {
 		return nil, err
 	}

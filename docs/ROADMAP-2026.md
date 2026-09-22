@@ -1,3 +1,5 @@
+> **更新（2026-09-21）** — 本文 §3 P0 五项已全部落地（健康数据求真、额度成为路由信号、按渠道出口、CDP 证据链、通知），实施记录与后续优先级见 [`strategy-review-2026-09-21.md`](strategy-review-2026-09-21.md)。该文亦补充了本文未覆盖的竞品（Metapi / All-API-Hub / CLIProxyAPI 生态）并据此收窄了产品身份；两文冲突处以 strategy-review 为准。
+
 # RelayHub 产品规划书（独立评审版）
 
 > **2026-09-20 续**：执行计划与 UI 规范见 `docs/dev/PLAN-2026-09-20.md`、`docs/ui/desktop-paradigm.md`。差异化提案见 `docs/proposals/2026-09-20-differentiation.md`。下文「路由只有 weighted/RR」已过时（selector 已有 fixed/latency/success-rate/quota-aware）。旧 Web Console 已删除。
