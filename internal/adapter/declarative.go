@@ -30,8 +30,9 @@ type DeclarativeConfig struct {
 }
 
 type DeclarativeAdapter struct {
-	Config DeclarativeConfig
-	Client *http.Client
+	Config  DeclarativeConfig
+	Client  *http.Client
+	Secrets SecretResolver
 }
 
 func NewDeclarativeAdapter(cfg DeclarativeConfig, client *http.Client) (*DeclarativeAdapter, error) {
@@ -95,7 +96,9 @@ func (d *DeclarativeAdapter) CheckIn(ctx context.Context, channel domain.Channel
 	if err != nil {
 		return CheckInResult{Success: false, Message: err.Error()}, err
 	}
-	// Try parsing standard JSON success/message
+	// Try parsing standard JSON success/message. Anything that does not carry
+	// an explicit success:true is NOT a success: unparseable check-in responses
+	// previously fabricated success:true, masking every failure (AUDIT RH-26).
 	var result struct {
 		Success bool   `json:"success"`
 		Message string `json:"message"`
@@ -108,7 +111,11 @@ func (d *DeclarativeAdapter) CheckIn(ctx context.Context, channel domain.Channel
 			Message: result.Message,
 		}, nil
 	}
-	return CheckInResult{Success: true, Message: string(respBody)}, nil
+	msg := string(respBody)
+	if len(msg) > 256 {
+		msg = msg[:256]
+	}
+	return CheckInResult{Success: false, Message: "unrecognized check-in response: " + msg}, nil
 }
 
 func (d *DeclarativeAdapter) Balance(ctx context.Context, channel domain.Channel) (BalanceResult, error) {
@@ -160,11 +167,15 @@ func (d *DeclarativeAdapter) executeStep(ctx context.Context, channel domain.Cha
 	for k, v := range step.Headers {
 		req.Header.Set(k, v)
 	}
-	if channel.CredentialRef != "" && req.Header.Get("Authorization") == "" {
-		req.Header.Set("Authorization", "Bearer "+channel.CredentialRef)
+	if channel.CredentialRef != "" && req.Header.Get("Authorization") == "" && d.Secrets != nil {
+		// Resolve the ref to an actual credential; without a resolver the ref
+		// is a locator, not a token (AUDIT RH-26).
+		if token, terr := d.Secrets.Get(ctx, channel.CredentialRef); terr == nil && len(token) > 0 {
+			req.Header.Set("Authorization", "Bearer "+string(token))
+		}
 	}
 
-	resp, err := d.Client.Do(req)
+	resp, err := clientForChannel(d.Client, channel).Do(req)
 	if err != nil {
 		return nil, err
 	}

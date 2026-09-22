@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"relayhub/internal/affinity"
@@ -16,60 +17,28 @@ import (
 	"relayhub/internal/verify"
 )
 
-func (s *Server) extras(w http.ResponseWriter, r *http.Request) {
-	if !s.authorize(w, r) {
-		return
-	}
-	path := r.URL.Path
-	switch {
-	case path == "/api/v1/usage/summary" && r.Method == http.MethodGet:
-		s.usageSummary(w, r)
-	case path == "/api/v1/verify/scores" && r.Method == http.MethodGet:
-		s.verifyScores(w, r)
-	case path == "/api/v1/verify/probe" && r.Method == http.MethodPost:
-		s.verifyProbe(w, r)
-	case path == "/api/v1/identity" && r.Method == http.MethodGet:
-		s.identityList(w, r)
-	case strings.HasPrefix(path, "/api/v1/identity/") && (r.Method == http.MethodPatch || r.Method == http.MethodPut):
-		s.identityPatch(w, r)
-	case path == "/api/v1/sessions" && r.Method == http.MethodGet:
-		s.sessions(w, r)
-	case path == "/api/v1/lab/capture" && r.Method == http.MethodPost:
-		s.labCapture(w, r)
-	case path == "/api/v1/lab/replay" && r.Method == http.MethodPost:
-		s.labReplay(w, r)
-	case path == "/api/v1/lab" && r.Method == http.MethodGet:
-		s.labList(w, r)
-	case path == "/api/v1/routes/explain" && r.Method == http.MethodGet:
-		s.routeExplain(w, r)
-	case path == "/api/v1/mcp" && r.Method == http.MethodPost:
-		s.mcpRPC(w, r)
-	default:
-		s.fail(w, r, badRequest("not_found", "unknown extras endpoint"))
-	}
-}
 
 func (s *Server) usageSummary(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodGet) {
+		return
+	}
 	if s.Repo == nil {
 		s.write(w, r, 200, map[string]any{"cache_hit_ratio": 0, "total_requests": 0, "cache_read_tokens": 0, "input_tokens": 0})
 		return
 	}
-	recs, err := s.Repo.ListRequestRecords(r.Context())
+	// Aggregates are computed in SQL; loading the full history into memory was
+	// a capacity-governance gap (AUDIT RH-32).
+	total, in, cache, err := s.Repo.RequestUsageTotals(r.Context())
 	if err != nil {
 		s.fail(w, r, internal(err))
 		return
-	}
-	var in, cache int
-	for _, rec := range recs {
-		in += rec.InputTokens
-		cache += rec.CacheReadTokens
 	}
 	ratio := 0.0
 	if in > 0 {
 		ratio = float64(cache) / float64(in)
 	}
 	s.write(w, r, 200, map[string]any{
-		"total_requests":    len(recs),
+		"total_requests":    total,
 		"input_tokens":      in,
 		"cache_read_tokens": cache,
 		"cache_hit_ratio":   ratio,
@@ -77,6 +46,9 @@ func (s *Server) usageSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) verifyScores(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodGet) {
+		return
+	}
 	scores := []verify.Score{}
 	if s.Verify != nil {
 		scores = s.Verify.All()
@@ -85,6 +57,9 @@ func (s *Server) verifyScores(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) verifyProbe(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodPost) {
+		return
+	}
 	var in struct {
 		ChannelID string `json:"channel_id"`
 	}
@@ -98,6 +73,9 @@ func (s *Server) verifyProbe(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) identityList(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodGet) {
+		return
+	}
 	if s.Repo == nil {
 		s.write(w, r, 200, map[string]any{"bundles": []any{}})
 		return
@@ -109,12 +87,19 @@ func (s *Server) identityList(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]identity.Bundle, 0, len(chs))
 	for _, ch := range chs {
-		out = append(out, identity.FromChannel(ch))
+		b := identity.FromChannel(ch)
+		// Proxy credentials must never be echoed by the management API
+		// (AUDIT RH-31).
+		b.ProxyURL = maskProxyUserinfo(b.ProxyURL)
+		out = append(out, b)
 	}
 	s.write(w, r, 200, map[string]any{"bundles": out})
 }
 
 func (s *Server) identityPatch(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodPatch, http.MethodPut) {
+		return
+	}
 	if s.Repo == nil {
 		s.fail(w, r, unavailable("resource persistence is not configured"))
 		return
@@ -144,10 +129,23 @@ func (s *Server) identityPatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodGet) {
+		return
+	}
 	s.write(w, r, 200, map[string]any{"sticky": s.Sticky != nil})
 }
 
 func (s *Server) labCapture(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodPost, http.MethodDelete) {
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if s.Lab != nil {
+			s.Lab.Clear()
+		}
+		s.write(w, r, 200, map[string]any{"cleared": true})
+		return
+	}
 	var in struct {
 		Enabled *bool `json:"enabled"`
 	}
@@ -162,6 +160,9 @@ func (s *Server) labCapture(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) labList(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodGet) {
+		return
+	}
 	items := []lab.Capture{}
 	if s.Lab != nil {
 		items = s.Lab.List()
@@ -170,34 +171,19 @@ func (s *Server) labList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) labReplay(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		ID         string   `json:"id"`
-		ChannelIDs []string `json:"channel_ids"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
-		s.fail(w, r, badRequest("invalid_json", "malformed replay request"))
+	if !s.methodAllowed(w, r, http.MethodPost) {
 		return
 	}
-	if s.Lab == nil {
-		s.fail(w, r, unavailable("lab capture is not enabled"))
-		return
-	}
-	cap, ok := s.Lab.Get(in.ID)
-	if !ok {
-		s.fail(w, r, notFound("capture not found"))
-		return
-	}
-	ids := in.ChannelIDs
-	if len(ids) > 3 {
-		ids = ids[:3]
-	}
-	s.write(w, r, 200, map[string]any{
-		"id": cap.ID, "model": cap.Model, "protocol": cap.Protocol,
-		"fanout": ids, "size": cap.Size, "note": "replay executes on next gateway slice; payload retained in memory",
-	})
+	// Honest capability signalling (AUDIT RH-25): replaying a captured payload
+	// through the gateway is not implemented; the previous response claimed a
+	// replay would "execute on the next gateway slice", which never happened.
+	s.fail(w, r, unsupported("lab replay is not implemented yet"))
 }
 
 func (s *Server) routeExplain(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodGet) {
+		return
+	}
 	if s.Repo == nil {
 		s.write(w, r, 200, map[string]any{"record": nil})
 		return
@@ -223,6 +209,9 @@ func (s *Server) routeExplain(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) mcpRPC(w http.ResponseWriter, r *http.Request) {
+	if !s.methodAllowed(w, r, http.MethodPost) {
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	srv := &mcp.Server{Backend: mcpAdapter{s: s}}
 	out := srv.Handle(r.Context(), body)
@@ -243,11 +232,11 @@ func (m mcpAdapter) QuotaStatus(ctx context.Context) (any, error) {
 	if m.s.Repo == nil {
 		return map[string]any{}, nil
 	}
-	recs, err := m.s.Repo.ListRequestRecords(ctx)
+	total, inputTokens, cacheRead, err := m.s.Repo.RequestUsageTotals(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"total": len(recs)}, nil
+	return map[string]any{"total": total, "input_tokens": inputTokens, "cache_read_tokens": cacheRead}, nil
 }
 func (m mcpAdapter) ExplainLast(ctx context.Context) (any, error) {
 	if m.s.Repo == nil {
@@ -263,7 +252,33 @@ func (m mcpAdapter) RunCheckin(ctx context.Context) (any, error) {
 	if m.s.Scheduler == nil {
 		return map[string]any{"ok": false, "reason": "scheduler not configured"}, nil
 	}
-	return map[string]any{"ok": true}, nil
+	if m.s.Repo == nil {
+		return map[string]any{"ok": false, "reason": "repository not configured"}, nil
+	}
+	// run_checkin previously returned ok without executing anything (AUDIT
+	// RH-25). Trigger the real scheduler for every check-in enabled channel.
+	chs, err := m.s.Repo.ListChannels(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	started := []string{}
+	skipped := []string{}
+	for _, ch := range chs {
+		if !ch.CheckinEnabled {
+			continue
+		}
+		if err := m.s.Scheduler.RunNow(ctx, ch.ID); err != nil {
+			skipped = append(skipped, ch.ID+": "+err.Error())
+		} else {
+			started = append(started, ch.ID)
+		}
+	}
+	return map[string]any{
+		"ok":      true,
+		"started": started,
+		"skipped": skipped,
+		"note":    "check-in runs asynchronously; consult /api/v1/checkin for results",
+	}, nil
 }
 func (m mcpAdapter) TrustReport(ctx context.Context) (any, error) {
 	if m.s.Verify == nil {
@@ -277,4 +292,35 @@ func (s *Server) WithControlPlane(v *verify.Registry, l *lab.Ring, sticky *affin
 	s.Lab = l
 	s.Sticky = sticky
 	s.Limiter = lim
+}
+
+// methodAllowed enforces the method contract on directly-registered extras
+// endpoints (P0-1: previously the removed dispatcher performed these checks).
+func (s *Server) methodAllowed(w http.ResponseWriter, r *http.Request, methods ...string) bool {
+	for _, m := range methods {
+		if r.Method == m {
+			return true
+		}
+	}
+	s.fail(w, r, methodNotAllowed())
+	return false
+}
+
+// maskProxyUserinfo strips credentials from a proxy URL before it is echoed
+// by the management API (AUDIT RH-31: proxy passwords were returned in clear).
+func maskProxyUserinfo(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u == nil {
+		return raw
+	}
+	if u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			u.User = url.User(u.User.Username())
+		}
+	}
+	return u.String()
 }

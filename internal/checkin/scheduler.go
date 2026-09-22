@@ -313,6 +313,9 @@ func (s *Scheduler) RunNow(ctx context.Context, channelID string) error {
 					ProviderID: provider.ID,
 					ChannelID:  ch.ID,
 					Timeout:    30 * time.Second,
+					// Browser check-ins honour the same channel proxy as the
+					// HTTP adapter paths (AUDIT RH-10).
+					ProxyURL: ch.ProxyURL,
 				})
 				if execErr == nil && execRes.Success {
 					result = adapter.CheckInResult{

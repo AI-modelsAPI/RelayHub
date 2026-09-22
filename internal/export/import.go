@@ -2,6 +2,7 @@ package export
 
 import (
 	"context"
+	"crypto/hmac"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -20,13 +21,21 @@ func PreviewPackage(ctx context.Context, packageBytes []byte, repo repository.Re
 	if pkg.Manifest.Version <= 0 || pkg.Manifest.Version > CurrentPackageVersion {
 		return Preview{}, fmt.Errorf("unsupported package version: %d", pkg.Manifest.Version)
 	}
-
-	expectedChecksum, err := ComputePackageChecksum(pkg)
-	if err != nil {
-		return Preview{}, fmt.Errorf("failed to compute package checksum: %w", err)
-	}
-	if pkg.Manifest.Checksum == "" || pkg.Manifest.Checksum != expectedChecksum {
+	if pkg.Manifest.Checksum == "" {
 		return Preview{}, ErrTamperedPackage
+	}
+	// version>=2 packages carry an HMAC keyed with the export password; the
+	// caller previewing without a password cannot fully validate them, so the
+	// preview reports integrity as "pending" and application re-checks with
+	// the password (AUDIT RH-13).
+	if pkg.Manifest.Version == 1 {
+		expectedChecksum, err := ComputePackageChecksum(pkg)
+		if err != nil {
+			return Preview{}, fmt.Errorf("failed to compute package checksum: %w", err)
+		}
+		if pkg.Manifest.Checksum != expectedChecksum {
+			return Preview{}, ErrTamperedPackage
+		}
 	}
 
 	existingProviders, _ := repo.ListProviders(ctx)
@@ -62,7 +71,7 @@ func PreviewPackage(ctx context.Context, packageBytes []byte, repo repository.Re
 		}
 	}
 
-	total := pkg.Manifest.ProviderCount + pkg.Manifest.ChannelCount + pkg.Manifest.ModelCount + pkg.Manifest.RouteCount
+	total := pkg.Manifest.ProviderCount + pkg.Manifest.ChannelCount + pkg.Manifest.ModelCount + pkg.Manifest.RouteCount + pkg.Manifest.ProviderModelCount + pkg.Manifest.ModelGroupCount + pkg.Manifest.ChannelKeyCount
 
 	return Preview{
 		Version:       pkg.Manifest.Version,
@@ -95,17 +104,39 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 	if pkg.Manifest.Version <= 0 || pkg.Manifest.Version > CurrentPackageVersion {
 		return fmt.Errorf("unsupported package version: %d", pkg.Manifest.Version)
 	}
-
-	expectedChecksum, err := ComputePackageChecksum(pkg)
-	if err != nil {
-		return fmt.Errorf("failed to compute package checksum: %w", err)
-	}
-	if pkg.Manifest.Checksum == "" || pkg.Manifest.Checksum != expectedChecksum {
+	if pkg.Manifest.Checksum == "" {
 		return ErrTamperedPackage
 	}
 
 	if pkg.Manifest.HasSecrets && opts.Password == "" {
 		return errors.New("password required to import encrypted package")
+	}
+	// Sanity: v2 manifests advertise counts for the new tables; refuse forks
+	// that claim v2 but omit the arrays entirely (tampering heuristics).
+	if pkg.Manifest.Version >= 2 && (pkg.Manifest.ProviderModelCount > 0) && len(pkg.ProviderModels) == 0 {
+		return errors.New("v2 manifest lists provider bindings but the package carries none")
+	}
+	// v2 HMAC covers the entire package with the password-derived key; v1 is
+	// legacy plain SHA-256 and is only accepted for packages without secrets.
+	if pkg.Manifest.Version >= 2 || pkg.Manifest.HasSecrets {
+		if opts.Password == "" {
+			return errors.New("password required to verify package integrity")
+		}
+		expectedChecksum, err := ComputePackageChecksumV2(pkg, opts.Password)
+		if err != nil {
+			return fmt.Errorf("failed to compute package checksum: %w", err)
+		}
+		if !hmac.Equal([]byte(pkg.Manifest.Checksum), []byte(expectedChecksum)) {
+			return ErrTamperedPackage
+		}
+	} else {
+		expectedChecksum, err := ComputePackageChecksum(pkg)
+		if err != nil {
+			return fmt.Errorf("failed to compute package checksum: %w", err)
+		}
+		if pkg.Manifest.Checksum != expectedChecksum {
+			return ErrTamperedPackage
+		}
 	}
 
 	var decryptedSecrets map[string][]byte
@@ -144,6 +175,29 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 	rawR, _ := json.Marshal(pkg.Routes)
 	var routes []domain.Route
 	if err := json.Unmarshal(rawR, &routes); err != nil {
+		return err
+	}
+
+	// v2 additions: bindings/groups/keys migrate with the package so a
+	// re-imported deployment is functionally identical (AUDIT RH-13).
+	rawPM, _ := json.Marshal(pkg.ProviderModels)
+	var pms []domain.ProviderModel
+	if err := json.Unmarshal(rawPM, &pms); err != nil {
+		return err
+	}
+	rawMG, _ := json.Marshal(pkg.ModelGroups)
+	var groups []domain.ModelGroup
+	if err := json.Unmarshal(rawMG, &groups); err != nil {
+		return err
+	}
+	rawMM, _ := json.Marshal(pkg.ModelGroupMembers)
+	var members []domain.ModelGroupMember
+	if err := json.Unmarshal(rawMM, &members); err != nil {
+		return err
+	}
+	rawCK, _ := json.Marshal(pkg.ChannelKeys)
+	var chKeys []domain.ChannelKey
+	if err := json.Unmarshal(rawCK, &chKeys); err != nil {
 		return err
 	}
 
@@ -206,6 +260,67 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 			}
 			if err := tx.CreateRoute(ctx, r); err != nil {
 				return fmt.Errorf("create route %s: %w", r.ID, err)
+			}
+		}
+
+		for _, pm := range pms {
+			existing, err := tx.GetProviderModel(ctx, pm.ID)
+			if err == nil && existing.ID != "" {
+				if opts.Policy == ConflictOverwrite {
+					if err := tx.UpdateProviderModel(ctx, pm); err != nil {
+						return fmt.Errorf("update provider model %s: %w", pm.ID, err)
+					}
+				}
+				continue
+			}
+			if err := tx.CreateProviderModel(ctx, pm); err != nil {
+				return fmt.Errorf("create provider model %s: %w", pm.ID, err)
+			}
+		}
+
+		for _, g := range groups {
+			existing, err := tx.GetModelGroup(ctx, g.ID)
+			if err == nil && existing.ID != "" {
+				if opts.Policy == ConflictOverwrite {
+					if err := tx.UpdateModelGroup(ctx, g); err != nil {
+						return fmt.Errorf("update model group %s: %w", g.ID, err)
+					}
+				}
+				continue
+			}
+			if err := tx.CreateModelGroup(ctx, g); err != nil {
+				return fmt.Errorf("create model group %s: %w", g.ID, err)
+			}
+		}
+
+		for _, m := range members {
+			if err := tx.AddModelGroupMember(ctx, m); err != nil {
+				if opts.Policy == ConflictOverwrite {
+					if rerr := tx.RemoveModelGroupMember(ctx, m.GroupID, m.ModelID); rerr != nil {
+						return fmt.Errorf("re-add model group member %s/%s: %w", m.GroupID, m.ModelID, rerr)
+					}
+					if err := tx.AddModelGroupMember(ctx, m); err != nil {
+						return fmt.Errorf("re-add model group member %s/%s: %w", m.GroupID, m.ModelID, err)
+					}
+					continue
+				}
+				// skip policy: a duplicate member row is not a fatal import error
+				continue
+			}
+		}
+
+		for _, k := range chKeys {
+			existing, err := tx.GetChannelKey(ctx, k.ID)
+			if err == nil && existing.ID != "" {
+				if opts.Policy == ConflictOverwrite {
+					if err := tx.UpdateChannelKey(ctx, k); err != nil {
+						return fmt.Errorf("update channel key %s: %w", k.ID, err)
+					}
+				}
+				continue
+			}
+			if err := tx.CreateChannelKey(ctx, k); err != nil {
+				return fmt.Errorf("create channel key %s: %w", k.ID, err)
 			}
 		}
 

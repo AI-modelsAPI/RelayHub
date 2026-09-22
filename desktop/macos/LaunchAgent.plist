@@ -13,9 +13,11 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- Logs previously went to world-readable /tmp paths (AUDIT RH-04/RH-31 hygiene);
+         ~/Library/Logs keeps them inside the installing user's home. -->
     <key>StandardOutPath</key>
-    <string>/tmp/relayhub.stdout.log</string>
+    <string>~/Library/Logs/relayhub.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/relayhub.stderr.log</string>
+    <string>~/Library/Logs/relayhub.stderr.log</string>
 </dict>
 </plist>

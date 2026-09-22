@@ -29,6 +29,7 @@ import (
 	"relayhub/internal/clisync/hermes"
 	"relayhub/internal/domain"
 	"relayhub/internal/export"
+	"relayhub/internal/identity"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/ratelimit"
@@ -296,7 +297,29 @@ func (s *Server) managementRoutes() http.Handler {
 	mux.HandleFunc("/api/v1/channel-keys", s.channelKeys)
 	mux.HandleFunc("/api/v1/channel-keys/", s.channelKeys)
 	mux.HandleFunc("/api/v1/channels/stats", s.channelStats)
-	mux.Handle("/", http.FileServer(http.FS(webassets.Assets)))
+	// Extras endpoints were implemented but never registered, leaving the UI,
+	// the MCP bridge and routes/explain dead (P0-1 / RH-05). Register each
+	// method/path explicitly; /api/v1/routes/explain must be registered as the
+	// longer pattern so it wins over the /api/v1/routes/ subtree.
+	mux.HandleFunc("/api/v1/usage/summary", s.usageSummary)
+	mux.HandleFunc("/api/v1/verify/scores", s.verifyScores)
+	mux.HandleFunc("/api/v1/verify/probe", s.verifyProbe)
+	mux.HandleFunc("/api/v1/identity", s.identityList)
+	mux.HandleFunc("/api/v1/identity/", s.identityPatch)
+	mux.HandleFunc("/api/v1/sessions", s.sessions)
+	mux.HandleFunc("/api/v1/lab", s.labList)
+	mux.HandleFunc("/api/v1/lab/capture", s.labCapture)
+	mux.HandleFunc("/api/v1/lab/replay", s.labReplay)
+	mux.HandleFunc("/api/v1/routes/explain", s.routeExplain)
+	mux.HandleFunc("/api/v1/mcp", s.mcpRPC)
+	// Unknown /api/ paths must return a JSON 404, not the SPA document.
+	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			s.fail(w, r, errors.New(http.StatusText(http.StatusNotFound)))
+			return
+		}
+		http.FileServer(http.FS(webassets.Assets)).ServeHTTP(w, r)
+	}))
 	return s.browserBoundary(mux)
 }
 
@@ -485,12 +508,16 @@ func (s *Server) auditEvent(ctx context.Context, action string, r *http.Request,
 	if s.AuditLogger == nil {
 		return
 	}
-	_ = s.AuditLogger.Record(ctx, audit.Event{
+	// Previously the error was discarded; a failed audit write must at least be
+	// observable in the server log (AUDIT RH-30).
+	if err := s.AuditLogger.Record(ctx, audit.Event{
 		Action:    action,
 		RequestID: requestID(r),
 		Actor:     r.RemoteAddr,
 		Metadata:  metadata,
-	})
+	}); err != nil && s.Logger != nil {
+		_ = s.Logger.Event("warn", "audit_write_failed", "", map[string]any{"action": action, "error": err.Error()})
+	}
 }
 
 // fetchModels fetches the model list from an upstream (AxonHub-style server-side fetch).
@@ -518,37 +545,26 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 	apiKey := input.APIKey
 
 	// Existing channel: resolve base URL and credential from the store.
+	var ch domain.Channel
+	haveChannel := false
 	if input.ChannelID != "" {
 		if s.Repo == nil {
 			s.fail(w, r, unavailable("resource persistence is not configured"))
 			return
 		}
-		ch, err := s.Repo.GetChannel(r.Context(), input.ChannelID)
+		var err error
+		ch, err = s.Repo.GetChannel(r.Context(), input.ChannelID)
 		if err != nil {
 			s.fail(w, r, mapRepoError(err, "channel"))
 			return
 		}
+		haveChannel = true
 		baseURL = strings.TrimRight(ch.BaseURL, "/")
 		// Resolve the credential the same way the gateway/test/sync paths do:
 		// prefer an enabled per-channel key, fall back to the legacy CredentialRef.
 		// Reading only CredentialRef here left UI-added keys invisible (401 upstream).
-		if s.SecretStore != nil {
-			if keys, kerr := s.Repo.ListChannelKeys(r.Context(), input.ChannelID); kerr == nil {
-				for _, k := range keys {
-					if k.Disabled {
-						continue
-					}
-					if secret, gerr := s.SecretStore.Get(r.Context(), k.SecretRef); gerr == nil {
-						apiKey = string(secret)
-						break
-					}
-				}
-			}
-			if apiKey == "" && ch.CredentialRef != "" {
-				if secret, err := s.SecretStore.Get(r.Context(), ch.CredentialRef); err == nil {
-					apiKey = string(secret)
-				}
-			}
+		if key := s.resolveChannelAPIKey(r.Context(), ch); key != "" {
+			apiKey = key
 		}
 	}
 
@@ -558,7 +574,17 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build the upstream /models endpoint. Prefer /v1/models; fall back to /models.
+	// Existing channels go out through their configured proxy / identity headers
+	// (AUDIT RH-10); draft-channel probes have no channel identity to apply.
 	client := &http.Client{Timeout: 20 * time.Second}
+	if haveChannel {
+		proxyClient, cerr := identity.HTTPClientE(ch.ProxyURL, 20*time.Second)
+		if cerr != nil {
+			s.fail(w, r, badRequest("validation_error", cerr.Error()))
+			return
+		}
+		client = proxyClient
+	}
 	endpoints := []string{baseURL + "/v1/models", baseURL + "/models"}
 	var lastErr error
 	for _, ep := range endpoints {
@@ -569,6 +595,9 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 		}
 		if apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		if haveChannel {
+			identity.ApplyRequestHeaders(req.Header, ch)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -673,26 +702,8 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 	if err != nil {
 		return nil, 0, err
 	}
-	apiKey := ""
-	if s.SecretStore != nil {
-		if keys, kerr := s.Repo.ListChannelKeys(ctx, channelID); kerr == nil {
-			for _, k := range keys {
-				if k.Disabled {
-					continue
-				}
-				if secret, gerr := s.SecretStore.Get(ctx, k.SecretRef); gerr == nil {
-					apiKey = string(secret)
-					break
-				}
-			}
-		}
-		if apiKey == "" && ch.CredentialRef != "" {
-			if secret, gerr := s.SecretStore.Get(ctx, ch.CredentialRef); gerr == nil {
-				apiKey = string(secret)
-			}
-		}
-	}
-	models, err := s.fetchUpstreamModelList(ctx, ch.BaseURL, apiKey)
+	apiKey := s.resolveChannelAPIKey(ctx, ch)
+	models, err := s.fetchUpstreamModelList(ctx, ch, apiKey)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -709,30 +720,82 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 			}
 		}
 	}
-	existing, _ := s.Repo.ListProviderModels(ctx, "")
-	for _, pm := range existing {
-		if pm.ChannelID == channelID {
-			_ = s.Repo.DeleteProviderModel(ctx, pm.ID)
+	// Bindings inherit the provider protocol instead of hard-coded openai-chat:
+	// anthropic upstreams previously got non-routable "openai-chat" bindings
+	// after auto-sync (AUDIT RH-15).
+	protocol := "openai-chat"
+	if providers, perr := s.Repo.ListProviders(ctx); perr == nil {
+		for _, pr := range providers {
+			if pr.ID == ch.ProviderID && pr.Protocol != "" {
+				protocol = pr.Protocol
+				break
+			}
 		}
 	}
-	created := 0
+	type bindingPlan struct {
+		pm domain.ProviderModel
+	}
+	plans := make([]bindingPlan, 0, len(filtered))
 	for _, m := range filtered {
-		_ = s.Repo.CreateModel(ctx, domain.Model{ID: m, DisplayName: m, Enabled: true})
-		pm := domain.ProviderModel{
+		plans = append(plans, bindingPlan{pm: domain.ProviderModel{
 			ID:                fmt.Sprintf("pm-%s-%s", channelID, m),
 			ProviderID:        ch.ProviderID,
 			ChannelID:         channelID,
 			ModelID:           m,
 			UpstreamModelName: m,
-			Protocol:          "openai-chat",
+			Protocol:          protocol,
 			Priority:          ch.Priority,
 			Weight:            ch.Weight,
 			Enabled:           true,
+		}})
+	}
+	created := 0
+	apply := func(tx *repository.Tx) error {
+		// Delete+recreate inside one transaction: the old loop deleted bindings
+		// first and ignored Create errors, so any failure left the channel
+		// permanently unbound (AUDIT RH-15).
+		if err := tx.DeleteProviderModelsByChannel(ctx, channelID); err != nil {
+			return err
 		}
-		if err := s.Repo.CreateProviderModel(ctx, pm); err == nil {
+		created = 0
+		for _, plan := range plans {
+			// Preserve operator-curated model metadata (capabilities etc.):
+			// CreateModel is skipped silently for duplicates, so existing rows
+			// keep their flags.
+			_ = tx.CreateModel(ctx, domain.Model{ID: plan.pm.ModelID, DisplayName: plan.pm.ModelID, Enabled: true})
+			if err := tx.CreateProviderModel(ctx, plan.pm); err != nil {
+				return fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
+			}
+			created++
+		}
+		return nil
+	}
+	if storeWithTx, ok := s.Repo.(interface {
+		WithTx(context.Context, func(*repository.Tx) error) error
+	}); ok {
+		if err := storeWithTx.WithTx(ctx, apply); err != nil {
+			return nil, 0, err
+		}
+	} else {
+		// Repositories without transaction support (test fakes) get the same
+		// logic without the atomicity wrapper.
+		if err := s.Repo.DeleteProviderModelsByChannel(ctx, channelID); err != nil {
+			return nil, 0, err
+		}
+		created = 0
+		for _, plan := range plans {
+			_ = s.Repo.CreateModel(ctx, domain.Model{ID: plan.pm.ModelID, DisplayName: plan.pm.ModelID, Enabled: true})
+			if err := s.Repo.CreateProviderModel(ctx, plan.pm); err != nil {
+				return nil, 0, fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
+			}
 			created++
 		}
 	}
+	// Refresh the routing snapshot for BOTH manual sync and scheduler-triggered
+	// auto-sync: previously only the HTTP handler refreshed the resolver, so
+	// automatic model syncs updated the DB while the gateway kept routing with
+	// stale bindings (AUDIT RH-15).
+	s.notifyConfigChange(ctx)
 	return filtered, created, nil
 }
 
@@ -1192,19 +1255,14 @@ func (s *Server) channelStats(w http.ResponseWriter, r *http.Request) {
 			enabledKeys++
 		}
 	}
-	// Recent request outcomes for this channel (bounded to the newest 100).
+	// Recent request outcomes for this channel (SQL-bounded newest 100, instead
+	// of scanning the whole history table — AUDIT RH-32).
 	recent, recentOK, recentErr, latencySum := 0, 0, 0, 0
-	if reqs, err := s.Repo.ListRequestRecords(ctx); err == nil {
+	if reqs, err := s.Repo.ListRequestRecordsByChannel(ctx, channelID, 100); err == nil {
 		for _, rec := range reqs {
-			if rec.ChannelID != channelID {
-				continue
-			}
-			if recent >= 100 {
-				break
-			}
 			recent++
 			latencySum += rec.LatencyMS
-			if rec.StatusCode >= 200 && rec.StatusCode < 400 {
+			if rec.StatusCode >= 200 && rec.StatusCode < 300 {
 				recentOK++
 			} else {
 				recentErr++
@@ -1256,6 +1314,10 @@ func (s *Server) channelTest(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, badRequest("validation_error", "channel_id is required"))
 		return
 	}
+	if s.Repo == nil {
+		s.fail(w, r, unavailable("resource persistence is not configured"))
+		return
+	}
 	ch, err := s.Repo.GetChannel(r.Context(), input.ChannelID)
 	if err != nil {
 		s.fail(w, r, mapRepoError(err, "channel"))
@@ -1296,7 +1358,7 @@ func (s *Server) channelTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	start := time.Now()
-	models, err := s.fetchUpstreamModelList(r.Context(), ch.BaseURL, apiKey)
+	models, err := s.fetchUpstreamModelList(r.Context(), ch, apiKey)
 	latency := time.Since(start).Milliseconds()
 
 	// Update channel error state
@@ -1325,13 +1387,22 @@ func (s *Server) channelTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// fetchUpstreamModelList is a shared helper that GETs {base}/v1/models (fallback /models).
-func (s *Server) fetchUpstreamModelList(ctx context.Context, baseURL, apiKey string) ([]string, error) {
-	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+// fetchUpstreamModelList GETs {base}/v1/models (fallback /models) through the
+// channel's configured egress (proxy + identity headers). Model fetch/test
+// previously used a fresh direct client and ignored channel ProxyURL,
+// exposing the default egress on paths that were supposed to be pinned to the
+// channel identity (AUDIT RH-10). Auto-sync supports OpenAI-shaped model
+// listing endpoints.
+func (s *Server) fetchUpstreamModelList(ctx context.Context, ch domain.Channel, apiKey string) ([]string, error) {
+	base := strings.TrimRight(strings.TrimSpace(ch.BaseURL), "/")
 	if base == "" {
 		return nil, errors.New("base_url is empty")
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
+	client, err := identity.HTTPClientE(ch.ProxyURL, 20*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
 	for _, ep := range []string{base + "/v1/models", base + "/models"} {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep, nil)
 		if err != nil {
@@ -1340,13 +1411,16 @@ func (s *Server) fetchUpstreamModelList(ctx context.Context, baseURL, apiKey str
 		if apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
+		identity.ApplyRequestHeaders(req.Header, ch)
 		resp, err := client.Do(req)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("upstream %s returned %d", ep, resp.StatusCode)
 			continue
 		}
 		var payload struct {
@@ -1355,17 +1429,45 @@ func (s *Server) fetchUpstreamModelList(ctx context.Context, baseURL, apiKey str
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
+			lastErr = fmt.Errorf("malformed model list from %s", ep)
 			continue
 		}
-		out := make([]string, 0, len(payload.Data))
+		models := make([]string, 0, len(payload.Data))
 		for _, m := range payload.Data {
 			if m.ID != "" {
-				out = append(out, m.ID)
+				models = append(models, m.ID)
 			}
 		}
-		return out, nil
+		return models, nil
 	}
-	return nil, errors.New("failed to fetch models from upstream")
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("no model endpoint responded")
+}
+
+// resolveChannelAPIKey mirrors the key selection used by test/sync paths:
+// first enabled per-channel key, falling back to the legacy CredentialRef.
+func (s *Server) resolveChannelAPIKey(ctx context.Context, ch domain.Channel) string {
+	if s.SecretStore == nil {
+		return ""
+	}
+	if keys, err := s.Repo.ListChannelKeys(ctx, ch.ID); err == nil {
+		for _, k := range keys {
+			if k.Disabled {
+				continue
+			}
+			if secret, gerr := s.SecretStore.Get(ctx, k.SecretRef); gerr == nil {
+				return string(secret)
+			}
+		}
+	}
+	if ch.CredentialRef != "" {
+		if secret, gerr := s.SecretStore.Get(ctx, ch.CredentialRef); gerr == nil {
+			return string(secret)
+		}
+	}
+	return ""
 }
 
 func (s *Server) secrets(w http.ResponseWriter, r *http.Request) {
@@ -1654,6 +1756,7 @@ func (s *Server) modelResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, mapRepoError(e, "model"))
 			return
 		}
+		s.auditEvent(ctx, "mutate_model", r, map[string]string{"id": m.ID, "method": r.Method})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"model": m})
 	case http.MethodDelete:
@@ -1665,6 +1768,7 @@ func (s *Server) modelResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, mapRepoError(e, "model"))
 			return
 		}
+		s.auditEvent(ctx, "delete_model", r, map[string]string{"id": id})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"deleted": id})
 	default:
@@ -1706,6 +1810,20 @@ func (s *Server) providerModelResource(w http.ResponseWriter, r *http.Request, c
 			s.fail(w, r, e)
 			return
 		}
+		// Business invariants checked here because the management API writes to
+		// the SQL repository directly, bypassing the catalog service validators
+		// (AUDIT RH-02): a binding must not point across providers.
+		if m.ChannelID != "" {
+			ch, cerr := s.Repo.GetChannel(ctx, m.ChannelID)
+			if cerr != nil {
+				s.fail(w, r, badRequest("validation_error", "channel_id does not exist"))
+				return
+			}
+			if ch.ProviderID != "" && m.ProviderID != "" && ch.ProviderID != m.ProviderID {
+				s.fail(w, r, badRequest("validation_error", "channel_id belongs to a different provider"))
+				return
+			}
+		}
 		var e error
 		if r.Method == http.MethodPost && id == "" {
 			e = s.Repo.CreateProviderModel(ctx, m)
@@ -1716,6 +1834,7 @@ func (s *Server) providerModelResource(w http.ResponseWriter, r *http.Request, c
 			s.fail(w, r, mapRepoError(e, "provider model"))
 			return
 		}
+		s.auditEvent(ctx, "mutate_provider_model", r, map[string]string{"id": m.ID, "method": r.Method})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"provider_model": safeProviderModel(m)})
 	case http.MethodDelete:
@@ -1727,6 +1846,7 @@ func (s *Server) providerModelResource(w http.ResponseWriter, r *http.Request, c
 			s.fail(w, r, mapRepoError(e, "provider model"))
 			return
 		}
+		s.auditEvent(ctx, "delete_provider_model", r, map[string]string{"id": id})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"deleted": id})
 	default:
@@ -1774,6 +1894,19 @@ func (s *Server) groupResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, e)
 			return
 		}
+		// Fallback chains resolve by recursion in the selector; reject cycles at
+		// write time so a broken chain cannot start (AUDIT RH-02; the selector
+		// also defends at runtime).
+		if g.FallbackGroupID != "" {
+			if g.ID != "" && g.FallbackGroupID == g.ID {
+				s.fail(w, r, badRequest("validation_error", "fallback_group_id cannot reference the group itself"))
+				return
+			}
+			if cerr := groupFallbackCycle(s.Repo, ctx, g.ID, g.FallbackGroupID); cerr != nil {
+				s.fail(w, r, badRequest("validation_error", cerr.Error()))
+				return
+			}
+		}
 		var e error
 		if r.Method == http.MethodPost && id == "" {
 			e = s.Repo.CreateModelGroup(ctx, g)
@@ -1784,6 +1917,7 @@ func (s *Server) groupResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, mapRepoError(e, "model group"))
 			return
 		}
+		s.auditEvent(ctx, "mutate_model_group", r, map[string]string{"id": g.ID, "method": r.Method})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"model_group": g})
 	case http.MethodDelete:
@@ -1795,6 +1929,7 @@ func (s *Server) groupResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, mapRepoError(e, "model group"))
 			return
 		}
+		s.auditEvent(ctx, "delete_model_group", r, map[string]string{"id": id})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"deleted": id})
 	default:
@@ -1825,6 +1960,7 @@ func (s *Server) groupMembers(w http.ResponseWriter, r *http.Request, ctx contex
 			s.fail(w, r, mapRepoError(e, "model group member"))
 			return
 		}
+		s.auditEvent(ctx, "add_group_member", r, map[string]string{"group": id, "model": m.ModelID})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 201, map[string]any{"member": m})
 	case http.MethodDelete:
@@ -1837,6 +1973,7 @@ func (s *Server) groupMembers(w http.ResponseWriter, r *http.Request, ctx contex
 			s.fail(w, r, mapRepoError(e, "model group member"))
 			return
 		}
+		s.auditEvent(ctx, "remove_group_member", r, map[string]string{"group": id, "model": mid})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"deleted": mid})
 	default:
@@ -1888,6 +2025,7 @@ func (s *Server) routeResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, mapRepoError(e, "route"))
 			return
 		}
+		s.auditEvent(ctx, "mutate_route", r, map[string]string{"id": v.ID, "method": r.Method})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"route": v})
 	case http.MethodDelete:
@@ -1899,6 +2037,7 @@ func (s *Server) routeResource(w http.ResponseWriter, r *http.Request, ctx conte
 			s.fail(w, r, mapRepoError(e, "route"))
 			return
 		}
+		s.auditEvent(ctx, "delete_route", r, map[string]string{"id": id})
 		s.notifyConfigChange(ctx)
 		s.write(w, r, 200, map[string]any{"deleted": id})
 	default:
@@ -1922,22 +2061,29 @@ func (s *Server) checkin(w http.ResponseWriter, r *http.Request) {
 		s.write(w, r, 200, map[string]any{"supported": false, "records": []any{}})
 		return
 	}
-	channels, err := s.Repo.ListChannels(r.Context(), "")
-	if err != nil {
-		s.fail(w, r, internal(err))
-		return
-	}
-	records := []domain.CheckinRecord{}
-	for _, ch := range channels {
-		if id := r.URL.Query().Get("channel_id"); id != "" && id != ch.ID {
-			continue
-		}
-		items, err := s.Repo.ListCheckinRecords(r.Context(), ch.ID)
+	// One bounded multi-channel query instead of a per-channel N+1 loop
+	// (channels * newest-window fetches — AUDIT RH-32).
+	idsParam := strings.TrimSpace(r.URL.Query().Get("channel_id"))
+	ids := []string{}
+	if idsParam != "" {
+		ids = append(ids, idsParam)
+	} else {
+		channels, err := s.Repo.ListChannels(r.Context(), "")
 		if err != nil {
 			s.fail(w, r, internal(err))
 			return
 		}
-		records = append(records, items...)
+		if len(channels) > 256 {
+			channels = channels[:256]
+		}
+		for _, ch := range channels {
+			ids = append(ids, ch.ID)
+		}
+	}
+	records, err := s.Repo.ListCheckinRecordsMulti(r.Context(), ids, 500)
+	if err != nil {
+		s.fail(w, r, internal(err))
+		return
 	}
 	s.write(w, r, 200, map[string]any{"supported": s.Scheduler != nil, "records": records})
 }
@@ -1981,24 +2127,29 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, internal(e))
 		return
 	}
+	// History reads are SQL-bounded (AUDIT RH-32); tell the client when the
+	// summary covers only the recent window rather than all-time history.
+	truncated := len(v) >= 5000
 
 	var totalTokens int64
 	var totalLatency int64
 	var successCount int
-	modelStats := make(map[string]int)
-	channelStats := make(map[string]int)
+	modelCounts := make(map[string]int)
+	channelCounts := make(map[string]int)
 
 	for _, rec := range v {
 		totalTokens += int64(rec.InputTokens + rec.OutputTokens)
 		totalLatency += int64(rec.LatencyMS)
-		if rec.StatusCode == http.StatusOK {
+		// Consistent success criterion across usage views: any 2xx (3xx/4xx
+		// counted as success previously inflated channel success rates).
+		if rec.StatusCode >= 200 && rec.StatusCode < 300 {
 			successCount++
 		}
 		if rec.ModelID != "" {
-			modelStats[rec.ModelID]++
+			modelCounts[rec.ModelID]++
 		}
 		if rec.ChannelID != "" {
-			channelStats[rec.ChannelID]++
+			channelCounts[rec.ChannelID]++
 		}
 	}
 
@@ -2011,6 +2162,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 
 	s.write(w, r, 200, map[string]any{
 		"supported": true,
+		"truncated": truncated,
 		"records":   v,
 		"summary": map[string]any{
 			"total_requests": len(v),
@@ -2018,8 +2170,8 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 			"success_rate":   fmt.Sprintf("%.1f%%", successRate),
 			"total_tokens":   totalTokens,
 			"avg_latency_ms": avgLatency,
-			"model_stats":    modelStats,
-			"channel_stats":  channelStats,
+			"model_stats":    modelCounts,
+			"channel_stats":  channelCounts,
 		},
 	})
 }
@@ -2429,6 +2581,32 @@ func mapRepoError(err error, kind string) error {
 // POST /api/v1/keys -> 201 { "key": "rh_...", "id": "rh_..." } (raw key returned only once)
 // GET /api/v1/keys -> 200 { "keys": [ { "id": "rh_..." } ] } (IDs only, never secrets)
 // DELETE /api/v1/keys/{id} -> 200 { "status": "revoked" }
+
+// groupFallbackCycle follows the fallback chain with a visited set and errors
+// when it loops or when a chain link does not exist (AUDIT RH-02).
+func groupFallbackCycle(repo repository.ResourceRepository, ctx context.Context, selfID, fallbackID string) error {
+	visited := map[string]bool{}
+	if selfID != "" {
+		visited[selfID] = true
+	}
+	current := fallbackID
+	for steps := 0; steps < 64; steps++ {
+		if visited[current] {
+			return errors.New("fallback chain would form a cycle")
+		}
+		visited[current] = true
+		g, err := repo.GetModelGroup(ctx, current)
+		if err != nil {
+			return errors.New("fallback_group_id does not reference an existing model group")
+		}
+		if g.FallbackGroupID == "" {
+			return nil
+		}
+		current = g.FallbackGroupID
+	}
+	return errors.New("fallback chain is too long")
+}
+
 func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(w, r) {
 		return
@@ -2485,7 +2663,12 @@ func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, badRequest("missing_id", "key id is required"))
 			return
 		}
-		s.LocalKeys.Revoke(id)
+		// Revocation must surface persistence failures: claiming a leaked key is
+		// revoked while the delete failed would be a security lie (AUDIT RH-30).
+		if err := s.LocalKeys.Revoke(id); err != nil {
+			s.fail(w, r, internal(err))
+			return
+		}
 		s.auditEvent(r.Context(), "revoke_local_key", r, map[string]string{"id": id})
 		s.write(w, r, http.StatusOK, map[string]any{"status": "revoked", "id": id})
 
@@ -2496,8 +2679,18 @@ func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 
 // Secret-bearing references are safe to return; secret values are never part
 // of domain objects. CredentialRef is deliberately retained as a reference.
+// Proxy credentials embedded in proxy_url are masked before any API echo
+// (AUDIT RH-31: the management API previously returned proxy passwords).
 func safeProvider(p domain.Provider) domain.Provider                { return p }
 func safeProviders(v []domain.Provider) []domain.Provider           { return v }
-func safeChannel(c domain.Channel) domain.Channel                   { return c }
-func safeChannels(v []domain.Channel) []domain.Channel              { return v }
+func safeChannel(c domain.Channel) domain.Channel {
+	c.ProxyURL = maskProxyUserinfo(c.ProxyURL)
+	return c
+}
+func safeChannels(v []domain.Channel) []domain.Channel {
+	for i := range v {
+		v[i] = safeChannel(v[i])
+	}
+	return v
+}
 func safeProviderModel(v domain.ProviderModel) domain.ProviderModel { return v }

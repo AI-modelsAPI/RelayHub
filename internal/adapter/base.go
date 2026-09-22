@@ -197,6 +197,13 @@ func (b *BaseNewAPIAdapter) RefreshAccessToken(ctx context.Context, channel doma
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Re-resolve under the lock: a concurrent caller may have already rotated
+	// the secret, and refreshing with the caller's stale copy would consume an
+	// already-used refresh cookie.
+	if fresh, err := b.ResolveCredential(ctx, channel); err == nil && fresh != nil {
+		cred = fresh
+	}
+
 	// Re-check after lock
 	current := cred.Token
 	if failedToken != "" {
@@ -292,10 +299,12 @@ func (b *BaseNewAPIAdapter) CallWithAuth(ctx context.Context, channel domain.Cha
 		if len(reqBody) > 0 {
 			req.Header.Set("Content-Type", "application/json")
 		}
-		client := b.Client
-		if client == nil {
-			client = &http.Client{Timeout: 15 * time.Second}
-		}
+		// The actual account call must use the channel's configured egress
+		// (proxy / identity headers) exactly like refresh & status paths do;
+		// using the bare b.Client here bypassed the channel proxy and exposed
+		// the default egress to the upstream (AUDIT RH-10).
+		client := clientForChannel(b.Client, channel)
+		identity.ApplyRequestHeaders(req.Header, channel)
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, nil, err
@@ -330,10 +339,15 @@ func (b *BaseNewAPIAdapter) FetchStatusQuotaPerUnit(ctx context.Context, channel
 	}
 	client := clientForChannel(b.Client, channel)
 	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
 		return DefaultQuotaPerUnit
 	}
+	// Close the body on non-200 too: the early return previously leaked the
+	// response connection on error statuses.
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return DefaultQuotaPerUnit
+	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var res struct {
 		Data struct {

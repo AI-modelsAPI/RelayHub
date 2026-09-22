@@ -88,9 +88,12 @@ func (s *Service) Preview(ctx context.Context, cli string, desired DesiredState)
 	if err != nil {
 		return Diff{}, err
 	}
-	desired, err = s.resolveDesired(desired)
-	if err != nil {
-		return Diff{}, err
+	// Preview must not mint a real gateway key: an abandoned preview would
+	// leave a live credential behind, and even an applied one would be
+	// orphaned if Apply were never called (AUDIT RH-23/24). A marker keeps the
+	// diff honest without touching the key service.
+	if desired.APIKey == "" {
+		desired.APIKey = "<<issued-on-apply>>"
 	}
 	return syncer.Preview(ctx, desired)
 }
