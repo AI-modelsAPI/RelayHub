@@ -11,6 +11,9 @@ var (
 	bearerPattern   = regexp.MustCompile(`(?i)(\b(?:authorization\s*[:=]\s*)?bearer\s+)[^\s,;&]+`)
 	basicPattern    = regexp.MustCompile(`(?i)(\b(?:authorization\s*[:=]\s*)?basic\s+)[^\s,;&]+`)
 	apiPattern      = regexp.MustCompile(`(?i)\b(?:sk|ak|ah|ghp|gho|xoxb|xoxp)[_-][A-Za-z0-9._-]+\b`)
+	// Telegram bot tokens ("123456789:AA…") appear in bot API URLs and error
+	// messages (AUDIT 2026-09-24 F20).
+	botTokenPattern = regexp.MustCompile(`\d{6,12}:[A-Za-z0-9_-]{30,}\b`)
 	oauthPattern    = regexp.MustCompile(`(?i)([?&](?:code|state|access_token|refresh_token|client_secret|token|key|password)=)[^&#\s]+`)
 )
 
@@ -23,6 +26,7 @@ func (r *Redactor) Redact(value string) string {
 	value = basicPattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = keyValuePattern.ReplaceAllString(value, `${1}[REDACTED]`)
 	value = oauthPattern.ReplaceAllString(value, `${1}[REDACTED]`)
+	value = botTokenPattern.ReplaceAllString(value, `[REDACTED]`)
 	return apiPattern.ReplaceAllString(value, `[REDACTED]`)
 }
 

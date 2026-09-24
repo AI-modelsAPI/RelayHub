@@ -86,6 +86,10 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err := os.MkdirAll(absDataDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create data dir: %w", err)
 	}
+	// MkdirAll only applies 0700 to directories it creates; a pre-existing
+	// dir (Docker's /data, a hand-made dir, an older install) kept 0755 and
+	// the database landed world-readable (AUDIT 2026-09-24 F19).
+	restrictToOwner(absDataDir, 0o700)
 
 	// Database
 	dbPath := filepath.Join(absDataDir, "relayhub.db")
@@ -97,6 +101,12 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err := db.Migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migration failed: %w", err)
+	}
+	// SQLite creates files per umask (typically 0644); the DB holds proxy
+	// URLs, custom headers and request metadata. WAL/SHM files inherit the
+	// database file's mode once it is restricted.
+	for _, f := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		restrictToOwner(f, 0o600)
 	}
 
 	repo := repository.New(db.DB)
@@ -499,6 +509,18 @@ func isLoopbackListen(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// restrictToOwner drops group/other permission bits from an existing path.
+// Failures (e.g. a directory owned by another user) are logged, not fatal.
+func restrictToOwner(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		log.Printf("relayhub: warning: %s is accessible to other users (mode %v) and could not be restricted: %v", path, info.Mode().Perm(), err)
+	}
 }
 
 // targetPolicyFor maps a configured policy name to a proxy target policy.

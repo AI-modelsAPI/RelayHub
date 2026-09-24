@@ -103,7 +103,7 @@ func (w *Webhook) Send(ctx context.Context, ev Event) error {
 	b, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.URL, bytes.NewReader(b))
 	if err != nil {
-		return err
+		return invalidEndpoint("webhook")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "relayhub-notify/1")
@@ -139,7 +139,7 @@ func (b *Bark) Send(ctx context.Context, ev Event) error {
 	raw, _ := json.Marshal(payload)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.URL, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return invalidEndpoint("bark")
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	return do(b.client, req)
@@ -172,7 +172,7 @@ func (t *Telegram) Send(ctx context.Context, ev Event) error {
 	endpoint := strings.TrimRight(t.apiBase, "/") + "/bot" + t.Token + "/sendMessage"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return err
+		return invalidEndpoint("telegram")
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return do(t.client, req)
@@ -181,7 +181,7 @@ func (t *Telegram) Send(ctx context.Context, ev Event) error {
 func do(client *http.Client, req *http.Request) error {
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return scrubURLError(err)
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
@@ -189,6 +189,29 @@ func do(client *http.Client, req *http.Request) error {
 		return fmt.Errorf("notify: %s responded %d", req.URL.Host, resp.StatusCode)
 	}
 	return nil
+}
+
+// scrubURLError removes the request URL from transport errors. Telegram
+// (/bot<token>/), Bark (/<device key>/) and most chat webhooks
+// (?access_token=…) carry their secret in the URL, and *url.Error embeds the
+// full URL in its message, which the dispatcher then logged verbatim (AUDIT
+// 2026-09-24 F20).
+func scrubURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		host := "endpoint"
+		if u, perr := url.Parse(ue.URL); perr == nil && u.Host != "" {
+			host = u.Host
+		}
+		return fmt.Errorf("notify: %s %s: %w", ue.Op, host, ue.Err)
+	}
+	return err
+}
+
+// invalidEndpoint reports a request that could not be built without echoing
+// the (secret-bearing) URL.
+func invalidEndpoint(sink string) error {
+	return fmt.Errorf("notify: %s endpoint is not a valid URL", sink)
 }
 
 // ---- Dispatcher ----------------------------------------------------------
