@@ -200,7 +200,7 @@ func NewConfiguredServer(cfg Config) (*Server, error) {
 	}
 	syncEngine := clisync.NewEngine(cfg.Repo, cfg.BackupDir)
 	cliSyncSvc := clisync.NewService(syncEngine, cfg.LocalKeys, gatewayBase, map[string]clisync.Syncer{
-		"claude": &claude.Syncer{Engine: syncEngine, Path: cfg.ClaudePath, GatewayAddr: gatewayBase},
+		"claude": &claude.Syncer{Engine: syncEngine, Path: cfg.ClaudePath, GatewayAddr: gatewayBase, ManagementAddr: cfg.Management},
 		"codex":  &codex.Syncer{Engine: syncEngine, Path: cfg.CodexPath, GatewayAddr: gatewayBase},
 		"hermes": &hermes.Syncer{Engine: syncEngine, Home: cfg.HermesHome, GatewayAddr: gatewayBase},
 	})
@@ -2463,6 +2463,9 @@ func (s *Server) cliSyncMutate(w http.ResponseWriter, r *http.Request) {
 func cliSyncFault(err error) error {
 	if errors.Is(err, clisync.ErrUnknownCLI) {
 		return badRequest("unknown_cli", err.Error())
+	}
+	if errors.Is(err, clisync.ErrUntrustedBaseURL) {
+		return badRequest("untrusted_base_url", err.Error())
 	}
 	return fault{status: http.StatusInternalServerError, code: "cli_sync_failed", message: err.Error(), cause: err}
 }

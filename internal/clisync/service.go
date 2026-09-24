@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -13,6 +16,10 @@ import (
 
 // ErrUnknownCLI is returned when a caller names a CLI that has no registered syncer.
 var ErrUnknownCLI = errors.New("unknown cli target")
+
+// ErrUntrustedBaseURL is returned when a desired base URL does not point at
+// this RelayHub instance's own gateway.
+var ErrUntrustedBaseURL = errors.New("base_url must point at this RelayHub gateway")
 
 // KeyIssuer issues a real local gateway API key. CLI config files are useless
 // without a key the gateway will actually accept, and writing a placeholder
@@ -86,6 +93,9 @@ func (s *Service) names() []string {
 func (s *Service) Preview(ctx context.Context, cli string, desired DesiredState) (Diff, error) {
 	syncer, err := s.syncer(cli)
 	if err != nil {
+		return Diff{}, err
+	}
+	if err := s.checkBaseURL(desired.BaseURL); err != nil {
 		return Diff{}, err
 	}
 	// Preview must not mint a real gateway key: an abandoned preview would
@@ -176,7 +186,54 @@ func (s *Service) syncer(cli string) (Syncer, error) {
 // resolveDesired fills in the gateway base URL and issues a real API key. An
 // empty key is an error rather than a silent placeholder: a CLI pointed at the
 // gateway with a bogus key fails at request time with a confusing 401.
+// checkBaseURL only accepts base URLs that address this instance's own
+// gateway (loopback host or the advertised gateway host, gateway port,
+// optional /v1). CLI sync writes the URL into Claude Code / Codex / Hermes
+// configs together with a freshly minted gateway key, so an arbitrary URL
+// redirected every future prompt — and the key — to that host (AUDIT
+// 2026-09-24 F14).
+func (s *Service) checkBaseURL(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%w: %q is not a plain http(s) URL", ErrUntrustedBaseURL, raw)
+	}
+	switch strings.TrimRight(u.Path, "/") {
+	case "", "/v1":
+	default:
+		return fmt.Errorf("%w: unexpected path %q", ErrUntrustedBaseURL, u.Path)
+	}
+	gwHost, gwPort, err := net.SplitHostPort(s.gatewayAddr())
+	if err != nil {
+		return fmt.Errorf("%w: gateway address %q is invalid", ErrUntrustedBaseURL, s.gatewayAddr())
+	}
+	if u.Port() != gwPort {
+		return fmt.Errorf("%w: port %q is not the gateway port %s", ErrUntrustedBaseURL, u.Port(), gwPort)
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") || strings.EqualFold(host, gwHost) {
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("%w: host %q is not this machine", ErrUntrustedBaseURL, host)
+}
+
+func (s *Service) gatewayAddr() string {
+	if s.GatewayAddr != "" {
+		return s.GatewayAddr
+	}
+	return "127.0.0.1:8789"
+}
+
 func (s *Service) resolveDesired(desired DesiredState) (DesiredState, error) {
+	if err := s.checkBaseURL(desired.BaseURL); err != nil {
+		return desired, err
+	}
 	if desired.APIKey == "" {
 		if s.keys == nil {
 			return desired, errors.New("local key service is not configured; cannot issue a gateway api key")

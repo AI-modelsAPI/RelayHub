@@ -18,6 +18,57 @@ type Syncer struct {
 	// API, whose base URL must NOT carry a /v1 suffix, so the endpoint is built
 	// here rather than accepting one URL shared with the OpenAI-shaped CLIs.
 	GatewayAddr string
+	// ManagementAddr is the management API host:port the MCP bridge talks to.
+	ManagementAddr string
+	// Executable overrides the binary path written into the MCP entry
+	// (tests); empty means the running executable.
+	Executable string
+}
+
+// mcpEntry renders the Claude Code MCP server entry. The command is the
+// absolute path of this binary (a bare "relayhub" resolved through PATH, so
+// any earlier PATH entry named relayhub was launched by Claude Code, and the
+// desktop build ships as relayhub-core which is not on PATH at all), and the
+// environment names the variable cmd/relayhub actually reads with the
+// management address — the old entry set RELAYHUB_MGMT, which nothing read,
+// to the gateway port (AUDIT 2026-09-24 F14).
+func (s *Syncer) mcpEntry() map[string]interface{} {
+	cmd := s.Executable
+	if cmd == "" {
+		if exe, err := os.Executable(); err == nil {
+			if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+				exe = resolved
+			}
+			cmd = exe
+		} else {
+			cmd = "relayhub"
+		}
+	}
+	mgmt := s.ManagementAddr
+	if mgmt == "" {
+		mgmt = "127.0.0.1:8790"
+	}
+	return map[string]interface{}{
+		"command": cmd,
+		"args":    []string{"mcp"},
+		"env":     map[string]interface{}{"RELAYHUB_MANAGEMENT_ADDR": mgmt},
+	}
+}
+
+// legacyMCPEntry reports whether an existing entry was written by an older
+// RelayHub (identified by the unused RELAYHUB_MGMT variable) and may be
+// replaced without clobbering a user-authored entry.
+func legacyMCPEntry(v interface{}) bool {
+	entry, ok := v.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	env, ok := entry["env"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	_, legacy := env["RELAYHUB_MGMT"]
+	return legacy
 }
 
 func New(e *clisync.Engine, customPath string) *Syncer {
@@ -105,12 +156,8 @@ func (s *Syncer) Preview(ctx context.Context, desired clisync.DesiredState) (cli
 		mcp = map[string]interface{}{}
 		current["mcpServers"] = mcp
 	}
-	if _, ok := mcp["relayhub"]; !ok {
-		mcp["relayhub"] = map[string]interface{}{
-			"command": "relayhub",
-			"args":    []string{"mcp"},
-			"env":     map[string]interface{}{"RELAYHUB_MGMT": s.endpoint()},
-		}
+	if existing, ok := mcp["relayhub"]; !ok || legacyMCPEntry(existing) {
+		mcp["relayhub"] = s.mcpEntry()
 		changedKeys = append(changedKeys, "mcpServers.relayhub")
 	}
 
