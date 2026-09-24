@@ -610,7 +610,7 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 	// Build the upstream /models endpoint. Prefer /v1/models; fall back to /models.
 	// Existing channels go out through their configured proxy / identity headers
 	// (AUDIT RH-10); draft-channel probes have no channel identity to apply.
-	client := &http.Client{Timeout: 20 * time.Second}
+	client := &http.Client{Timeout: 20 * time.Second, CheckRedirect: egress.SameOriginRedirect}
 	if haveChannel {
 		client = s.upstreamProbeClient(ch, 20*time.Second)
 	}

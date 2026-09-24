@@ -170,7 +170,13 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 		// above hands out cached, fail-closed transports (AUDIT RH-10/RH-20).
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(httpReq)
+	// API calls never follow redirects: a 3xx from a relay used to make the
+	// gateway GET an arbitrary (internal) URL and hand that body to the
+	// client as a 200 completion (AUDIT 2026-09-24 F9). The copy shares the
+	// cached transport.
+	noFollow := *client
+	noFollow.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noFollow.Do(httpReq)
 	if err != nil {
 		return Response{}, err
 	}
@@ -455,6 +461,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
 		rr.Sticky.Remember(routeReq.SessionKey, decision.Channel.ID, last.CredentialKeyID)
+	}
+	// A relay answering 200 with an HTML page (Cloudflare challenge, login or
+	// "insufficient balance" page) is a failure, not a completion to relay
+	// (AUDIT 2026-09-24 F9: response shape was never checked).
+	if ct := strings.ToLower(last.Header.Get("Content-Type")); strings.HasPrefix(ct, "text/html") {
+		if h.cfg.Health != nil {
+			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+		}
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "provider_protocol", reqStart)
+		writeGatewayError(w, r, http.StatusBadGateway, "provider_protocol", "upstream returned an HTML page instead of an API response")
+		return
 	}
 	if stream {
 		upProto := normalizeProtocol(decision.ProviderModel.Protocol)

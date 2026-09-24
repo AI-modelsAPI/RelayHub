@@ -678,7 +678,9 @@ func writeUpstreamError(w http.ResponseWriter, r *http.Request, response Respons
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if json.Valid(body) && len(bytes.TrimSpace(body)) > 0 {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(response.StatusCode)
+		// Only 4xx/5xx statuses pass through; an upstream 3xx must not reach
+		// the client as a redirect (AUDIT 2026-09-24 F9).
+		w.WriteHeader(upstreamStatus(response.StatusCode))
 		_, _ = w.Write(body)
 		return
 	}

@@ -128,20 +128,58 @@ func (s *Selector) StreamingClientFor(ch domain.Channel) *http.Client {
 func (s *Selector) StreamingClient(proxy string) *http.Client {
 	key := proxy + "|stream"
 	if s == nil {
-		return &http.Client{Transport: NewTransport(proxy)}
+		return &http.Client{Transport: NewTransport(proxy), CheckRedirect: SameOriginRedirect}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if c, ok := s.clients[key]; ok {
 		return c
 	}
-	c := &http.Client{Transport: NewTransport(proxy)}
+	c := &http.Client{Transport: NewTransport(proxy), CheckRedirect: SameOriginRedirect}
 	s.clients[key] = c
 	return c
 }
 
 func newClient(proxy string, timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout, Transport: NewTransport(proxy)}
+	return &http.Client{Timeout: timeout, Transport: NewTransport(proxy), CheckRedirect: SameOriginRedirect}
+}
+
+// SameOriginRedirect is the redirect policy for every upstream client. Go's
+// default follows up to 10 redirects to any host, so an upstream answering
+// "302 Location: http://127.0.0.1:8790/…" (or a metadata address) made
+// RelayHub fetch internal URLs, and custom credential headers such as
+// x-api-key survive cross-host redirects (AUDIT 2026-09-24 F9/F16). Only
+// same-origin hops (plus an http→https upgrade of the same host on default
+// ports) are followed, at most three; anything else is returned to the caller
+// as the 3xx response itself.
+func SameOriginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	if len(via) >= 3 {
+		return http.ErrUseLastResponse
+	}
+	from, to := via[0].URL, req.URL
+	if !strings.EqualFold(from.Hostname(), to.Hostname()) {
+		return http.ErrUseLastResponse
+	}
+	if from.Scheme == to.Scheme && effectivePort(from) == effectivePort(to) {
+		return nil
+	}
+	if from.Scheme == "http" && to.Scheme == "https" && effectivePort(from) == "80" && effectivePort(to) == "443" {
+		return nil
+	}
+	return http.ErrUseLastResponse
+}
+
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
 }
 
 // NewTransport builds a transport honouring the proxy setting.
