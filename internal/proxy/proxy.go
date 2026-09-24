@@ -36,6 +36,11 @@ func (p TargetPolicy) allows(ip net.IP) bool {
 	if ip == nil {
 		return false
 	}
+	// Cloud instance-metadata endpoints are never a legitimate egress target
+	// for an AI traffic proxy, whatever the policy says (AUDIT 2026-09-24 F2).
+	if isMetadataIP(ip) {
+		return false
+	}
 	if isLocalIP(ip) {
 		return p.AllowLocal
 	}
@@ -47,6 +52,105 @@ func (p TargetPolicy) allows(ip net.IP) bool {
 
 func isLocalIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+// metadataIPs are well-known cloud instance-metadata service addresses (AWS,
+// GCP, Azure, OpenStack; AWS ECS task metadata; Alibaba Cloud; AWS IPv6).
+var metadataIPs = []net.IP{
+	net.ParseIP("169.254.169.254"),
+	net.ParseIP("169.254.170.2"),
+	net.ParseIP("100.100.100.200"),
+	net.ParseIP("fd00:ec2::254"),
+}
+
+func isMetadataIP(ip net.IP) bool {
+	for _, m := range metadataIPs {
+		if m.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// SelfGuard records the TCP ports of RelayHub's own listeners (proxies,
+// gateway, management API). A proxy must never relay to one of those ports on
+// an address of this host: doing so let any proxy client reach the loopback
+// management API without passing its browser boundary (AUDIT 2026-09-24 F3)
+// and let an origin-form request make the HTTP proxy dial itself until file
+// descriptors ran out (F1). The guard is independent of TargetPolicy so even
+// an "open" policy cannot re-enable those paths.
+type SelfGuard struct {
+	mu    sync.RWMutex
+	ports map[int]struct{}
+	// localAddrs is swappable in tests; defaults to net.InterfaceAddrs.
+	localAddrs func() ([]net.Addr, error)
+}
+
+// NewSelfGuard returns a guard protecting the given ports.
+func NewSelfGuard(ports ...int) *SelfGuard {
+	g := &SelfGuard{ports: map[int]struct{}{}, localAddrs: net.InterfaceAddrs}
+	for _, p := range ports {
+		g.ProtectPort(p)
+	}
+	return g
+}
+
+// ProtectPort adds a port to the guard. Non-positive ports are ignored.
+func (g *SelfGuard) ProtectPort(port int) {
+	if g == nil || port <= 0 {
+		return
+	}
+	g.mu.Lock()
+	g.ports[port] = struct{}{}
+	g.mu.Unlock()
+}
+
+// ProtectAddr adds the port of a listener address such as "127.0.0.1:8790"
+// or a net.Addr's String(). Unparseable addresses are ignored.
+func (g *SelfGuard) ProtectAddr(addr string) {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	if p, err := strconv.Atoi(portStr); err == nil {
+		g.ProtectPort(p)
+	}
+}
+
+// Blocks reports whether dialing ip:port would reach one of this host's own
+// protected listeners.
+func (g *SelfGuard) Blocks(ip net.IP, port int) bool {
+	if g == nil || ip == nil {
+		return false
+	}
+	g.mu.RLock()
+	_, protected := g.ports[port]
+	g.mu.RUnlock()
+	if !protected {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	addrs, err := g.localAddrs()
+	if err != nil {
+		// Fail closed: without the interface list we cannot prove the target
+		// is not this host.
+		return true
+	}
+	for _, a := range addrs {
+		var local net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			local = v.IP
+		case *net.IPAddr:
+			local = v.IP
+		}
+		if local != nil && local.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 type baseServer struct {
@@ -63,6 +167,18 @@ type baseServer struct {
 	ctx                      context.Context
 	cancel                   context.CancelFunc
 	dialTimeout, idleTimeout time.Duration
+	// guard always protects this server's own listener port (see SelfGuard).
+	guard *SelfGuard
+}
+
+// useGuard installs g (or a fresh guard when nil) and protects the server's
+// own listener port with it.
+func (b *baseServer) useGuard(g *SelfGuard) {
+	if g == nil {
+		g = NewSelfGuard()
+	}
+	g.ProtectAddr(b.addr.String())
+	b.guard = g
 }
 
 func newBase(addr string, supplied net.Listener) (*baseServer, error) {
@@ -229,20 +345,21 @@ func parseAuthority(authority, defaultPort string, requirePort bool) (string, in
 	return strings.Trim(host, "[]"), portNumber, nil
 }
 
-func resolveTarget(ctx context.Context, authority, defaultPort string, requirePort bool, policy TargetPolicy) (string, string, int, error) {
+func resolveTarget(ctx context.Context, authority, defaultPort string, requirePort bool, policy TargetPolicy, guard *SelfGuard) (string, string, int, error) {
 	host, port, err := parseAuthority(authority, defaultPort, requirePort)
 	if err != nil {
 		return "", "", 0, err
 	}
 	ips := net.ParseIP(host)
 	if ips != nil {
-		if !policy.allows(ips) {
+		if !policy.allows(ips) || guard.Blocks(ips, port) {
 			return "", "", 0, fmt.Errorf("target blocked by policy: %w", errInvalidTarget)
 		}
 		return net.JoinHostPort(ips.String(), strconv.Itoa(port)), host, port, nil
 	}
 	if strings.EqualFold(host, "localhost") {
-		if !policy.AllowLocal {
+		loopback := net.IPv4(127, 0, 0, 1)
+		if !policy.AllowLocal || guard.Blocks(loopback, port) {
 			return "", "", 0, fmt.Errorf("target blocked by policy: %w", errInvalidTarget)
 		}
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), host, port, nil
@@ -255,7 +372,7 @@ func resolveTarget(ctx context.Context, authority, defaultPort string, requirePo
 		return "", "", 0, err
 	}
 	for _, ip := range resolved {
-		if policy.allows(ip) {
+		if policy.allows(ip) && !guard.Blocks(ip, port) {
 			return net.JoinHostPort(ip.String(), strconv.Itoa(port)), host, port, nil
 		}
 	}
@@ -263,7 +380,7 @@ func resolveTarget(ctx context.Context, authority, defaultPort string, requirePo
 }
 
 func (b *baseServer) dialTarget(ctx context.Context, authority, defaultPort string, requirePort bool, policy TargetPolicy) (net.Conn, string, int, error) {
-	address, host, port, err := resolveTarget(ctx, authority, defaultPort, requirePort, policy)
+	address, host, port, err := resolveTarget(ctx, authority, defaultPort, requirePort, policy, b.guard)
 	if err != nil {
 		return nil, "", 0, err
 	}

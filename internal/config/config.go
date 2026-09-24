@@ -26,8 +26,11 @@ type Config struct {
 	SOCKS5Addr     string `json:"socks5_addr"`
 	GatewayAddr    string `json:"gateway_addr"`
 	ManagementAddr string `json:"management_addr"`
-	// Proxy target policies: "open" allows public internet targets (default for out-of-the-box operation);
-	// "local_only" limits targets to loopback/link-local.
+	// Proxy target policies: "open" (default) allows local, private and public
+	// targets; "public_private" drops loopback/link-local; "public_only" also
+	// drops RFC1918 ranges; "local_only" limits targets to loopback/link-local.
+	// Every policy refuses RelayHub's own listener ports and cloud metadata
+	// addresses (AUDIT 2026-09-24 F1-F3).
 	HTTPProxyTargetPolicy string `json:"http_proxy_target_policy"`
 	SOCKS5TargetPolicy    string `json:"socks5_target_policy"`
 	// EgressProxyURL is the global default exit for outbound AI gateway,

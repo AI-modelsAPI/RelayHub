@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -212,13 +213,24 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if httpPAddr == "" {
 		httpPAddr = "127.0.0.1:8787"
 	}
-	httpTargetPolicy := proxy.OpenPolicy()
-	if cfg.HTTPProxyTargetPolicy == "local_only" {
-		httpTargetPolicy = proxy.LocalOnlyPolicy()
+	httpTargetPolicy, err := targetPolicyFor(cfg.HTTPProxyTargetPolicy)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("http proxy: %w", err)
+	}
+	// One guard shared by both proxies: it holds every RelayHub listener
+	// port (proxies, gateway, management) so neither proxy can relay to the
+	// loopback management API or to itself (AUDIT 2026-09-24 F1/F3). The
+	// configured addresses are protected up front; the actual bound ports are
+	// added below once the listeners exist (they differ when ":0" is used).
+	selfGuard := proxy.NewSelfGuard()
+	for _, a := range []string{cfg.GatewayAddr, cfg.ManagementAddr} {
+		selfGuard.ProtectAddr(a)
 	}
 	httpProxy, err := proxy.NewHTTP(proxy.HTTPConfig{
 		Addr:         httpPAddr,
 		TargetPolicy: httpTargetPolicy,
+		Guard:        selfGuard,
 	})
 	if err != nil {
 		_ = db.Close()
@@ -229,13 +241,16 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if socksAddr == "" {
 		socksAddr = "127.0.0.1:8788"
 	}
-	socksTargetPolicy := proxy.OpenPolicy()
-	if cfg.SOCKS5TargetPolicy == "local_only" {
-		socksTargetPolicy = proxy.LocalOnlyPolicy()
+	socksTargetPolicy, err := targetPolicyFor(cfg.SOCKS5TargetPolicy)
+	if err != nil {
+		_ = httpProxy.Shutdown(ctx)
+		_ = db.Close()
+		return nil, fmt.Errorf("socks5 proxy: %w", err)
 	}
 	socksProxy, err := proxy.NewSOCKS5(proxy.SOCKS5Config{
 		Addr:         socksAddr,
 		TargetPolicy: socksTargetPolicy,
+		Guard:        selfGuard,
 	})
 	if err != nil {
 		_ = httpProxy.Shutdown(ctx)
@@ -268,6 +283,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to listen on api addr %s: %w", apiAddr, err)
 	}
+	selfGuard.ProtectAddr(apiL.Addr().String())
 
 	refreshResolver := func(ctx context.Context) error {
 		if err := catalogSvc.Load(ctx); err != nil {
@@ -299,6 +315,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to listen on gateway addr %s: %w", gwAddr, err)
 	}
+	selfGuard.ProtectAddr(gwL.Addr().String())
 
 	browserRt := browser.NewRuntime()
 	sched.SetBrowserExecutor(browser.NewCDPExecutor(browserRt, absDataDir, browser.Detect))
@@ -484,12 +501,34 @@ func isLoopbackListen(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// targetPolicyFor maps a configured policy name to a proxy target policy.
+// Unknown names fail startup instead of silently falling back to "open".
+// RelayHub's own listener ports and cloud metadata addresses are refused by
+// every policy (proxy.SelfGuard / metadata deny list).
+func targetPolicyFor(name string) (proxy.TargetPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "open":
+		return proxy.OpenPolicy(), nil
+	case "local_only":
+		return proxy.LocalOnlyPolicy(), nil
+	case "public_private":
+		return proxy.TargetPolicy{AllowPrivate: true, AllowPublic: true}, nil
+	case "public_only":
+		return proxy.TargetPolicy{AllowPublic: true}, nil
+	}
+	return proxy.TargetPolicy{}, fmt.Errorf("unknown proxy target policy %q (use open, public_private, public_only or local_only)", name)
+}
+
 func describeTargetPolicy(p proxy.TargetPolicy) string {
 	switch {
 	case p.AllowPublic && p.AllowPrivate && p.AllowLocal:
 		return "open (local+private+public)"
 	case !p.AllowPublic && !p.AllowPrivate && p.AllowLocal:
 		return "local_only"
+	case p.AllowPublic && p.AllowPrivate && !p.AllowLocal:
+		return "public_private"
+	case p.AllowPublic && !p.AllowPrivate && !p.AllowLocal:
+		return "public_only"
 	default:
 		return fmt.Sprintf("custom (local=%t private=%t public=%t)", p.AllowLocal, p.AllowPrivate, p.AllowPublic)
 	}

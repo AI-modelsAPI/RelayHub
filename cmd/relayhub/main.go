@@ -105,6 +105,11 @@ func run(args []string) error {
 		ManagementAddr: managementAddr,
 		WireFullStack:  fullStack,
 		EgressProxyURL: fileCfg.EgressProxyURL,
+		// The target policies were parsed from config.json / env but never
+		// handed to the app, so "local_only" silently stayed "open" (AUDIT
+		// 2026-09-24 F2).
+		HTTPProxyTargetPolicy: fileCfg.HTTPProxyTargetPolicy,
+		SOCKS5TargetPolicy:    fileCfg.SOCKS5TargetPolicy,
 		Notify: app.NotifyConfig{
 			WebhookURL:       fileCfg.Notify.WebhookURL,
 			BarkURL:          fileCfg.Notify.BarkURL,
