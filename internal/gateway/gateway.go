@@ -267,9 +267,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(ctx)
 		defer cancel()
 	}
-	input, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	input, err := io.ReadAll(io.LimitReader(r.Body, maxGatewayBody+1))
 	if err != nil {
 		writeGatewayError(w, r, http.StatusBadRequest, "client_error", "could not read request")
+		return
+	}
+	// Oversized bodies used to be truncated silently and forwarded as broken
+	// JSON (AUDIT 2026-09-24 F8).
+	if int64(len(input)) > maxGatewayBody {
+		writeGatewayError(w, r, http.StatusRequestEntityTooLarge, "client_error", "request body exceeds 16 MiB")
 		return
 	}
 	model, err := requestModel(protocol, input)
@@ -494,7 +500,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(last.Body, 16<<20))
+	body, err := io.ReadAll(io.LimitReader(last.Body, maxGatewayBody+1))
+	if err == nil && int64(len(body)) > maxGatewayBody {
+		err = errUpstreamTooLarge
+	}
+	if errors.Is(err, errUpstreamTooLarge) {
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "response_too_large", reqStart)
+		writeGatewayError(w, r, http.StatusBadGateway, "response_too_large", "upstream response exceeds 16 MiB")
+		return
+	}
 	if err != nil {
 		if h.cfg.Health != nil {
 			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
@@ -654,13 +668,42 @@ func endpointProtocol(path string) (string, string, error) {
 		return "", "", ErrUnsupportedPath
 	}
 }
+
+// maxGatewayBody bounds request and non-stream response bodies.
+const maxGatewayBody = 16 << 20
+
+var errUpstreamTooLarge = errors.New("upstream response exceeds gateway limit")
+
+// strippedRequestHeaders are never forwarded upstream.
+//
+// Accept-Encoding: when the client's value is forwarded, Go's transport no
+// longer decompresses transparently, so a relay that honours gzip returned
+// bytes the gateway then failed to parse ("malformed upstream JSON", 502,
+// channel marked unhealthy) — Python httpx/requests and Node fetch send it by
+// default (AUDIT 2026-09-24 F8). The transport negotiates compression itself.
+//
+// Hop-by-hop headers describe the client connection, not the upstream one.
+// Browser-context and OpenAI account headers identify the operator to a
+// third-party relay without being needed by any relay protocol.
+var strippedRequestHeaders = []string{
+	"Authorization", "X-Api-Key", "Cookie", "Set-Cookie", "Proxy-Authorization",
+	"Accept-Encoding", "Content-Length", "Host",
+	"Connection", "Keep-Alive", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+	"Origin", "Referer",
+	"Openai-Organization", "Openai-Project",
+}
+
 func requestHeaders(r *http.Request, protocol string, stream bool, decision router.Decision) http.Header {
 	h := r.Header.Clone()
-	h.Del("Authorization")
-	h.Del("x-api-key")
-	h.Del("Cookie")
-	h.Del("Set-Cookie")
-	h.Del("Proxy-Authorization")
+	for _, name := range strippedRequestHeaders {
+		h.Del(name)
+	}
+	for name := range h {
+		// Fetch-metadata and client hints only exist on browser requests.
+		if strings.HasPrefix(name, "Sec-") {
+			h.Del(name)
+		}
+	}
 	// Clients may spoof forwarding headers; the gateway speaks to the upstream
 	// itself, so these must never be forwarded verbatim (AUDIT RH-11).
 	h.Del("X-Forwarded-For")
