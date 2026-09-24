@@ -284,7 +284,13 @@ func (m mcpAdapter) ListChannels(ctx context.Context) (any, error) {
 	if m.s.Repo == nil {
 		return []any{}, nil
 	}
-	return m.s.Repo.ListChannels(ctx, "")
+	chs, err := m.s.Repo.ListChannels(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	// MCP output reaches LLM agents and their logs: same masking as the
+	// management API (AUDIT 2026-09-24 F10; RH-31 covered only /channels).
+	return safeChannels(chs), nil
 }
 func (m mcpAdapter) QuotaStatus(ctx context.Context) (any, error) {
 	if m.s.Repo == nil {

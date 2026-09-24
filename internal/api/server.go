@@ -1787,6 +1787,7 @@ func (s *Server) channelResource(w http.ResponseWriter, r *http.Request, ctx con
 			// that omits them must not erase the last observation.
 			if existing, gErr := s.Repo.GetChannel(ctx, c.ID); gErr == nil {
 				preserveSystemFields(&c, existing)
+				restoreMaskedSecrets(&c, existing)
 			}
 			e = s.Repo.UpdateChannel(ctx, c)
 		}
@@ -2845,7 +2846,63 @@ func preserveSystemFields(c *domain.Channel, existing domain.Channel) {
 
 func safeChannel(c domain.Channel) domain.Channel {
 	c.ProxyURL = maskProxyUserinfo(c.ProxyURL)
+	c.CustomHeaders = maskSensitiveHeaders(c.CustomHeaders)
 	return c
+}
+
+// redactedHeaderValue replaces sensitive custom header values in API echoes.
+// Sending it back unchanged on update keeps the stored value.
+const redactedHeaderValue = "[redacted]"
+
+// sensitiveHeaderName reports whether a custom header carries a credential.
+// custom_headers is documented as the place for "custom authorization
+// headers", yet GET /channels and MCP echoed them verbatim (AUDIT 2026-09-24
+// F10).
+func sensitiveHeaderName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch n {
+	case "authorization", "proxy-authorization", "cookie", "x-api-key", "api-key", "apikey":
+		return true
+	}
+	for _, part := range []string{"token", "secret", "password", "passwd", "session", "auth", "key"} {
+		if strings.Contains(n, part) {
+			return true
+		}
+	}
+	return false
+}
+
+func maskSensitiveHeaders(h map[string]string) map[string]string {
+	if len(h) == 0 {
+		return h
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		if sensitiveHeaderName(k) && v != "" {
+			v = redactedHeaderValue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// restoreMaskedSecrets keeps stored credentials when an update echoes the
+// masked forms produced by safeChannel (a GET-modify-PUT round trip used to
+// overwrite the proxy password with the masked URL).
+func restoreMaskedSecrets(c *domain.Channel, existing domain.Channel) {
+	if c.ProxyURL != "" && c.ProxyURL != existing.ProxyURL && c.ProxyURL == maskProxyUserinfo(existing.ProxyURL) {
+		c.ProxyURL = existing.ProxyURL
+	}
+	for k, v := range c.CustomHeaders {
+		if v != redactedHeaderValue {
+			continue
+		}
+		if old, ok := existing.CustomHeaders[k]; ok {
+			c.CustomHeaders[k] = old
+		} else {
+			delete(c.CustomHeaders, k)
+		}
+	}
 }
 func safeChannels(v []domain.Channel) []domain.Channel {
 	for i := range v {
