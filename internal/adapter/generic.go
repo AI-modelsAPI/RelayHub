@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"relayhub/internal/domain"
+	"relayhub/internal/keybind"
 )
 
 // GenericAdapter handles standard OpenAI/Anthropic/Gemini compatible endpoints.
@@ -60,7 +61,7 @@ func NewGenericAdapterWithSecrets(client *http.Client, secrets SecretResolver) *
 // bearerToken resolves the channel credential; without a secret resolver the
 // ref is a locator, not a token, so the adapter must not send it.
 func (g *GenericAdapter) bearerToken(ctx context.Context, channel domain.Channel) string {
-	if channel.CredentialRef == "" || g.Secrets == nil {
+	if channel.CredentialRef == "" || g.Secrets == nil || !keybind.Allows(channel.CredentialRef, channel.ID, channel.BaseURL) {
 		return ""
 	}
 	secret, err := g.Secrets.Get(ctx, channel.CredentialRef)

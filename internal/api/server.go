@@ -32,6 +32,7 @@ import (
 	"relayhub/internal/export"
 	"relayhub/internal/health"
 	"relayhub/internal/identity"
+	"relayhub/internal/keybind"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/notify"
@@ -1148,12 +1149,15 @@ func (s *Server) channelKeys(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, badRequest("validation_error", "channel_id and value are required"))
 			return
 		}
-		if _, err := s.Repo.GetChannel(ctx, input.ChannelID); err != nil {
+		keyCh, err := s.Repo.GetChannel(ctx, input.ChannelID)
+		if err != nil {
 			s.fail(w, r, mapRepoError(err, "channel"))
 			return
 		}
 		keyID := "chk-" + newID()
-		secretRef := "chkey:" + input.ChannelID + ":" + keyID
+		// The ref carries the origin the key is entered for; it is only ever
+		// released to that origin (AUDIT 2026-09-24 F5).
+		secretRef := keybind.Bind(keybind.ChannelKeyPrefix+input.ChannelID+":"+keyID, keyCh.BaseURL)
 		if err := s.SecretStore.Put(ctx, secretRef, []byte(input.Value)); err != nil {
 			s.fail(w, r, internal(err))
 			return
@@ -1420,25 +1424,19 @@ func (s *Server) channelTest(w http.ResponseWriter, r *http.Request) {
 				s.fail(w, r, notFound("channel key not found for this channel"))
 				return
 			}
+			if !keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
+				s.fail(w, r, keyOriginMismatch())
+				return
+			}
 			if secret, err := s.SecretStore.Get(r.Context(), k.SecretRef); err == nil {
 				apiKey = string(secret)
 			}
 		} else {
-			if keys, err := s.Repo.ListChannelKeys(r.Context(), input.ChannelID); err == nil {
-				for _, k := range keys {
-					if k.Disabled {
-						continue
-					}
-					if secret, err := s.SecretStore.Get(r.Context(), k.SecretRef); err == nil {
-						apiKey = string(secret)
-						break
-					}
-				}
-			}
-			if apiKey == "" && ch.CredentialRef != "" {
-				if secret, err := s.SecretStore.Get(r.Context(), ch.CredentialRef); err == nil {
-					apiKey = string(secret)
-				}
+			var locked bool
+			apiKey, locked = s.channelKeyFor(r.Context(), ch)
+			if apiKey == "" && locked {
+				s.fail(w, r, keyOriginMismatch())
+				return
 			}
 		}
 	}
@@ -1545,25 +1543,44 @@ func (s *Server) fetchUpstreamModelList(ctx context.Context, ch domain.Channel, 
 // resolveChannelAPIKey mirrors the key selection used by test/sync paths:
 // first enabled per-channel key, falling back to the legacy CredentialRef.
 func (s *Server) resolveChannelAPIKey(ctx context.Context, ch domain.Channel) string {
+	key, _ := s.channelKeyFor(ctx, ch)
+	return key
+}
+
+// channelKeyFor returns the first enabled key the channel may send to its
+// current base_url, falling back to the legacy CredentialRef. locked reports
+// that keys exist but are bound to a different origin (AUDIT 2026-09-24 F5).
+func (s *Server) channelKeyFor(ctx context.Context, ch domain.Channel) (key string, locked bool) {
 	if s.SecretStore == nil {
-		return ""
+		return "", false
 	}
 	if keys, err := s.Repo.ListChannelKeys(ctx, ch.ID); err == nil {
 		for _, k := range keys {
 			if k.Disabled {
 				continue
 			}
+			if !keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
+				locked = true
+				continue
+			}
 			if secret, gerr := s.SecretStore.Get(ctx, k.SecretRef); gerr == nil {
-				return string(secret)
+				return string(secret), false
 			}
 		}
 	}
 	if ch.CredentialRef != "" {
+		if !keybind.Allows(ch.CredentialRef, ch.ID, ch.BaseURL) {
+			return "", true
+		}
 		if secret, gerr := s.SecretStore.Get(ctx, ch.CredentialRef); gerr == nil {
-			return string(secret)
+			return string(secret), false
 		}
 	}
-	return ""
+	return "", locked
+}
+
+func keyOriginMismatch() error {
+	return fault{status: http.StatusConflict, code: "key_origin_mismatch", message: "the channel's keys were entered for a different base_url origin; re-enter the key for the new address"}
 }
 
 func (s *Server) secrets(w http.ResponseWriter, r *http.Request) {

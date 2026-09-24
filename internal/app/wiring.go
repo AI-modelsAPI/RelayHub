@@ -33,6 +33,7 @@ import (
 	"relayhub/internal/gateway"
 	"relayhub/internal/guard"
 	"relayhub/internal/health"
+	"relayhub/internal/keybind"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/notify"
@@ -179,6 +180,11 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create secret store: %w", err)
+	}
+	if n, err := bindLegacyChannelKeys(ctx, repo, secStore); err != nil {
+		log.Printf("relayhub: warning: binding legacy channel keys to their origin: %v", err)
+	} else if n > 0 {
+		log.Printf("relayhub: bound %d legacy channel key(s) to their channel's current origin", n)
 	}
 
 	// Local Auth
@@ -451,7 +457,9 @@ func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepos
 	if keys, err := repo.ListChannelKeys(ctx, ch.ID); err == nil && len(keys) > 0 {
 		enabled := make([]domain.ChannelKey, 0, len(keys))
 		for _, k := range keys {
-			if !k.Disabled {
+			// Keys are only released to the origin they were entered for
+			// (AUDIT 2026-09-24 F5).
+			if !k.Disabled && keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
 				enabled = append(enabled, k)
 			}
 		}
@@ -472,7 +480,7 @@ func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepos
 			}
 		}
 	}
-	if ch.CredentialRef == "" {
+	if ch.CredentialRef == "" || !keybind.Allows(ch.CredentialRef, ch.ID, ch.BaseURL) {
 		return "", "", nil
 	}
 	secretBytes, err := secStore.Get(ctx, ch.CredentialRef)
@@ -509,6 +517,48 @@ func isLoopbackListen(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// bindLegacyChannelKeys re-seals channel keys created before origin binding
+// under a ref bound to the channel's current base_url origin, so they are no
+// longer released to whatever host base_url is changed to later (AUDIT
+// 2026-09-24 F5). The upgrade moment is trusted: the stored base_url is the
+// one the operator entered the key for.
+func bindLegacyChannelKeys(ctx context.Context, repo *repository.Store, store *secrets.Store) (int, error) {
+	channels, err := repo.ListChannels(ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	bound := 0
+	for _, ch := range channels {
+		if keybind.Origin(ch.BaseURL) == "" {
+			continue
+		}
+		keys, err := repo.ListChannelKeys(ctx, ch.ID)
+		if err != nil {
+			return bound, err
+		}
+		for _, k := range keys {
+			if !keybind.Unbound(k.SecretRef) || !keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
+				continue
+			}
+			value, err := store.Get(ctx, k.SecretRef)
+			if err != nil {
+				continue
+			}
+			newRef := keybind.Bind(k.SecretRef, ch.BaseURL)
+			if err := store.Put(ctx, newRef, value); err != nil {
+				return bound, err
+			}
+			if err := repo.RebindChannelKeySecret(ctx, k.ID, newRef); err != nil {
+				_ = store.Delete(ctx, newRef)
+				return bound, err
+			}
+			_ = store.Delete(ctx, k.SecretRef)
+			bound++
+		}
+	}
+	return bound, nil
 }
 
 // restrictToOwner drops group/other permission bits from an existing path.
