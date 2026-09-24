@@ -36,7 +36,10 @@ func ApplyToChannel(ch *domain.Channel, b Bundle) {
 	if ch.CustomHeaders == nil {
 		ch.CustomHeaders = map[string]string{}
 	}
-	if b.ProxyURL != "" || ch.ProxyURL != "" {
+	// An empty bundle field means "not specified", never "clear": the old
+	// condition wiped a configured proxy whenever the bundle omitted it,
+	// silently switching the channel to direct egress (AUDIT 2026-09-24 F12).
+	if b.ProxyURL != "" {
 		ch.ProxyURL = b.ProxyURL
 	}
 	if b.UserAgent != "" {
