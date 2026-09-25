@@ -30,9 +30,11 @@ func TestCDPClicksOnceWhileWaiting(t *testing.T) {
 	rt := browser.NewRuntime()
 	defer rt.Close(context.Background())
 	executor := browser.NewCDPExecutor(rt, t.TempDir(), func() browser.Info { return info })
-	// Executor default is 30s; a tighter 15s budget flaked under -race load
-	// (chrome start + CDP ready + navigate exceeded it), not a logic failure.
-	res, err := executor.ExecuteCheckin(context.Background(), browser.CheckinRequest{URL: server.URL, ProviderID: "p", ChannelID: "c", Timeout: 30 * time.Second})
+	// Executor default is 30s; a 15s budget flaked under -race load (chrome
+	// start + CDP ready + navigate exceeded it), and CI once needed more than
+	// 15s just to attach. The generous budget only matters when the machine
+	// is slow; a passing run takes about a second.
+	res, err := executor.ExecuteCheckin(context.Background(), browser.CheckinRequest{URL: server.URL, ProviderID: "p", ChannelID: "c", Timeout: 60 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

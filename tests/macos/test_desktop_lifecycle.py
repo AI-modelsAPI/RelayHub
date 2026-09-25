@@ -80,7 +80,15 @@ def wait_healthy(port, timeout=15.0):
 
 
 def spawn(port, data_dir, home):
-    env = dict(os.environ, HOME=home, RELAYHUB_NO_ALERT_MODAL="1")
+    # The core inherits this environment. Give its proxies and gateway free
+    # ports instead of the fixed 8787-8789: a core from the previous test can
+    # still hold those while it shuts down, and the new core then exits with
+    # "address already in use" (seen on CI as a vanished core PID or a
+    # refused /healthz).
+    env = dict(os.environ, HOME=home, RELAYHUB_NO_ALERT_MODAL="1",
+               RELAYHUB_HTTP_PROXY_ADDR=f"127.0.0.1:{get_free_port()}",
+               RELAYHUB_SOCKS5_ADDR=f"127.0.0.1:{get_free_port()}",
+               RELAYHUB_GATEWAY_ADDR=f"127.0.0.1:{get_free_port()}")
     return subprocess.Popen(
         [str(BINARY), "--port", str(port), "--data-dir", str(data_dir)],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -113,6 +121,7 @@ class DesktopLifecycleTests(unittest.TestCase):
             data_dir.mkdir()
             proc = spawn(port, data_dir, td)
             core_pid = None
+            passed = False
             try:
                 core_pid, core_token = read_token(data_dir)
                 self.assertIsNotNone(core_pid, "Core PID not recorded in token")
@@ -144,8 +153,13 @@ class DesktopLifecycleTests(unittest.TestCase):
                 with urllib.request.urlopen(authed, timeout=2) as r:
                     self.assertEqual(r.status, 200)
                     self.assertIn(b"cache_hit_ratio", r.read())
+                passed = True
             finally:
-                stop(proc)
+                out = stop(proc)
+                if not passed:
+                    # The shell relays the core's log; without it a failure
+                    # here says nothing about why the core went away.
+                    print("---- shell/core output ----\n" + out[-6000:])
 
             time.sleep(0.5)
             check = subprocess.run(["kill", "-0", str(core_pid)], capture_output=True)

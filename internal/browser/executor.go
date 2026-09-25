@@ -160,9 +160,10 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 	client := cdp.ConnectPipe(respR, cmdW)
 	defer client.Close()
 
-	attachCtx, attachCancel := context.WithTimeout(runCtx, 15*time.Second)
-	page, err := cdp.AttachFirstPage(attachCtx, client)
-	attachCancel()
+	// Attaching waits for the browser to come up, which can take a large
+	// part of the budget on a loaded machine (seen under the -race suite on
+	// CI), so it shares the run's overall timeout instead of a tighter one.
+	page, err := cdp.AttachFirstPage(runCtx, client)
 	if err != nil {
 		if runCtx.Err() != nil {
 			return CheckinResult{}, runCtx.Err()
