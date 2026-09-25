@@ -30,6 +30,8 @@ go build -o bin/relayhub ./cmd/relayhub
 
 The desktop-paradigm console is served at `http://127.0.0.1:8790` during development (icon rail + inspector; not a website admin). See `docs/ui/desktop-paradigm.md`.
 
+The management API requires a token by default. On first start RelayHub generates one into `<data-dir>/management.token` and logs a one-time pairing link (`http://127.0.0.1:8790/#pair=…`) that signs the console in; `./bin/relayhub pair` prints a fresh link. Set `management_auth` to `off` to restore the unauthenticated loopback API. See `docs/operations.md` §4.
+
 ### 2. Run with Docker Compose
 
 ```bash

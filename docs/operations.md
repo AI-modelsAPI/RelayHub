@@ -89,10 +89,24 @@ CDP 签到默认寻找 `#checkin-btn, .checkin-btn, button[data-action="checkin"
 
 | 字段 | 环境变量 | 作用 |
 |---|---|---|
-| `management_token` | `RELAYHUB_MANAGEMENT_TOKEN` | 设置后，所有修改类管理 API 都要求 `Authorization: Bearer <token>`。控制台第一次遇到 401 时会提示输入，令牌只保存在浏览器的 localStorage 里；`relayhub mcp` 读取同一个环境变量 |
+| `management_auth` | `RELAYHUB_MANAGEMENT_AUTH` | `token`（默认）或 `off`。`token` 模式下，除 `/api/v1/health`、`/healthz` 和配对接口外，所有管理 API（包括读取）都要求 `Authorization: Bearer <token>`。`off` 恢复旧行为：本机任何进程都可以不带凭据读写管理 API，启动日志会打印警告 |
+| `management_token` | `RELAYHUB_MANAGEMENT_TOKEN` | 显式指定管理令牌。不设置时，首次启动会随机生成一个，写入 `<data-dir>/management.token`（权限 `0600`），之后重启沿用。与 `management_auth: off` 同时设置会阻止启动 |
 | `proxy_username` / `proxy_password` | `RELAYHUB_PROXY_USERNAME` / `RELAYHUB_PROXY_PASSWORD` | 两个都设置时，本地 HTTP 代理要求 Basic 认证，SOCKS5 要求 RFC 1929 认证；只设置其中一个会阻止启动 |
 | `master_key_store` | `RELAYHUB_MASTER_KEY_STORE` | `file`（默认，`<data-dir>/master.key`）或 `keychain`（仅 macOS）。选 `keychain` 后主密钥存入登录钥匙串：已有的 `master.key` 会先迁移过去，回读校验通过后才删除文件；如果文件和钥匙串里的值不一致，就拒绝启动。之后备份和同步盘里就不再有明文主密钥（旧备份里仍然有，必要时请轮换渠道 Key）。钥匙串处于锁定状态时启动会失败，不会悄悄生成新密钥 |
 | `http_proxy_target_policy` / `socks5_target_policy` | — | 可选 `open`（默认）、`public_private`、`public_only`、`local_only`。无论选哪个，都会拒绝 RelayHub 自身的端口和云元数据地址；CGNAT（100.64/10）按私网处理 |
+
+### 管理 API 认证与控制台配对
+
+管理 API 默认要求令牌（`management_auth: token`）。浏览器通过一次性配对链接拿到令牌，令牌本身不会出现在任何 URL 里：
+
+- 启动日志会打印 `http://127.0.0.1:8790/#pair=<code>`。这个链接只能用一次，10 分钟后过期。
+- 运行 `relayhub pair` 会打印一个新链接（需要能读到令牌：`RELAYHUB_MANAGEMENT_TOKEN`、`config.json` 里的 `management_token`，或 `<data-dir>/management.token`；非默认数据目录请加 `-data-dir` 或设置 `RELAYHUB_DATA_DIR`）。
+- 配对码放在 URL 的 `#` 片段里，浏览器不会把它发给服务器，也就不会进入访问日志。控制台兑换成功后会把它从地址栏和历史记录中去掉，令牌只保存在该来源的 localStorage 里。
+- 没有配对码时，控制台会显示一个登录框，可以粘贴配对链接、配对码，或 `management.token` 里的令牌。
+- macOS 桌面应用会自动把令牌交给内嵌网页；菜单里的“在浏览器中打开”会附带一个新的配对链接。
+- `relayhub mcp` 按同样的顺序自己查找令牌。CLI 同步写入 Claude Code 的 MCP 条目只包含 `RELAYHUB_DATA_DIR`，不包含令牌。
+- 脚本可以直接读 `<data-dir>/management.token`，然后在请求中带上 `Authorization: Bearer $(cat …/management.token)`。
+- 审计日志的操作者字段会附带令牌指纹（`token:` 加 SHA-256 前 8 位十六进制），不会记录令牌本身。
 
 ### 渠道请求头档案
 
