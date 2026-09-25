@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -56,20 +57,49 @@ func (s *Server) verifyScores(w http.ResponseWriter, r *http.Request) {
 	s.write(w, r, 200, map[string]any{"scores": scores})
 }
 
+// verifyProbe runs an active authenticity probe (AUDIT §5 B1) against a
+// channel: a canary and, for tool-capable models, a forced tool call, sent
+// through the channel's credential, egress and identity headers. model_id is
+// optional (default: the channel's default test model, then its most used
+// model). Without a wired prober it reports the passive score.
 func (s *Server) verifyProbe(w http.ResponseWriter, r *http.Request) {
 	if !s.methodAllowed(w, r, http.MethodPost) {
 		return
 	}
 	var in struct {
 		ChannelID string `json:"channel_id"`
+		ModelID   string `json:"model_id"`
 	}
 	_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&in)
-	score := verify.Score{ChannelID: in.ChannelID, Score: 100, Signals: []string{"passive_only"}}
-	if s.Verify != nil && in.ChannelID != "" {
-		score = s.Verify.Get(in.ChannelID)
-		score.Signals = append(append([]string{}, score.Signals...), "passive_only")
+	in.ChannelID, in.ModelID = strings.TrimSpace(in.ChannelID), strings.TrimSpace(in.ModelID)
+	if s.Prober == nil {
+		score := verify.Score{ChannelID: in.ChannelID, Score: 100, Passive: 100, Signals: []string{"passive_only"}}
+		if s.Verify != nil && in.ChannelID != "" {
+			score = s.Verify.Get(in.ChannelID)
+			score.Signals = append(append([]string{}, score.Signals...), "passive_only")
+		}
+		s.write(w, r, 200, map[string]any{"score": score})
+		return
 	}
-	s.write(w, r, 200, map[string]any{"score": score})
+	if in.ChannelID == "" {
+		s.fail(w, r, badRequest("validation_error", "channel_id is required"))
+		return
+	}
+	res, err := s.Prober(r.Context(), in.ChannelID, in.ModelID)
+	if err != nil {
+		if errors.Is(err, verify.ErrNoProbeTarget) {
+			s.fail(w, r, notFound(err.Error()))
+			return
+		}
+		s.fail(w, r, internal(err))
+		return
+	}
+	s.auditEvent(r.Context(), "verify_probe", r, map[string]string{"channel": in.ChannelID, "model": res.ModelID})
+	score := verify.Score{ChannelID: in.ChannelID, Score: 100, Passive: 100}
+	if s.Verify != nil {
+		score = s.Verify.Get(in.ChannelID)
+	}
+	s.write(w, r, 200, map[string]any{"result": res, "score": score})
 }
 
 func (s *Server) identityList(w http.ResponseWriter, r *http.Request) {
@@ -360,6 +390,12 @@ func (s *Server) WithControlPlane(v *verify.Registry, l *lab.Ring, sticky *affin
 	s.Lab = l
 	s.Sticky = sticky
 	s.Limiter = lim
+}
+
+// WithProber wires the active authenticity probe behind POST
+// /api/v1/verify/probe.
+func (s *Server) WithProber(p func(ctx context.Context, channelID, modelID string) (verify.ProbeResult, error)) {
+	s.Prober = p
 }
 
 // methodAllowed enforces the method contract on directly-registered extras

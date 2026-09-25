@@ -107,6 +107,10 @@ func run(args []string) error {
 		return err
 	}
 	config.ApplyEnv(&fileCfg)
+	probeEvery, err := fileCfg.ProbeInterval()
+	if err != nil {
+		return err
+	}
 	a, err := app.New(app.Config{
 		DataDir:        dataDir,
 		HTTPProxyAddr:  httpProxyAddr,
@@ -132,6 +136,8 @@ func run(args []string) error {
 			TelegramChatID:   fileCfg.Notify.TelegramChatID,
 			QuotaLowUSD:      fileCfg.Notify.QuotaLowUSD,
 		},
+		// Authenticity probes (AUDIT §5 B1): verify_probe_interval, default 12h.
+		VerifyProbeInterval: probeEvery,
 	})
 	if err != nil {
 		return err

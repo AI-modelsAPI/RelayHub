@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"relayhub/internal/buildinfo"
 )
@@ -37,6 +38,10 @@ type Config struct {
 	ManagementAuth string
 	// Notify configures outbound notification sinks (see internal/notify).
 	Notify NotifyConfig
+	// VerifyProbeInterval is how often authenticity probes run (AUDIT §5
+	// B1); 0 disables the periodic pass. The relayhub binary passes
+	// config's verify_probe_interval (default 12h).
+	VerifyProbeInterval time.Duration
 }
 
 // NotifyConfig mirrors config.NotifyConfig without importing the config

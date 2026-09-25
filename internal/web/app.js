@@ -201,7 +201,7 @@ function renderPulse() {
     : `<li><time>—</time><span>尚无请求流过网关</span><span></span></li>`;
   const trust = (state.scores || []).slice().sort((a, b) => (a.score || 0) - (b.score || 0)).slice(0, 5);
   $("#pulse-trust").innerHTML = trust.length
-    ? trust.map((c) => `<li><span>${esc(c.channel_id)}</span><span class="badge">${esc(c.score)}</span></li>`).join("")
+    ? trust.map((c) => `<li><span>${esc(c.channel_id)}</span><span class="badge${c.suspect ? " bad" : ""}">${esc(c.score)}</span></li>`).join("")
     : "<li><span>尚无信任分</span><span></span></li>";
   $("#topo-up").textContent = (counts.channels || 0) + " 上游";
 }
@@ -236,9 +236,75 @@ function inspectChannel(ch) {
       </dl>
       <h3>身份束</h3>
       <p class="lede">${esc((state.identity || []).find((b) => b.channel_id === ch.id)?.user_agent || "UA 未设")} · ${esc(ch.proxy_url || "直连")}</p>
-      <h3>信任</h3>
-      <p class="lede">${esc(JSON.stringify((state.scores || []).find((s) => s.channel_id === ch.id) || { score: 100 }))}</p>
+      <h3>真实度</h3>
+      ${trustHTML(scoreFor(ch.id))}
+      <div class="actions"><button class="ghost" id="ch-probe" type="button">立即探测</button><span class="probe-msg" id="ch-probe-msg"></span></div>
     </div>`;
+  $("#ch-probe")?.addEventListener("click", () => probeChannel(ch));
+}
+
+// Authenticity probes (AUDIT §5 B1): the backend sends a canary ("repeat
+// these words") and, for tool-capable models, a forced tool call through the
+// channel, then scores the reply. Every field below is server data: escape it.
+const CHECK_LABEL = { canary: "复述暗号", model: "model 字段", tools: "工具调用", fingerprint: "分词指纹", fingerprint_peers: "同模型对比" };
+const CHECK_MARK = { pass: "✓", fail: "✗", error: "?", skip: "–" };
+
+function scoreFor(channelID) {
+  return (state.scores || []).find((s) => s.channel_id === channelID);
+}
+
+function fmtTime(t) {
+  const d = new Date(t);
+  return isNaN(d.getTime()) ? "—" : d.toLocaleString("zh-CN", { hour12: false });
+}
+
+function probeHTML(p) {
+  const rows = (p.checks || [])
+    .map((c) => `<dt>${esc(CHECK_MARK[c.status] || c.status)} ${esc(CHECK_LABEL[c.name] || c.name)}</dt><dd>${esc(c.detail || "")}</dd>`)
+    .join("");
+  return `<p class="lede">${esc(p.model_id)} · ${esc(p.score)} 分 · ${esc(fmtTime(p.checked_at))}</p><dl class="kv">${rows}</dl>`;
+}
+
+function trustHTML(s) {
+  s = s || { score: 100 };
+  const score = Number(s.score ?? 100);
+  const badge = s.suspect ? " bad" : score < 80 ? " warn" : "";
+  const head = `<dl class="kv">
+      <dt>综合分</dt><dd><span class="badge${badge}">${esc(score)}</span>${s.suspect ? " 已降权：路由优先使用其他渠道" : ""}</dd>
+      <dt>被动分</dt><dd>${esc(s.passive ?? score)}</dd>
+      <dt>信号</dt><dd>${esc((s.signals || []).join(", ") || "—")}</dd>
+    </dl>`;
+  const probes = (s.probes || []).map(probeHTML).join("");
+  const last = s.last_probe;
+  const lastNote =
+    last && !last.conclusive
+      ? `<p class="lede">最近一次探测（${esc(fmtTime(last.checked_at))}）没有得出结论：${esc((last.checks || [])[0]?.detail || "")}</p>`
+      : "";
+  const empty = `<p class="lede">尚未探测。探测会向该渠道发送 1–2 个极小的请求：让模型复述一串随机单词；声明支持工具的模型再加一次强制工具调用。</p>`;
+  return head + (probes || empty) + lastNote;
+}
+
+function renderTrustBar() {
+  const worst = (state.scores || []).reduce((m, s) => (m == null || Number(s.score) < m ? Number(s.score) : m), null);
+  $("#sb-trust").textContent = worst == null ? "trust —" : "trust min " + worst;
+}
+
+async function probeChannel(ch) {
+  const btn = $("#ch-probe");
+  const msg = $("#ch-probe-msg");
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = "探测中…";
+  try {
+    const r = await api("verify/probe", JSON_POST({ channel_id: ch.id }));
+    const sc = await api("verify/scores").catch(() => null);
+    state.scores = sc ? sc.scores || [] : [...(state.scores || []).filter((s) => s.channel_id !== ch.id), r.score];
+    renderTrustBar();
+    if (state.view === "pulse") renderPulse();
+    inspectChannel(ch);
+  } catch (e) {
+    if (msg) msg.textContent = / 404$/.test(e.message) ? "该渠道没有可探测的已启用模型" : "探测失败：" + e.message;
+    if (btn) btn.disabled = false;
+  }
 }
 
 function renderModels() {
@@ -460,8 +526,7 @@ async function boot() {
 
   const ratio = state.summary?.cache_hit_ratio;
   $("#sb-cache").textContent = state.online && ratio != null ? "cache " + Math.round(Number(ratio) * 100) + "%" : "cache —";
-  const worst = (state.scores || []).reduce((m, s) => (m == null || Number(s.score) < m ? Number(s.score) : m), null);
-  $("#sb-trust").textContent = worst == null ? "trust —" : "trust min " + worst;
+  renderTrustBar();
   $("#sb-gw").textContent = "gw " + (state.settings?.gateway_address || ":8789");
   $("#pulse-clock").textContent = state.online ? "更新 " + new Date().toLocaleTimeString("zh-CN", { hour12: false }) : "离线";
   render();

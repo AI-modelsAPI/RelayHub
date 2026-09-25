@@ -72,6 +72,14 @@ type Runtime struct {
 	// ManagementTokenSource says where the management token came from:
 	// "config", "off", or the path of <data-dir>/management.token.
 	ManagementTokenSource string
+	// Verify holds passive and probe-based authenticity scores; the router
+	// demotes channels it marks suspect.
+	Verify *verify.Registry
+
+	// Periodic authenticity probes (AUDIT §5 B1); probeEvery 0 disables.
+	probeEvery  time.Duration
+	probePass   func(context.Context)
+	probeCancel context.CancelFunc
 
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -402,22 +410,41 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	aimd := ratelimit.New()
 	runaway := guard.New()
 	apiServer.WithControlPlane(verifyReg, labRing, sticky, aimd)
+	// Channels that fail an authenticity probe yield to trusted ones.
+	res.Trust = verifyReg
 
 	// keyRotation drives round-robin selection across a channel's enabled keys.
 	var keyRotation atomic.Uint64
+	upstream := gateway.HTTPUpstream{
+		PickCredential: func(ctx context.Context, d router.Decision) (gateway.CredentialPick, error) {
+			token, keyID, err := resolveChannelCredential(ctx, repo, secStore, &keyRotation, d.Channel, d.PreferredKeyID)
+			return gateway.CredentialPick{Token: token, KeyID: keyID}, err
+		},
+		// Streaming responses must not be cut by a client timeout; the
+		// request context bounds the call instead.
+		ClientFor: egressSel.StreamingClientFor,
+	}
+	// Authenticity probes travel the exact path of client traffic: same
+	// credential rotation, channel egress and identity headers.
+	probes := &channelProber{
+		resolver: res,
+		prober:   gateway.Prober{Upstream: upstream},
+		verify:   verifyReg,
+		repo:     repo,
+		health:   healthReg,
+		notify:   notifier.Notify,
+		logf:     log.Printf,
+		spacing:  2 * time.Second,
+	}
+	apiServer.WithProber(probes.probe)
+	if cfg.VerifyProbeInterval > 0 {
+		log.Printf("relayhub: authenticity probes every %s", cfg.VerifyProbeInterval)
+	}
 	gwHandler := gateway.New(gateway.Config{
 		Resolver: res,
-		Upstream: gateway.HTTPUpstream{
-			PickCredential: func(ctx context.Context, d router.Decision) (gateway.CredentialPick, error) {
-				token, keyID, err := resolveChannelCredential(ctx, repo, secStore, &keyRotation, d.Channel, d.PreferredKeyID)
-				return gateway.CredentialPick{Token: token, KeyID: keyID}, err
-			},
-			// Streaming responses must not be cut by a client timeout; the
-			// request context bounds the call instead.
-			ClientFor: egressSel.StreamingClientFor,
-		},
-		Health: healthReg,
-		Auth:   localKeys,
+		Upstream: upstream,
+		Health:   healthReg,
+		Auth:     localKeys,
 		DisableKey: func(ctx context.Context, keyID string) {
 			k, err := repo.GetChannelKey(ctx, keyID)
 			if err != nil {
@@ -465,6 +492,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		// Source of the management credential, for the startup log.
 		ManagementTokenSource: mgmtTokenSource,
 		stopped:               make(chan struct{}),
+		Verify:                verifyReg,
+		probeEvery:            cfg.VerifyProbeInterval,
+		probePass:             probes.pass,
 	}
 
 	return rt, nil
@@ -630,6 +660,11 @@ func (r *Runtime) Start(ctx context.Context) error {
 	go func() { _ = r.HTTPProxy.Start(ctx) }()
 	go func() { _ = r.SOCKSProxy.Start(ctx) }()
 	go func() { _ = r.Scheduler.Start(ctx) }()
+	if r.probeEvery > 0 && r.probePass != nil {
+		probeCtx, cancel := context.WithCancel(ctx)
+		r.probeCancel = cancel
+		go runProbeLoop(probeCtx, r.probeEvery, probeInitialDelay, r.probePass)
+	}
 
 	apiSrv := &http.Server{
 		Handler:           r.APIServer.Handler(),
@@ -656,6 +691,9 @@ func (r *Runtime) Start(ctx context.Context) error {
 }
 
 func (r *Runtime) Shutdown(ctx context.Context) error {
+	if r.probeCancel != nil {
+		r.probeCancel()
+	}
 	_ = r.Scheduler.Stop(ctx)
 	if r.MgmtHTTP != nil {
 		_ = r.MgmtHTTP.Shutdown(ctx)

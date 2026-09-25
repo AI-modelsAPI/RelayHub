@@ -62,6 +62,7 @@ Channel.proxy_url  >  egress_proxy_url（config / 环境变量）  >  进程环�
 | `quota_exhausted` | 观测余额归零，路由已跳过该渠道 |
 | `quota_low` | 余额低于阈值 |
 | `channel_recovered` | 从熔断 / 额度耗尽 / 认证失效恢复为 healthy |
+| `authenticity_suspect` | 真实度探针判定渠道可疑（复述失败、换了模型、工具调用失效），路由已降权；只在由正常转为可疑时发送（见 §5） |
 | `test` | `POST /api/v1/notify/test` |
 
 同一 `(kind, channel)` 组合 5 分钟内只发一次；投递异步进行，失败写入日志且不影响主流程。
@@ -137,3 +138,44 @@ CDP 签到默认寻找 `#checkin-btn, .checkin-btn, button[data-action="checkin"
 - 手动同步和渠道的首次同步保持原有行为：上游列出的模型全部绑定并启用，多个中转站提供同一模型时照常负载均衡。
 - 已经上线的渠道在**后台定时同步**中新声明了某个模型，而这个模型已经由其他渠道提供（例如某个中转站突然开始列出 `gpt-4o`）时，绑定会被创建但保持**禁用**，同时发送 `models_held` 通知。确认可信后，在模型页手动启用即可；启用状态在之后的同步中会保留。
 - 每次同步最多接受 2000 个模型 ID。ID 最长 200 个字符，不能包含空白或控制字符。运维手工调整过的优先级、权重、启用状态和上游名映射不会被同步覆盖。
+
+## 5. 真实度探针（AUDIT §5 B1）
+
+中转站最常见的问题是「挂羊头卖狗肉」：名义上是 Opus，实际给的是便宜模型、缓存的固定回复，或者把工具调用悄悄丢掉。RelayHub 定期给每个渠道发极小的 canary 请求，给渠道打「真实度」分，并据此调整路由。
+
+**怎么测**：请求走的是和正常流量完全相同的路径（同一套 Key 轮换、渠道出口代理和身份请求头），中转站从传输层看不出这是探针。
+
+| 检查 | 做法 | 不通过时 |
+|---|---|---|
+| 复述暗号 | 让模型原样复述 4 个随机英文单词 | −60（`canary_failed`） |
+| `model` 字段 | 响应里的 `model` 与请求的模型比对家族、档位和版本；只是写法不同（带日期、`-latest`、厂商前缀、Bedrock ID）不算 | −40（`model_mismatch`）；写法不同只记 `model_renamed`，不扣分 |
+| 工具调用 | 模型声明支持工具时，再发一次强制工具调用 | −40（`tools_missing`） |
+| 分词指纹 | 固定形状的 canary，上报的 prompt token 数应当稳定：与本渠道第一次观测相比（漂移，常见于换了后端或注入了系统提示），以及与服务同一模型的其他渠道相比（离群，需要至少两个渠道意见一致） | 漂移 −25（`fingerprint_drift`），离群 −30（`fingerprint_outlier`） |
+
+- 探针分低于 **70** 即判为可疑：一次复述失败、换了模型或工具失效都够，单独的指纹异常不够。
+- 上游没给出可用的 2xx 回答（网络错误、4xx/5xx、HTML 等）时本次探测**不下结论**，既不洗白也不定罪；被截断的回答也不算复述失败。
+- 探针请求不计入健康度、用量和被动分，所以某个中转站拒绝探针不会连累正常流量。
+
+**对路由的影响**：可疑渠道在有其他可信渠道可选时被跳过，原因写进路由决策（`GET /api/v1/routes/explain` 可见，形如 `authenticity probe on <模型>: canary_failed (score 40)`）；所有候选都可疑时照常使用，**降权但不断供**。结论 48 小时内有效，过期后不再影响路由（仍会显示）。
+
+**频率与开销**：
+
+| 配置 | `config.json` | 环境变量 | 说明 |
+|---|---|---|---|
+| 探测间隔 | `verify_probe_interval` | `RELAYHUB_VERIFY_PROBE_INTERVAL` | Go 时长格式，默认 `12h`，最小 `10m`；`off` 或 `0` 关闭定期探测（手动探测仍可用）；非法值启动时报错 |
+
+- 每轮对每个「启用且参与路由、当前可用」的渠道探测一个模型：渠道的 `default_test_model`，否则最近请求最多的模型，否则第一个绑定的模型。渠道之间间隔 2 秒，启动 2 分钟后跑第一轮。
+- 每次探测 1–2 个请求，canary 的 `max_tokens` 为 64，工具探测为 256（OpenAI 推理模型改用 `max_completion_tokens` 2048）。
+- 分数只保存在内存里，重启后从下一轮探测重新建立（指纹基线也一样）。
+
+**手动探测**：控制台「渠道 → Inspector → 真实度 → 立即探测」，或：
+
+```bash
+TOKEN=$(cat "<data-dir>/management.token")
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel_id":"<渠道 ID>","model_id":"<可选，逻辑模型 ID 或上游模型名>"}' \
+  http://127.0.0.1:8790/api/v1/verify/probe
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/verify/scores
+```
+
+`verify/probe` 返回本次结论（`result`：每项检查的 pass/fail/error/skip 与说明）和渠道综合分（`score`：被动分与各模型最新探针分取较低者，`suspect` 表示正在降权）。渠道没有可探测的已启用模型时返回 404。

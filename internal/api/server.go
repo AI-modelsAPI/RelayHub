@@ -100,6 +100,9 @@ type Server struct {
 	Lab     *lab.Ring
 	Sticky  *affinity.Table
 	Limiter *ratelimit.Limiter
+	// Prober runs an authenticity probe against a channel (AUDIT §5 B1);
+	// nil keeps POST /api/v1/verify/probe on the passive score.
+	Prober func(ctx context.Context, channelID, modelID string) (verify.ProbeResult, error)
 }
 
 type peerPolicy struct {

@@ -35,6 +35,10 @@ const (
 	// KindModelsHeld: a background model sync found a channel newly
 	// claiming models other channels serve; the bindings start disabled.
 	KindModelsHeld Kind = "models_held"
+	// KindAuthenticitySuspect: an authenticity probe (AUDIT §5 B1) found a
+	// channel answering with another model, a canned reply or without tool
+	// support; routing now prefers other channels.
+	KindAuthenticitySuspect Kind = "authenticity_suspect"
 )
 
 type Severity string

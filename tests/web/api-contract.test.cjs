@@ -76,3 +76,13 @@ test("the console pairs through the URL fragment and an in-page gate (AUDIT 2026
   assert.match(html, /<form[^>]*id="auth-gate"/);
   assert.ok(isRegistered("/api/v1/auth/pair") && isRegistered("/api/v1/auth/pair-codes"));
 });
+
+test("the channel inspector runs and shows authenticity probes (AUDIT §5 B1)", () => {
+  // The inspector used to dump the passive score as raw JSON and had no way
+  // to trigger the active probe the backend implements.
+  assert.match(appJs, /api\("verify\/probe", JSON_POST\(\{ channel_id:/);
+  assert.doesNotMatch(appJs, /JSON\.stringify\(\(state\.scores/);
+  // Checks come from the server; they must be escaped like every other field.
+  assert.match(appJs, /function trustHTML\(/);
+  assert.match(appJs, /esc\(c\.detail/);
+});

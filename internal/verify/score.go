@@ -3,6 +3,7 @@ package verify
 import (
 	"strings"
 	"sync"
+	"time"
 
 	"relayhub/internal/domain"
 )
@@ -11,15 +12,54 @@ type Score struct {
 	ChannelID string   `json:"channel_id"`
 	Score     int      `json:"score"`
 	Signals   []string `json:"signals"`
+	// Passive is the score earned from live traffic alone.
+	Passive int `json:"passive"`
+	// Probes holds the latest conclusive authenticity probe per model.
+	Probes []ProbeResult `json:"probes,omitempty"`
+	// LastProbe is the most recent probe run, conclusive or not.
+	LastProbe *ProbeResult `json:"last_probe,omitempty"`
+	// Suspect is set while a fresh probe verdict demotes the channel.
+	Suspect bool `json:"suspect"`
 }
 
+// Registry keeps per-channel trust: a passive score derived from live
+// traffic and the verdicts of active authenticity probes (probe.go). Score
+// is the worse of the passive score and every fresh probe verdict.
 type Registry struct {
-	mu      sync.Mutex
-	passive map[string]Score
+	mu        sync.Mutex
+	passive   map[string]Score
+	probes    map[string]map[string]ProbeResult // channel -> model -> latest conclusive probe
+	lastProbe map[string]ProbeResult            // channel -> latest probe run
+	baselines map[string]int                    // channel|protocol|upstream model -> first prompt size
+	now       func() time.Time
 }
 
 func New() *Registry {
-	return &Registry{passive: map[string]Score{}}
+	r := &Registry{}
+	r.ensureLocked()
+	return r
+}
+
+func (r *Registry) ensureLocked() {
+	if r.passive == nil {
+		r.passive = map[string]Score{}
+	}
+	if r.probes == nil {
+		r.probes = map[string]map[string]ProbeResult{}
+	}
+	if r.lastProbe == nil {
+		r.lastProbe = map[string]ProbeResult{}
+	}
+	if r.baselines == nil {
+		r.baselines = map[string]int{}
+	}
+}
+
+func (r *Registry) clockLocked() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 func (r *Registry) Observe(rec domain.RequestRecord) Score {
@@ -28,6 +68,7 @@ func (r *Registry) Observe(rec domain.RequestRecord) Score {
 	}
 	s := Score{ChannelID: rec.ChannelID, Score: 100}
 	if rec.ChannelID == "" {
+		s.Passive = s.Score
 		return s
 	}
 	if rec.StatusCode >= 500 {
@@ -65,39 +106,81 @@ func (r *Registry) Observe(rec domain.RequestRecord) Score {
 		s.Score = 0
 	}
 	r.mu.Lock()
+	r.ensureLocked()
 	prev := r.passive[rec.ChannelID]
 	if prev.Score > 0 {
 		s.Score = (prev.Score*3 + s.Score) / 4
 		s.Signals = mergeSignals(prev.Signals, s.Signals)
 	}
+	s.Passive = s.Score
 	r.passive[rec.ChannelID] = s
 	r.mu.Unlock()
 	return s
 }
 
+// All returns every channel with a passive score or a probe, sorted by ID.
 func (r *Registry) All() []Score {
 	if r == nil {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]Score, 0, len(r.passive))
-	for _, s := range r.passive {
-		out = append(out, s)
+	ids := map[string]bool{}
+	for id := range r.passive {
+		ids[id] = true
+	}
+	for id := range r.probes {
+		ids[id] = true
+	}
+	for id := range r.lastProbe {
+		ids[id] = true
+	}
+	out := make([]Score, 0, len(ids))
+	for _, id := range sortedKeys(ids) {
+		out = append(out, r.scoreLocked(id))
 	}
 	return out
 }
 
 func (r *Registry) Get(channelID string) Score {
 	if r == nil {
-		return Score{ChannelID: channelID, Score: 100}
+		return Score{ChannelID: channelID, Score: 100, Passive: 100}
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if s, ok := r.passive[channelID]; ok {
-		return s
+	return r.scoreLocked(channelID)
+}
+
+// scoreLocked combines the passive score with the fresh probe verdicts.
+// Stale verdicts stay listed in Probes but no longer count.
+func (r *Registry) scoreLocked(channelID string) Score {
+	s, ok := r.passive[channelID]
+	if !ok {
+		s = Score{ChannelID: channelID, Score: 100}
 	}
-	return Score{ChannelID: channelID, Score: 100}
+	s.Passive = s.Score
+	s.Signals = append([]string(nil), s.Signals...)
+	now := r.clockLocked()
+	byModel := r.probes[channelID]
+	for _, id := range sortedKeys(byModel) {
+		p := byModel[id]
+		s.Probes = append(s.Probes, p)
+		if now.Sub(p.CheckedAt) > ProbeTTL {
+			continue
+		}
+		if p.Score < s.Score {
+			s.Score = p.Score
+		}
+		if p.Score < SuspectBelow {
+			s.Suspect = true
+		}
+		// Probe findings first: mergeSignals caps the list.
+		s.Signals = mergeSignals(p.Signals, s.Signals)
+	}
+	if lp, ok := r.lastProbe[channelID]; ok {
+		s.LastProbe = &lp
+	}
+	return s
 }
 
 func mergeSignals(a, b []string) []string {
