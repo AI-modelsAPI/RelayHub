@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"relayhub/internal/domain"
 	"relayhub/internal/health"
@@ -318,5 +319,124 @@ func TestStreamPassesThroughUnchangedAfterCommit(t *testing.T) {
 		if s := reg.Get("c"); len(up.channels) != 1 || s.WindowSuccess != 1 || s.WindowTotal != 1 {
 			t.Fatalf("%s: attempts=%v health=%+v", protocol, up.channels, s)
 		}
+	}
+}
+
+// A slow upstream is committed when the window closes: nothing it sent before
+// or after that point may be lost or reordered.
+func TestStreamCommitWindowExpiryReplaysEverything(t *testing.T) {
+	pr, pw := io.Pipe()
+	head := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"content\":[]}}\n\n"
+	tail := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	go func() {
+		_, _ = pw.Write([]byte(head))
+		time.Sleep(150 * time.Millisecond)
+		_, _ = pw.Write([]byte(tail))
+		_ = pw.Close()
+	}()
+	hdr := http.Header{}
+	hdr.Set("Content-Type", "text/event-stream")
+	res := resolverForTest()
+	res.ProviderModels[0].Protocol = "anthropic"
+	up := &channelUpstream{responses: []Response{{StatusCode: http.StatusOK, Header: hdr, Body: pr}}}
+	h := New(Config{Resolver: res, Upstream: up, StreamCommitWindow: 20 * time.Millisecond})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(anthropicStreamRequest)))
+	if w.Code != http.StatusOK || w.Body.String() != head+tail || len(up.channels) != 1 {
+		t.Fatalf("status=%d attempts=%v body=%q", w.Code, up.channels, w.Body.String())
+	}
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// A client that goes away during the window says nothing about the upstream.
+func TestProbeStreamClientCancelIsNoVerdict(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, failure, _ := probeStream(ctx, io.NopCloser(errReader{context.Canceled}), time.Second)
+	if failure != nil {
+		t.Fatalf("client cancellation must not be blamed on the upstream: %+v", failure)
+	}
+}
+
+func TestClassifyStreamHead(t *testing.T) {
+	const wait, commit, fail = "wait", "commit", "fail"
+	cases := []struct {
+		head string
+		done bool
+		want string
+	}{
+		{head: "", want: wait},
+		{head: ": keep-alive\n\n", want: wait},
+		{head: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n", want: wait},
+		{head: "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n", want: commit},
+		{head: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n", want: commit},
+		{head: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n", want: commit},
+		{head: "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n", want: commit},
+		{head: "data: {\"choices\":[],\"prompt_filter_results\":[]}\n\n", want: wait},
+		{head: "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}", want: wait},
+		{head: "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}", done: true, want: commit},
+		{head: "data:{\"error\":{\"message\":\"no space after the colon\"}}\n\n", want: fail},
+		{head: "data: {\"choices\":[],\"error\":null}\n\n", want: wait},
+		{head: "event: ping\ndata: {\"type\":\"ping\"}\n\n", want: wait},
+		{head: "event: content_block_start\ndata: {\"type\":\"content_block_start\"}\n\n", want: commit},
+		{head: "event: response.created\ndata: {\"type\":\"response.created\"}\n\n", want: wait},
+		{head: "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n", want: commit},
+		{head: "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\n", want: fail},
+		{head: "event: error\ndata: {\"message\":\"boom\"}\n\n", want: fail},
+		{head: "data: {\"id\":\"x\"}\n\n", want: commit},
+		{head: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}]}}]}\n\n", want: commit},
+		{head: "data: [1,2]\n\n", want: commit},
+		{head: "data: not json\n\n", want: fail},
+		{head: "data: [DONE]\n\n", want: fail},
+		{head: "<html>", want: fail},
+		{head: "\ufeff\n<!doctype html>", want: fail},
+		{head: "{\"error\":{\"message\":\"quota\"}", want: wait},
+		{head: "{\"error\":{\"message\":\"quota\"}}", done: true, want: fail},
+		{head: "{\"id\":\"x\",\"choices\":[]}", done: true, want: fail},
+		{head: "\n\n", done: true, want: fail},
+	}
+	for _, tc := range cases {
+		gotCommit, failure := classifyStreamHead([]byte(tc.head), tc.done, nil)
+		got := wait
+		if gotCommit {
+			got = commit
+		}
+		if failure != nil {
+			got = fail
+		}
+		if got != tc.want || (gotCommit && failure != nil) {
+			t.Errorf("classifyStreamHead(%q, done=%v) = %s (failure %+v), want %s", tc.head, tc.done, got, failure, tc.want)
+		}
+	}
+}
+
+func TestPrecommitErrorStatus(t *testing.T) {
+	cases := map[string]int{
+		"overloaded_error":        529,
+		"rate_limit_exceeded":     429,
+		"insufficient_quota":      429,
+		"invalid_request_error":   400,
+		"context_length_exceeded": 400,
+		"authentication_error":    401,
+		"invalid_api_key":         401,
+		"permission_error":        403,
+		"model_not_found":         404,
+		"request_too_large":       413,
+		"server_error":            502,
+		"":                        502,
+	}
+	for errType, want := range cases {
+		if got := errorStatus(errType, nil); got != want {
+			t.Errorf("errorStatus(%q) = %d, want %d", errType, got, want)
+		}
+	}
+	if got := errorStatus("server_error", map[string]any{"code": float64(503)}); got != 503 {
+		t.Errorf("a numeric upstream code must win, got %d", got)
+	}
+	if got := errorStatus("new_api_error", map[string]any{"code": "insufficient_user_quota"}); got != 429 {
+		t.Errorf("a string code must be considered too, got %d", got)
 	}
 }
