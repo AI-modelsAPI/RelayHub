@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -75,8 +76,30 @@ type Config struct {
 // DefaultVerifyProbeInterval applies when verify_probe_interval is unset.
 const DefaultVerifyProbeInterval = 12 * time.Hour
 
-// ProbeInterval parses VerifyProbeInterval. Not implemented yet.
-func (c Config) ProbeInterval() (time.Duration, error) { return 0, nil }
+// minVerifyProbeInterval keeps probes from hammering relays.
+const minVerifyProbeInterval = 10 * time.Minute
+
+// ProbeInterval parses VerifyProbeInterval: empty means the default, "off"
+// or "0" disables periodic probes, anything else must be a Go duration of at
+// least 10m. Invalid values are an error so a typo fails startup instead of
+// silently changing the schedule.
+func (c Config) ProbeInterval() (time.Duration, error) {
+	v := strings.ToLower(strings.TrimSpace(c.VerifyProbeInterval))
+	switch v {
+	case "":
+		return DefaultVerifyProbeInterval, nil
+	case "0", "off", "false", "disabled":
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid verify_probe_interval %q: %v", c.VerifyProbeInterval, err)
+	}
+	if d < minVerifyProbeInterval {
+		return 0, fmt.Errorf("verify_probe_interval %q is below the %s minimum (use \"off\" to disable)", c.VerifyProbeInterval, minVerifyProbeInterval)
+	}
+	return d, nil
+}
 
 // NotifyConfig holds notification sinks. Values are non-secret endpoints or
 // bot tokens the user chose to put in the config file; the file lives in the
@@ -110,6 +133,7 @@ func ApplyEnv(cfg *Config) {
 	set(&cfg.Notify.BarkURL, "RELAYHUB_NOTIFY_BARK_URL")
 	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
 	set(&cfg.Notify.TelegramChatID, "RELAYHUB_NOTIFY_TELEGRAM_CHAT_ID")
+	set(&cfg.VerifyProbeInterval, "RELAYHUB_VERIFY_PROBE_INTERVAL")
 	if v, ok := os.LookupEnv("RELAYHUB_NOTIFY_QUOTA_LOW_USD"); ok && v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			cfg.Notify.QuotaLowUSD = f
@@ -287,5 +311,8 @@ func merge(dst *Config, src Config) {
 	}
 	if src.Notify.QuotaLowUSD != 0 {
 		dst.Notify.QuotaLowUSD = src.Notify.QuotaLowUSD
+	}
+	if src.VerifyProbeInterval != "" {
+		dst.VerifyProbeInterval = src.VerifyProbeInterval
 	}
 }

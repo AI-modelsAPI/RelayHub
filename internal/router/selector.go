@@ -144,6 +144,7 @@ func (r Resolver) snapshot() Resolver {
 			FixedChannel:   r.FixedChannel,
 			Rand:           r.Rand,
 			Sticky:         r.Sticky,
+			Trust:          r.Trust,
 		}
 	}
 	return Resolver{
@@ -159,6 +160,7 @@ func (r Resolver) snapshot() Resolver {
 		FixedChannel:   r.FixedChannel,
 		Rand:           r.Rand,
 		Sticky:         r.Sticky,
+		Trust:          r.Trust,
 	}
 }
 
@@ -293,6 +295,9 @@ func (r Resolver) resolve(ctx context.Context, req Request, excluded map[string]
 	if len(candidates) == 0 {
 		return d, fmt.Errorf("%w: %s", ErrNoCandidates, exclusionSummary(d.Excluded))
 	}
+	// Channels that failed an authenticity probe yield to trusted ones
+	// before the strategy and session affinity pick (AUDIT §5 B1).
+	candidates = preferTrusted(candidates, r.Trust, &d)
 	chosen := selectCandidate(candidates, d.Strategy, r.FixedChannel, r.Health, r.Rand, req.Source)
 	if req.SessionKey != "" && r.Sticky != nil {
 		if chID, _, ok := r.Sticky.Lookup(req.SessionKey); ok {

@@ -205,6 +205,9 @@ func TestProbeReasoningModelsGetATokenBudget(t *testing.T) {
 		response(200, `{"model":"o3","choices":[{"message":{"content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":30}}`),
 	}}
 	o := Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("openai-chat", "o3", domain.Model{ID: "o3", ReasoningSupport: true}))
+	if len(up.requests) != 1 {
+		t.Fatalf("expected one canary request, got %d", len(up.requests))
+	}
 	body := decodeProbeBody(t, up.requests[0])
 	if body["max_tokens"] != nil || body["max_completion_tokens"] == nil {
 		t.Fatalf("OpenAI reasoning models reject max_tokens: %v", body)
@@ -221,6 +224,9 @@ func TestProbeProtocolSelection(t *testing.T) {
 	// No explicit protocol: Claude models are probed over Messages.
 	up := &probeScriptedUpstream{replies: []Response{response(200, `{"model":"claude-opus-4-1","content":[{"type":"text","text":"apple river stone cloud"}],"stop_reason":"end_turn","usage":{"input_tokens":20}}`)}}
 	o := Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("", "claude-opus-4-1", domain.Model{ID: "opus"}))
+	if len(up.requests) != 1 {
+		t.Fatalf("expected one canary request, got %d", len(up.requests))
+	}
 	if o.Protocol != "anthropic-messages" || up.requests[0].Path != "/v1/messages" || !o.CanaryEchoed {
 		t.Fatalf("implicit protocol: %+v", o)
 	}
