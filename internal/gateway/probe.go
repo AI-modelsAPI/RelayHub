@@ -48,6 +48,19 @@ const (
 	probeReasoningTokens = 2048
 )
 
+// LivenessResult is the outcome of one cheap liveness request.
+type LivenessResult struct {
+	OK      bool
+	Status  int
+	Latency time.Duration
+	Error   string
+}
+
+// ProbeLiveness asks a channel for a single token. Not implemented yet.
+func (p Prober) ProbeLiveness(ctx context.Context, d router.Decision) LivenessResult {
+	return LivenessResult{}
+}
+
 // probeWords are common English words that tokenize as single tokens in the
 // major tokenizers, so every code has the same prompt size (the prompt-token
 // fingerprint depends on it) while 64^4 codes stay unguessable.

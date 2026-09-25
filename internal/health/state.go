@@ -58,6 +58,9 @@ type State struct {
 	Reason           string
 	CircuitThreshold int
 	ProbeInFlight    bool
+	// ProbeStartedAt is when a half-open probe was admitted; a wedged probe
+	// stops holding the channel out after probeStaleAfter.
+	ProbeStartedAt   time.Time
 	ConsecutiveTrips int
 	LastFailureAt    time.Time
 	LastSuccessAt    time.Time
@@ -458,6 +461,21 @@ func backoff(trips int) time.Duration {
 	}
 	return d
 }
+
+// SetRecoveryProbe records that a cheap-probe loop is running: while it is on,
+// a tripped channel stays out of routing until a probe closes the breaker.
+// Not implemented yet.
+func (r *Registry) SetRecoveryProbe(on bool) {}
+
+// RecoveryProbeEnabled reports whether the breaker gate is on.
+func (r *Registry) RecoveryProbeEnabled() bool { return false }
+
+// ProbeCandidates lists the channels a recovery probe should try. Not
+// implemented yet.
+func (r *Registry) ProbeCandidates(now time.Time) []string { return nil }
+
+// probeStaleAfter is how long a half-open probe may hold a channel out.
+const probeStaleAfter = 2 * time.Minute
 
 func (r *Registry) AllowProbe(id string, now time.Time) bool {
 	r.mu.Lock()

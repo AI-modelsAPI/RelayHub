@@ -81,6 +81,11 @@ type Runtime struct {
 	probePass   func(context.Context)
 	probeCancel context.CancelFunc
 
+	// Cheap recovery probes for tripped channels (AUDIT §5 B5);
+	// healthProbeEvery 0 disables the loop and the breaker gate.
+	healthProbeEvery time.Duration
+	healthProbePass  func(context.Context)
+
 	stopCh  chan struct{}
 	stopped chan struct{}
 	mu      sync.Mutex
@@ -495,6 +500,8 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		Verify:                verifyReg,
 		probeEvery:            cfg.VerifyProbeInterval,
 		probePass:             probes.pass,
+		healthProbeEvery:      cfg.HealthProbeInterval,
+		healthProbePass:       probes.healthPass,
 	}
 
 	return rt, nil

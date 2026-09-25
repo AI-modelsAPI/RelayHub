@@ -43,6 +43,8 @@ type channelProber struct {
 	logf     func(string, ...any)
 	// spacing pauses between channels in a pass so probes never burst.
 	spacing time.Duration
+	// now is the clock (tests); nil means time.Now.
+	now func() time.Time
 }
 
 // probe runs one probe against channelID's binding of modelID (empty: the
@@ -102,6 +104,11 @@ func (p *channelProber) recentModels(ctx context.Context, channelID string) []st
 
 // pass probes every enabled, routable and currently available channel once,
 // one model each, sequentially.
+// healthPass probes every channel whose breaker tripped and whose cooldown has
+// elapsed: the channel is held out of routing until one cheap request proves it
+// works (AUDIT §5 B5). Not implemented yet.
+func (p *channelProber) healthPass(ctx context.Context) {}
+
 func (p *channelProber) pass(ctx context.Context) {
 	if p.repo == nil {
 		return

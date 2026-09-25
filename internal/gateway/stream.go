@@ -14,6 +14,11 @@ import (
 	"relayhub/internal/router"
 )
 
+// errStreamErrorEvent is returned when the upstream itself reported an error
+// inside an already committed stream. The bytes reached the client verbatim;
+// the gateway uses the error to penalise the attempt (AUDIT §5 B5).
+var errStreamErrorEvent = errors.New("upstream reported an error mid-stream")
+
 type streamMeta struct {
 	InputTokens      int
 	OutputTokens     int
@@ -22,6 +27,9 @@ type streamMeta struct {
 	TTFTMS           int
 	FinishReason     string
 	UpstreamModel    string
+	// ErrorEvent holds the upstream's own error message when the stream
+	// carried an error payload or event.
+	ErrorEvent string
 	// Truncated is set when the upstream stream ended without any explicit
 	// finish/stop reason, so telemetry can flag "EOF instead of completion"
 	// instead of disguising truncation as a normal end_turn (AUDIT RH-12).

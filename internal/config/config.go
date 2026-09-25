@@ -71,7 +71,31 @@ type Config struct {
 	// or "0" to disable, empty for DefaultVerifyProbeInterval.
 	// Env: RELAYHUB_VERIFY_PROBE_INTERVAL.
 	VerifyProbeInterval string `json:"verify_probe_interval"`
+	// HealthProbeInterval is how often a tripped channel is probed back with
+	// one cheap request (AUDIT §5 B5): a Go duration of at least 100ms, "off"
+	// or "0" to disable, empty for DefaultHealthProbeInterval.
+	// Env: RELAYHUB_HEALTH_PROBE_INTERVAL.
+	HealthProbeInterval string `json:"health_probe_interval"`
+	// StreamCommitWindow is how long a 2xx stream may be held back waiting
+	// for its first output event before it is committed to the client (AUDIT
+	// §5 B4): a Go duration of at least 100ms, "off" or "0" to forward the
+	// upstream bytes immediately, empty for DefaultStreamCommitWindow.
+	// Env: RELAYHUB_STREAM_COMMIT_WINDOW.
+	StreamCommitWindow string `json:"stream_commit_window"`
 }
+
+// DefaultHealthProbeInterval applies when health_probe_interval is unset.
+const DefaultHealthProbeInterval = 30 * time.Second
+
+// DefaultStreamCommitWindow applies when stream_commit_window is unset.
+const DefaultStreamCommitWindow = 10 * time.Second
+
+// HealthProbe parses HealthProbeInterval. Not implemented yet.
+func (c Config) HealthProbe() (time.Duration, error) { return 0, nil }
+
+// StreamCommit parses StreamCommitWindow; disabled means "commit immediately".
+// Not implemented yet.
+func (c Config) StreamCommit() (window time.Duration, disabled bool, err error) { return 0, false, nil }
 
 // DefaultVerifyProbeInterval applies when verify_probe_interval is unset.
 const DefaultVerifyProbeInterval = 12 * time.Hour

@@ -42,6 +42,15 @@ type Config struct {
 	// B1); 0 disables the periodic pass. The relayhub binary passes
 	// config's verify_probe_interval (default 12h).
 	VerifyProbeInterval time.Duration
+	// HealthProbeInterval is how often tripped channels are probed back with
+	// one cheap request (AUDIT §5 B5); 0 keeps the pre-B5 behaviour where a
+	// cooled-down channel receives real traffic again.
+	HealthProbeInterval time.Duration
+	// StreamCommitWindow is how long a 2xx stream may be held before its
+	// first output event (AUDIT §5 B4); 0 means the gateway default (10s).
+	// DisableStreamCommit forwards upstream bytes immediately instead.
+	StreamCommitWindow  time.Duration
+	DisableStreamCommit bool
 }
 
 // NotifyConfig mirrors config.NotifyConfig without importing the config

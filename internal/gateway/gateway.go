@@ -212,6 +212,9 @@ type Config struct {
 	// for its first output event, so an upstream that fails before producing
 	// output can still fail over (AUDIT 2026-09-24 §5 B4). Zero means 10s.
 	StreamCommitWindow time.Duration
+	// DisableStreamCommit forwards upstream bytes immediately, the pre-B4
+	// behaviour: faster to first byte, no failover once a stream starts.
+	DisableStreamCommit bool
 }
 
 type Handler struct {
