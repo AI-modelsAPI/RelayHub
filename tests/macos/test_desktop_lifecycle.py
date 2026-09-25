@@ -62,6 +62,23 @@ def read_token(data_dir, timeout=10.0):
     return None, None
 
 
+def wait_healthy(port, timeout=15.0):
+    """Wait until the core answers /healthz. The shell records the core's PID
+    as soon as it launches it, before the core has bound its port, so a
+    request right after read_token() can race the listener (seen on CI as
+    "Connection refused")."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, ConnectionError, OSError):
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def spawn(port, data_dir, home):
     env = dict(os.environ, HOME=home, RELAYHUB_NO_ALERT_MODAL="1")
     return subprocess.Popen(
@@ -106,6 +123,7 @@ class DesktopLifecycleTests(unittest.TestCase):
                 self.assertEqual(int(ps_ppid), proc.pid,
                                  f"Core PPID {ps_ppid} does not match Shell PID {proc.pid}")
 
+                self.assertTrue(wait_healthy(port), "Core never became healthy")
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2) as r:
                     self.assertEqual(r.status, 200)
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
