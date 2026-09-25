@@ -90,12 +90,51 @@ const DefaultHealthProbeInterval = 30 * time.Second
 // DefaultStreamCommitWindow applies when stream_commit_window is unset.
 const DefaultStreamCommitWindow = 10 * time.Second
 
-// HealthProbe parses HealthProbeInterval. Not implemented yet.
-func (c Config) HealthProbe() (time.Duration, error) { return 0, nil }
+// HealthProbe parses HealthProbeInterval; 0 means "keep the pre-B5 breaker
+// behaviour", empty means DefaultHealthProbeInterval.
+func (c Config) HealthProbe() (time.Duration, error) {
+	v := strings.ToLower(strings.TrimSpace(c.HealthProbeInterval))
+	switch v {
+	case "":
+		return DefaultHealthProbeInterval, nil
+	case "0", "off", "false", "disabled":
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid health_probe_interval %q: %v", c.HealthProbeInterval, err)
+	}
+	if d < minHealthProbeInterval {
+		return 0, fmt.Errorf("health_probe_interval %q is below the %s minimum (use \"off\" to disable)", c.HealthProbeInterval, minHealthProbeInterval)
+	}
+	return d, nil
+}
 
-// StreamCommit parses StreamCommitWindow; disabled means "commit immediately".
-// Not implemented yet.
-func (c Config) StreamCommit() (window time.Duration, disabled bool, err error) { return 0, false, nil }
+// StreamCommit parses StreamCommitWindow; disabled means the upstream's first
+// byte is forwarded immediately (no failover after a stream starts).
+func (c Config) StreamCommit() (window time.Duration, disabled bool, err error) {
+	v := strings.ToLower(strings.TrimSpace(c.StreamCommitWindow))
+	switch v {
+	case "":
+		return DefaultStreamCommitWindow, false, nil
+	case "0", "off", "false", "disabled":
+		return 0, true, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid stream_commit_window %q: %v", c.StreamCommitWindow, err)
+	}
+	if d < minStreamCommitWindow {
+		return 0, false, fmt.Errorf("stream_commit_window %q is below the %s minimum (use \"off\" to disable)", c.StreamCommitWindow, minStreamCommitWindow)
+	}
+	return d, false, nil
+}
+
+// Minimums keep a typo from disabling either safety feature by accident.
+const (
+	minHealthProbeInterval = 100 * time.Millisecond
+	minStreamCommitWindow  = 100 * time.Millisecond
+)
 
 // DefaultVerifyProbeInterval applies when verify_probe_interval is unset.
 const DefaultVerifyProbeInterval = 12 * time.Hour
@@ -158,6 +197,8 @@ func ApplyEnv(cfg *Config) {
 	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
 	set(&cfg.Notify.TelegramChatID, "RELAYHUB_NOTIFY_TELEGRAM_CHAT_ID")
 	set(&cfg.VerifyProbeInterval, "RELAYHUB_VERIFY_PROBE_INTERVAL")
+	set(&cfg.HealthProbeInterval, "RELAYHUB_HEALTH_PROBE_INTERVAL")
+	set(&cfg.StreamCommitWindow, "RELAYHUB_STREAM_COMMIT_WINDOW")
 	if v, ok := os.LookupEnv("RELAYHUB_NOTIFY_QUOTA_LOW_USD"); ok && v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			cfg.Notify.QuotaLowUSD = f
@@ -338,5 +379,11 @@ func merge(dst *Config, src Config) {
 	}
 	if src.VerifyProbeInterval != "" {
 		dst.VerifyProbeInterval = src.VerifyProbeInterval
+	}
+	if src.HealthProbeInterval != "" {
+		dst.HealthProbeInterval = src.HealthProbeInterval
+	}
+	if src.StreamCommitWindow != "" {
+		dst.StreamCommitWindow = src.StreamCommitWindow
 	}
 }

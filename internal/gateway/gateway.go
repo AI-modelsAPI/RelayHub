@@ -509,6 +509,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rec := recordFor(r, protocol, decision, nil, http.StatusOK, h.cfg.Now())
 			rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
 			rec.ErrorClass = "stream_interrupted"
+			// The upstream reported the failure inside its own already
+			// committed stream. The client got the error; the record says so
+			// instead of looking like a normal (or merely truncated) answer
+			// (AUDIT §5 B5).
+			if errors.Is(err, errStreamErrorEvent) {
+				rec.ErrorClass = "upstream_error_event"
+			}
 			if h.cfg.Verify != nil {
 				h.cfg.Verify.Observe(rec)
 			}
@@ -805,7 +812,9 @@ func applyChannelHeaders(h http.Header, custom map[string]string) {
 	}
 }
 func retryableStatus(status int) bool {
-	return status == 401 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+	// 529 is Anthropic's (and several relays') "overloaded": failing over is
+	// exactly as useful as for a 503 (AUDIT §5 B4 follow-up).
+	return status == 401 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504 || status == 529
 }
 func retryableNetwork(err error) bool {
 	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)

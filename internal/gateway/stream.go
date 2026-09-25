@@ -87,6 +87,7 @@ func writeSSE(w http.ResponseWriter, body io.Reader, clientProto, upProto, logic
 func pipeSSE(body io.Reader, emit func(string) error, markFirst func(), meta *streamMeta) (streamMeta, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 4096), 4<<20)
+	sawError := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if bytes.HasPrefix(line, []byte("data: ")) {
@@ -94,6 +95,17 @@ func pipeSSE(body io.Reader, emit func(string) error, markFirst func(), meta *st
 			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
 				if !json.Valid(payload) {
 					return *meta, errors.New("malformed upstream SSE event")
+				}
+				var obj map[string]any
+				if json.Unmarshal(payload, &obj) == nil {
+					if errObj, ok := streamErrorPayload(obj); ok {
+						// Same protocol: the payload already is what the
+						// client understands, so it is forwarded verbatim and
+						// only the telemetry notices (the stream is committed,
+						// failing over is no longer possible).
+						sawError = true
+						meta.ErrorEvent = streamErrorText(errObj)
+					}
 				}
 				markFirst()
 				absorbUsage(payload, meta)
@@ -103,7 +115,13 @@ func pipeSSE(body io.Reader, emit func(string) error, markFirst func(), meta *st
 			return *meta, err
 		}
 	}
-	return *meta, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return *meta, err
+	}
+	if sawError {
+		return *meta, errStreamErrorEvent
+	}
+	return *meta, nil
 }
 
 func absorbUsage(payload []byte, meta *streamMeta) {
@@ -210,12 +228,26 @@ func convertOpenAIStreamToAnthropic(body io.Reader, model string, emit func(stri
 		if !json.Valid(payload) {
 			return *meta, errors.New("malformed upstream SSE event")
 		}
-		markFirst()
-		absorbUsage(payload, meta)
 		var chunk map[string]any
 		if json.Unmarshal(payload, &chunk) != nil {
 			continue
 		}
+		if errObj, ok := streamErrorPayload(chunk); ok {
+			// The upstream reported an error inside the stream. Before any
+			// output the attempt can still fail over; afterwards the client
+			// gets the error in its own protocol instead of a cheerful
+			// end_turn (AUDIT §5 B4/B5).
+			meta.ErrorEvent = streamErrorText(errObj)
+			if !started {
+				return *meta, errStreamErrorEvent
+			}
+			if err := emitAnthropic(emit, "error", map[string]any{"type": "error", "error": errObj}); err != nil {
+				return *meta, err
+			}
+			return *meta, errStreamErrorEvent
+		}
+		markFirst()
+		absorbUsage(payload, meta)
 		if id, ok := chunk["id"].(string); ok && id != "" {
 			msgID = id
 		}
@@ -340,6 +372,16 @@ func convertAnthropicStreamToOpenAI(body io.Reader, model string, emit func(stri
 		if typ == "" {
 			typ = eventName
 		}
+		if errObj, ok := streamErrorPayload(obj); ok {
+			// Mid-stream upstream error: hand the client the error it can
+			// read and let telemetry know the stream failed (AUDIT §5 B4/B5).
+			meta.ErrorEvent = streamErrorText(errObj)
+			b, _ := json.Marshal(map[string]any{"error": errObj})
+			if err := emit("data: " + string(b) + "\n\n"); err != nil {
+				return *meta, err
+			}
+			return *meta, errStreamErrorEvent
+		}
 		switch typ {
 		case "message_start":
 			if msg, ok := obj["message"].(map[string]any); ok {
@@ -401,6 +443,38 @@ func convertAnthropicStreamToOpenAI(body io.Reader, model string, emit func(stri
 		meta.Truncated = true
 	}
 	return *meta, scanner.Err()
+}
+
+// streamErrorPayload reports whether a parsed SSE payload is the upstream's
+// own error, returning the error object to relay.
+func streamErrorPayload(obj map[string]any) (map[string]any, bool) {
+	switch e := obj["error"].(type) {
+	case string:
+		if strings.TrimSpace(e) == "" {
+			return nil, false
+		}
+		return map[string]any{"message": e, "type": "upstream_error"}, true
+	case map[string]any:
+		if len(e) == 0 {
+			return nil, false
+		}
+		return e, true
+	}
+	if t, _ := obj["type"].(string); t == "error" {
+		return obj, true
+	}
+	return nil, false
+}
+
+// streamErrorText names an upstream error in one line for telemetry.
+func streamErrorText(errObj map[string]any) string {
+	if s, ok := errObj["message"].(string); ok && s != "" {
+		return s
+	}
+	if s, ok := errObj["type"].(string); ok && s != "" {
+		return s
+	}
+	return "upstream error"
 }
 
 func emitAnthropic(emit func(string) error, event string, obj any) error {

@@ -56,9 +56,40 @@ type LivenessResult struct {
 	Error   string
 }
 
-// ProbeLiveness asks a channel for a single token. Not implemented yet.
+// ProbeLiveness asks a channel for a single token (AUDIT §5 B5): the cheap
+// request that decides whether a tripped breaker may take real traffic again.
+// It never returns an error; the result carries the reason instead.
 func (p Prober) ProbeLiveness(ctx context.Context, d router.Decision) LivenessResult {
-	return LivenessResult{}
+	upstreamModel := d.ProviderModel.UpstreamModelName
+	if upstreamModel == "" {
+		upstreamModel = d.Model.ID
+	}
+	proto := probeProtocol(d, upstreamModel)
+	if proto == "" {
+		return LivenessResult{Error: "liveness probes do not support upstream protocol " + strconv.Quote(d.ProviderModel.Protocol)}
+	}
+	start := time.Now()
+	status, body, err := p.send(ctx, d, proto, probeLivenessBody(proto, upstreamModel, d.Model.ReasoningSupport))
+	res := LivenessResult{Status: status, Latency: time.Since(start)}
+	if _, parseErr := probeParse(proto, status, body, err); parseErr != nil {
+		res.Error = parseErr.Error()
+		return res
+	}
+	res.OK = true
+	return res
+}
+
+// probeLivenessBody asks for one output token and nothing else, so the check
+// costs a rounding error of what a real request would.
+func probeLivenessBody(proto, model string, reasoning bool) []byte {
+	body := map[string]any{
+		"model":    model,
+		"stream":   false,
+		"messages": []map[string]any{{"role": "user", "content": "Reply with the single letter P and nothing else."}},
+	}
+	probeSetTokenLimit(body, proto, 1, reasoning)
+	out, _ := json.Marshal(body)
+	return out
 }
 
 // probeWords are common English words that tokenize as single tokens in the

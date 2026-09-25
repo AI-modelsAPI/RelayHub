@@ -67,6 +67,12 @@ func (h *Handler) vetResponse(ctx context.Context, resp *Response, stream bool) 
 	if !stream || resp.Body == nil {
 		return nil, 0
 	}
+	if h.cfg.DisableStreamCommit {
+		// The operator chose latency over failover: nothing is held back, so
+		// the upstream's first byte commits the response (visible as a higher
+		// TTFT and no failover when the stream turns out broken).
+		return nil, 0
+	}
 	window := h.cfg.StreamCommitWindow
 	if window <= 0 {
 		window = defaultStreamCommitWindow
