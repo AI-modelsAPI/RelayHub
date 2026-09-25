@@ -57,6 +57,9 @@ type Resolver struct {
 	FixedChannel   string
 	Rand           RandomSource
 	Sticky         *affinity.Table
+	// Trust demotes channels whose authenticity probes failed (AUDIT §5
+	// B1); nil disables the check.
+	Trust TrustSource
 }
 
 type resolverState struct {

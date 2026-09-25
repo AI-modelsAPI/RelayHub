@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 const (
@@ -64,7 +65,18 @@ type Config struct {
 	// Notify configures outbound notifications (check-in failures, quota
 	// low, breaker open). All fields optional; env overrides see ApplyEnv.
 	Notify NotifyConfig `json:"notify"`
+	// VerifyProbeInterval is how often authenticity probes (AUDIT §5 B1)
+	// canary every routable channel: a Go duration of at least 10m, "off"
+	// or "0" to disable, empty for DefaultVerifyProbeInterval.
+	// Env: RELAYHUB_VERIFY_PROBE_INTERVAL.
+	VerifyProbeInterval string `json:"verify_probe_interval"`
 }
+
+// DefaultVerifyProbeInterval applies when verify_probe_interval is unset.
+const DefaultVerifyProbeInterval = 12 * time.Hour
+
+// ProbeInterval parses VerifyProbeInterval. Not implemented yet.
+func (c Config) ProbeInterval() (time.Duration, error) { return 0, nil }
 
 // NotifyConfig holds notification sinks. Values are non-secret endpoints or
 // bot tokens the user chose to put in the config file; the file lives in the

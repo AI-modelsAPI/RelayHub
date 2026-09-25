@@ -11,6 +11,14 @@ type Score struct {
 	ChannelID string   `json:"channel_id"`
 	Score     int      `json:"score"`
 	Signals   []string `json:"signals"`
+	// Passive is the score earned from live traffic alone.
+	Passive int `json:"passive"`
+	// Probes holds the latest conclusive authenticity probe per model.
+	Probes []ProbeResult `json:"probes,omitempty"`
+	// LastProbe is the most recent probe run, conclusive or not.
+	LastProbe *ProbeResult `json:"last_probe,omitempty"`
+	// Suspect is set while a fresh probe verdict demotes the channel.
+	Suspect bool `json:"suspect"`
 }
 
 type Registry struct {

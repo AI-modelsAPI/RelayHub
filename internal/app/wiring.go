@@ -72,6 +72,9 @@ type Runtime struct {
 	// ManagementTokenSource says where the management token came from:
 	// "config", "off", or the path of <data-dir>/management.token.
 	ManagementTokenSource string
+	// Verify holds passive and probe-based authenticity scores; the router
+	// demotes channels it marks suspect.
+	Verify *verify.Registry
 
 	stopCh  chan struct{}
 	stopped chan struct{}

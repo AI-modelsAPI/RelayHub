@@ -362,6 +362,12 @@ func (s *Server) WithControlPlane(v *verify.Registry, l *lab.Ring, sticky *affin
 	s.Limiter = lim
 }
 
+// WithProber wires the active authenticity probe behind POST
+// /api/v1/verify/probe.
+func (s *Server) WithProber(p func(ctx context.Context, channelID, modelID string) (verify.ProbeResult, error)) {
+	s.Prober = p
+}
+
 // methodAllowed enforces the method contract on directly-registered extras
 // endpoints (P0-1: previously the removed dispatcher performed these checks).
 func (s *Server) methodAllowed(w http.ResponseWriter, r *http.Request, methods ...string) bool {
