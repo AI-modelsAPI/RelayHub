@@ -85,3 +85,46 @@ func TestOpsOptionsFromFileAndEnv(t *testing.T) {
 		t.Fatalf("env health_probe_interval: %v %v", d, err)
 	}
 }
+
+func TestBillingReconcileIntervalOption(t *testing.T) {
+	for in, want := range map[string]time.Duration{
+		"":     DefaultBillingReconcileInterval,
+		"off":  0,
+		"0":    0,
+		" 1h ": time.Hour,
+		"30m":  30 * time.Minute,
+		"1m":   time.Minute,
+	} {
+		got, err := Config{BillingReconcileInterval: in}.BillingReconcile()
+		if err != nil || got != want {
+			t.Errorf("BillingReconcile(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	if DefaultBillingReconcileInterval != time.Hour {
+		t.Fatalf("the default reconciliation interval changed: %v", DefaultBillingReconcileInterval)
+	}
+	for _, bad := range []string{"soon", "-1m", "10s"} {
+		if _, err := (Config{BillingReconcileInterval: bad}).BillingReconcile(); err == nil {
+			t.Errorf("BillingReconcile(%q) accepted", bad)
+		}
+	}
+}
+
+func TestBillingReconcileFromFileAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ConfigFileName), []byte(`{"billing_reconcile_interval":"2h"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, err := c.BillingReconcile(); err != nil || d != 2*time.Hour {
+		t.Fatalf("config.json billing_reconcile_interval: %v %v", d, err)
+	}
+	t.Setenv("RELAYHUB_BILLING_RECONCILE_INTERVAL", "off")
+	ApplyEnv(&c)
+	if d, err := c.BillingReconcile(); err != nil || d != 0 {
+		t.Fatalf("env billing_reconcile_interval: %v %v", d, err)
+	}
+}
