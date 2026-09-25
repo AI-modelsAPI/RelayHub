@@ -215,7 +215,8 @@ func Reconcile(ledger Ledger, site Charges, base Baseline, p Params, now time.Ti
 		Truncated:       site.Truncated,
 		CreatedAt:       now,
 	}
-	rep.DeclaredUSD, pricedTokens := declaredCost(ledger)
+	declaredUSD, pricedTokens := declaredCost(ledger)
+	rep.DeclaredUSD = declaredUSD
 	if rep.Tokens > 0 && pricedTokens > 0 {
 		rep.DeclaredCoverage = float64(pricedTokens) / float64(rep.Tokens)
 		rep.DeclaredKnown = rep.DeclaredCoverage >= p.MinPricedCoverage
