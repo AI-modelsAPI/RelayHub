@@ -59,3 +59,30 @@ jobs:
 
       - name: Dependency vulnerability scan
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # The desktop shell, the keychain key store and the packaged app only exist
+  # on macOS; before this job they were exercised on tags only (release.yml).
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: true
+
+      # Real /usr/bin/security against a throwaway keychain file; the login
+      # keychain is never touched (AUDIT 2026-09-24 F18).
+      - name: Keychain master key store (real security)
+        env:
+          RELAYHUB_KEYCHAIN_TEST: '1'
+        run: go test ./internal/secrets -run Keychain -count=1 -v
+
+      # Compiles the Objective-C shell (desktop/macos/RelayHubApp/main.m).
+      - name: Build macOS bundles
+        run: ./scripts/build-macos.sh
+
+      # Process ownership, health, fail-closed port conflict, flock, crash
+      # watchdog, and the token-authenticated management API (AUDIT F4).
+      - name: Desktop lifecycle suite (native-arch bundle)
+        run: python3 -m unittest -v tests.macos.test_desktop_lifecycle

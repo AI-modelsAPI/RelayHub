@@ -164,3 +164,24 @@ func TestKeychainProviderLockedKeychainFailsClosed(t *testing.T) {
 		t.Fatal("a locked keychain must not silently create a new key")
 	}
 }
+
+func TestKeychainProviderExplicitKeychainFile(t *testing.T) {
+	f := newFake()
+	path := filepath.Join(t.TempDir(), "master.key")
+	if _, err := NewKeychainKeyProvider(context.Background(), KeychainOptions{FilePath: path, Run: f.run, Keychain: "/tmp/rh-test.keychain-db"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, argv := range f.argv {
+		if strings.Contains(argv, "find-generic-password") && !strings.HasSuffix(argv, " /tmp/rh-test.keychain-db") {
+			t.Fatalf("read does not target the keychain file: %q", argv)
+		}
+	}
+	if len(f.stdin) == 0 || !strings.HasSuffix(strings.TrimSpace(f.stdin[0]), " /tmp/rh-test.keychain-db") {
+		t.Fatalf("write does not target the keychain file: %q", f.stdin)
+	}
+	for _, bad := range []string{"/tmp/a b.keychain", "/tmp/a\"b", "/tmp/a\nadd-generic-password"} {
+		if _, err := NewKeychainKeyProvider(context.Background(), KeychainOptions{FilePath: path, Run: f.run, Keychain: bad}); err == nil {
+			t.Fatalf("keychain path %q must be rejected (it travels through security -i)", bad)
+		}
+	}
+}

@@ -31,6 +31,10 @@ type KeychainOptions struct {
 	SecurityPath string
 	// Run defaults to exec; tests inject a fake keychain.
 	Run CommandRunner
+	// Keychain is a keychain file to use instead of the default search list
+	// (the login keychain). Tests point it at a throwaway keychain; it must
+	// not contain whitespace or quotes, since it travels through security -i.
+	Keychain string
 }
 
 const (
@@ -52,6 +56,8 @@ type KeychainKeyProvider struct {
 	path    string
 	secPath string
 	run     CommandRunner
+	// keychain is an explicit keychain file; empty means the search list.
+	keychain string
 
 	mu  sync.Mutex
 	key []byte
@@ -64,11 +70,15 @@ func NewKeychainKeyProvider(ctx context.Context, opts KeychainOptions) (*Keychai
 	if opts.FilePath == "" || !filepath.IsAbs(path) {
 		return nil, errors.New("keychain key provider: master key path must be absolute")
 	}
+	if strings.ContainsAny(opts.Keychain, " \t\r\n\"'\\") {
+		return nil, errors.New("keychain key provider: keychain path must not contain whitespace, quotes or backslashes")
+	}
 	p := &KeychainKeyProvider{
-		account: keychainAccount(path),
-		path:    path,
-		secPath: opts.SecurityPath,
-		run:     opts.Run,
+		account:  keychainAccount(path),
+		path:     path,
+		secPath:  opts.SecurityPath,
+		run:      opts.Run,
+		keychain: opts.Keychain,
 	}
 	if p.secPath == "" {
 		p.secPath = "/usr/bin/security"
@@ -155,7 +165,11 @@ func (p *KeychainKeyProvider) Available(ctx context.Context) error {
 }
 
 func (p *KeychainKeyProvider) read(ctx context.Context) ([]byte, bool, error) {
-	out, code, err := p.run(ctx, nil, p.secPath, "find-generic-password", "-s", keychainService, "-a", p.account, "-w")
+	args := []string{"find-generic-password", "-s", keychainService, "-a", p.account, "-w"}
+	if p.keychain != "" {
+		args = append(args, p.keychain)
+	}
+	out, code, err := p.run(ctx, nil, p.secPath, args...)
 	if err != nil {
 		return nil, false, fmt.Errorf("keychain key provider: %w", err)
 	}
@@ -173,7 +187,11 @@ func (p *KeychainKeyProvider) read(ctx context.Context) ([]byte, bool, error) {
 }
 
 func (p *KeychainKeyProvider) write(ctx context.Context, key []byte) error {
-	cmd := fmt.Sprintf("add-generic-password -U -s %s -a %s -l RelayHub -w %s\n", keychainService, p.account, hex.EncodeToString(key))
+	cmd := fmt.Sprintf("add-generic-password -U -s %s -a %s -l RelayHub -w %s", keychainService, p.account, hex.EncodeToString(key))
+	if p.keychain != "" {
+		cmd += " " + p.keychain
+	}
+	cmd += "\n"
 	_, code, err := p.run(ctx, []byte(cmd), p.secPath, "-i")
 	if err != nil {
 		return fmt.Errorf("keychain key provider: %w", err)
