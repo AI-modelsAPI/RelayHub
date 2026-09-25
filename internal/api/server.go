@@ -346,6 +346,10 @@ func (s *Server) managementRoutes() http.Handler {
 	mux.HandleFunc("/api/v1/channels/sync-models", s.channelSyncModels)
 	mux.HandleFunc("/api/v1/channels/test", s.channelTest)
 	mux.HandleFunc("/api/v1/models/catalog", s.modelCatalog)
+	// The review queue and the sync undo are registered as exact patterns,
+	// which win over the "/api/v1/models/" and "/api/v1/channels/" prefixes.
+	mux.HandleFunc("/api/v1/models/pending", s.modelPending)
+	mux.HandleFunc("/api/v1/channels/sync-undo", s.modelSyncUndo)
 	mux.HandleFunc("/api/v1/models/batch", s.modelBatch)
 	mux.HandleFunc("/api/v1/channels/duplicate", s.channelDuplicate)
 	mux.HandleFunc("/api/v1/channels/batch", s.channelBatch)
@@ -757,7 +761,7 @@ func (s *Server) channelSyncModels(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, badRequest("validation_error", "channel_id is required"))
 		return
 	}
-	filtered, created, err := s.syncChannelModels(r.Context(), input.ChannelID, input.Pattern)
+	filtered, created, held, err := s.syncChannelModelsMode(r.Context(), input.ChannelID, input.Pattern, false)
 	if err != nil {
 		if errors.Is(err, errInvalidPattern) {
 			s.fail(w, r, badRequest("validation_error", err.Error()))
@@ -776,6 +780,8 @@ func (s *Server) channelSyncModels(w http.ResponseWriter, r *http.Request) {
 		"channel_id": input.ChannelID,
 		"models":     filtered,
 		"total":      len(filtered),
+		// Claims that need a decision before they can route (§5 B3).
+		"held": held,
 	})
 }
 
@@ -855,11 +861,13 @@ func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern s
 	// name mapping, protocol, transforms) survive a re-sync; the old
 	// delete-and-recreate reset them on every scheduled auto-sync.
 	previous := map[string]domain.ProviderModel{}
+	beforeImage := []domain.ProviderModel{}
 	servedElsewhere := map[string]bool{}
 	if all, lerr := s.Repo.ListProviderModels(ctx, ""); lerr == nil {
 		for _, pm := range all {
 			if pm.ChannelID == channelID {
 				previous[pm.ModelID] = pm
+				beforeImage = append(beforeImage, pm)
 			} else if pm.Enabled {
 				servedElsewhere[pm.ModelID] = true
 			}
@@ -871,9 +879,9 @@ func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern s
 	// to enable (AUDIT 2026-09-24 F6). Manual syncs and a channel's first
 	// sync keep enabling everything, so multi-relay load balancing still
 	// works out of the box.
-	heldForReview := func(model string) bool {
-		return background && len(previous) > 0 && servedElsewhere[model]
-	}
+	// Reserved vendor names are only claimed automatically by a channel the
+	// operator vouched for (AUDIT §5 B3); the rest wait for a decision.
+	holds := holdContext{Channel: ch, Previous: previous, ServedElsewhere: servedElsewhere, Background: background, Onboarded: len(previous) > 0}
 	// Bindings inherit the provider protocol instead of hard-coded openai-chat:
 	// anthropic upstreams previously got non-routable "openai-chat" bindings
 	// after auto-sync (AUDIT RH-15).
@@ -902,8 +910,9 @@ func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern s
 			Weight:            ch.Weight,
 			Enabled:           true,
 		}
-		if _, ok := previous[m]; !ok && heldForReview(m) {
+		if reason := holdReasonFor(m, holds); reason != "" {
 			pm.Enabled = false
+			pm.HeldReason = reason
 			held = append(held, m)
 		}
 		if old, ok := previous[m]; ok {
@@ -915,10 +924,31 @@ func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern s
 			pm.Priority = old.Priority
 			pm.Weight = old.Weight
 			pm.Enabled = old.Enabled
+			// A binding the operator has not decided on stays pending.
+			pm.HeldReason = old.HeldReason
 		}
 		plans = append(plans, bindingPlan{pm: pm})
 	}
 	created := 0
+	// Models this sync itself invents are recorded so a rejected claim or an
+	// undo can take the global name away again (§5 B3).
+	addedModels := []string{}
+	createModel := func(exec interface {
+		GetModel(context.Context, string) (domain.Model, error)
+		CreateModel(context.Context, domain.Model) error
+	}, model string, enabled bool) error {
+		if _, err := exec.GetModel(ctx, model); err == nil {
+			// Preserve operator-curated model metadata (capabilities etc.).
+			return nil
+		} else if !errors.Is(err, repository.ErrNotFound) {
+			return err
+		}
+		if err := exec.CreateModel(ctx, domain.Model{ID: model, DisplayName: model, Enabled: enabled}); err != nil {
+			return err
+		}
+		addedModels = append(addedModels, model)
+		return nil
+	}
 	apply := func(tx *repository.Tx) error {
 		// Delete+recreate inside one transaction: the old loop deleted bindings
 		// first and ignored Create errors, so any failure left the channel
@@ -928,10 +958,9 @@ func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern s
 		}
 		created = 0
 		for _, plan := range plans {
-			// Preserve operator-curated model metadata (capabilities etc.):
-			// CreateModel is skipped silently for duplicates, so existing rows
-			// keep their flags.
-			_ = tx.CreateModel(ctx, domain.Model{ID: plan.pm.ModelID, DisplayName: plan.pm.ModelID, Enabled: true})
+			if err := createModel(tx, plan.pm.ModelID, plan.pm.HeldReason == ""); err != nil {
+				return fmt.Errorf("model %s: %w", plan.pm.ModelID, err)
+			}
 			if err := tx.CreateProviderModel(ctx, plan.pm); err != nil {
 				return fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
 			}
@@ -953,12 +982,27 @@ func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern s
 		}
 		created = 0
 		for _, plan := range plans {
-			_ = s.Repo.CreateModel(ctx, domain.Model{ID: plan.pm.ModelID, DisplayName: plan.pm.ModelID, Enabled: true})
+			if err := createModel(s.Repo, plan.pm.ModelID, plan.pm.HeldReason == ""); err != nil {
+				return nil, 0, nil, fmt.Errorf("model %s: %w", plan.pm.ModelID, err)
+			}
 			if err := s.Repo.CreateProviderModel(ctx, plan.pm); err != nil {
 				return nil, 0, nil, fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
 			}
 			created++
 		}
+	}
+	// Keep the before-image so the operator can undo this sync in one step
+	// (AUDIT §5 B3). A failure to store it must not fail the sync itself.
+	source := "manual"
+	if background {
+		source = "background"
+	}
+	snap := domain.ModelSyncSnapshot{
+		ID: newSnapshotID(), ChannelID: channelID, Source: source, CreatedAt: snapshotCreatedAt(),
+		Bindings: beforeImage, AddedModels: addedModels, Held: held,
+	}
+	if err := s.Repo.CreateModelSyncSnapshot(ctx, snap); err != nil {
+		log.Printf("relayhub: model sync: store snapshot for channel %s: %v", channelID, err)
 	}
 	// Refresh the routing snapshot for BOTH manual sync and scheduler-triggered
 	// auto-sync: previously only the HTTP handler refreshed the resolver, so
@@ -2878,6 +2922,12 @@ func validateRoute(v domain.Route) error {
 	return nil
 }
 func mapRepoError(err error, kind string) error {
+	// An error that already carries an HTTP fault (validation, conflict,
+	// not-pending, …) keeps its status instead of being flattened into 500.
+	var f fault
+	if errors.As(err, &f) {
+		return err
+	}
 	if errors.Is(err, repository.ErrNotFound) {
 		return notFound(kind + " not found")
 	}
