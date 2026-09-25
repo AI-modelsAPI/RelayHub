@@ -79,7 +79,7 @@ jobs:
         run: |
           set -o pipefail
           go test ./internal/secrets -run Keychain -count=1 -v 2>&1 | tee keychain.log
-          grep -E '^(--- |ok|FAIL)' keychain.log > keychain-summary.log || true
+          grep -E '^(--- |ok|FAIL)|keychain_darwin_test' keychain.log > keychain-summary.log || true
           python3 scripts/ci-annotate.py notice keychain keychain-summary.log
 
       # Compiles the Objective-C shell (desktop/macos/RelayHubApp/main.m).

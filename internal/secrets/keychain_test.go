@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeKeychain emulates the parts of security(1) the provider uses.
@@ -183,5 +184,23 @@ func TestKeychainProviderExplicitKeychainFile(t *testing.T) {
 		if _, err := NewKeychainKeyProvider(context.Background(), KeychainOptions{FilePath: path, Run: f.run, Keychain: bad}); err == nil {
 			t.Fatalf("keychain path %q must be rejected (it travels through security -i)", bad)
 		}
+	}
+}
+
+// A locked keychain makes security(1) wait for the unlock dialog; startup
+// must give up with a clear error instead of hanging (seen on a real macOS
+// runner, where the call only ended when the test's deadline killed it).
+func TestKeychainProviderBoundsSecurityCalls(t *testing.T) {
+	blocking := func(ctx context.Context, _ []byte, _ string, _ ...string) ([]byte, int, error) {
+		<-ctx.Done()
+		return nil, -1, nil // what exec reports for a killed process
+	}
+	start := time.Now()
+	_, err := NewKeychainKeyProvider(context.Background(), KeychainOptions{FilePath: filepath.Join(t.TempDir(), "master.key"), Run: blocking, Timeout: 50 * time.Millisecond})
+	if err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("expected a locked-keychain timeout error, got %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatalf("the call was not bounded: %s", time.Since(start))
 	}
 }

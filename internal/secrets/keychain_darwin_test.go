@@ -106,10 +106,14 @@ func TestKeychainProviderAgainstRealSecurity(t *testing.T) {
 
 	// 5. A locked keychain fails closed instead of minting a replacement for
 	// the key it holds.
+	// security waits for the unlock dialog here, so the call must be bounded.
 	security("lock-keychain", kc)
-	if _, err := NewKeychainKeyProvider(ctx, KeychainOptions{FilePath: keyPath, Keychain: kc}); err == nil {
-		t.Fatal("locked keychain: expected an error, got a key")
+	lockedStart := time.Now()
+	_, err = NewKeychainKeyProvider(ctx, KeychainOptions{FilePath: keyPath, Keychain: kc, Timeout: 5 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("locked keychain: expected a locked-keychain error, got %v", err)
 	}
+	t.Logf("locked keychain: failed closed after %s: %v", time.Since(lockedStart).Round(time.Millisecond), err)
 	security("unlock-keychain", "-p", "relayhub-test", kc)
 	stored = strings.TrimSpace(security("find-generic-password", "-s", keychainService, "-a", keychainAccount(keyPath), "-w", kc))
 	if stored != hex.EncodeToString(legacy) {

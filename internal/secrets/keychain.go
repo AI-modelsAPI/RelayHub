@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // CommandRunner runs name with args, feeding stdin, and returns stdout and
@@ -31,6 +32,10 @@ type KeychainOptions struct {
 	SecurityPath string
 	// Run defaults to exec; tests inject a fake keychain.
 	Run CommandRunner
+	// Timeout bounds each security(1) call; default 2 minutes. A locked
+	// keychain makes security wait for the unlock dialog, and without a bound
+	// startup would hang forever in a session nobody is watching.
+	Timeout time.Duration
 	// Keychain is a keychain file to use instead of the default search list
 	// (the login keychain). Tests point it at a throwaway keychain; it must
 	// not contain whitespace or quotes, since it travels through security -i.
@@ -58,6 +63,7 @@ type KeychainKeyProvider struct {
 	run     CommandRunner
 	// keychain is an explicit keychain file; empty means the search list.
 	keychain string
+	timeout  time.Duration
 
 	mu  sync.Mutex
 	key []byte
@@ -79,6 +85,10 @@ func NewKeychainKeyProvider(ctx context.Context, opts KeychainOptions) (*Keychai
 		secPath:  opts.SecurityPath,
 		run:      opts.Run,
 		keychain: opts.Keychain,
+		timeout:  opts.Timeout,
+	}
+	if p.timeout <= 0 {
+		p.timeout = 2 * time.Minute
 	}
 	if p.secPath == "" {
 		p.secPath = "/usr/bin/security"
@@ -169,9 +179,9 @@ func (p *KeychainKeyProvider) read(ctx context.Context) ([]byte, bool, error) {
 	if p.keychain != "" {
 		args = append(args, p.keychain)
 	}
-	out, code, err := p.run(ctx, nil, p.secPath, args...)
+	out, code, err := p.security(ctx, nil, args...)
 	if err != nil {
-		return nil, false, fmt.Errorf("keychain key provider: %w", err)
+		return nil, false, err
 	}
 	if code == securityItemNotFound {
 		return nil, false, nil
@@ -192,14 +202,28 @@ func (p *KeychainKeyProvider) write(ctx context.Context, key []byte) error {
 		cmd += " " + p.keychain
 	}
 	cmd += "\n"
-	_, code, err := p.run(ctx, []byte(cmd), p.secPath, "-i")
+	_, code, err := p.security(ctx, []byte(cmd), "-i")
 	if err != nil {
-		return fmt.Errorf("keychain key provider: %w", err)
+		return err
 	}
 	if code != 0 {
 		return fmt.Errorf("keychain key provider: security add-generic-password exited with %d", code)
 	}
 	return nil
+}
+
+// security runs one bounded security(1) command.
+func (p *KeychainKeyProvider) security(ctx context.Context, stdin []byte, args ...string) ([]byte, int, error) {
+	cctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	out, code, err := p.run(cctx, stdin, p.secPath, args...)
+	if cctx.Err() != nil && ctx.Err() == nil {
+		return nil, -1, fmt.Errorf("keychain key provider: security %s did not finish within %s; the keychain is probably locked — unlock it and start RelayHub again", args[0], p.timeout)
+	}
+	if err != nil {
+		return nil, -1, fmt.Errorf("keychain key provider: %w", err)
+	}
+	return out, code, nil
 }
 
 func readKeyFile(path string) ([]byte, error) {

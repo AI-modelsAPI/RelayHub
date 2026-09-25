@@ -117,10 +117,15 @@ function askForCredential() {
 
 async function authFetch(url, init) {
   await pairingReady;
+  const sent = localStorage.getItem(TOKEN_KEY);
   let r = await fetch(url, withAuth(init));
   if (r.status === 401) {
-    localStorage.removeItem(TOKEN_KEY);
-    await askForCredential();
+    // Only a rejection of the current token opens the gate; a request that
+    // raced a fresh sign-in just retries with the new token.
+    if (localStorage.getItem(TOKEN_KEY) === sent) {
+      localStorage.removeItem(TOKEN_KEY);
+      await askForCredential();
+    }
     r = await fetch(url, withAuth(init));
   }
   return r;
