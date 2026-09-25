@@ -99,6 +99,8 @@ jobs:
 
           ## 安装
 
+          系统要求：macOS 13 或更高版本（Go 1.27 核心要求）。
+
           1. 下载对应架构的 DMG（apple-silicon = Apple Silicon，intel = Intel）。
           2. 打开 DMG，把 RelayHub 拖进 Applications。
 
@@ -126,6 +128,8 @@ jobs:
           - Channel keys lock when their origin changes. Config export/import is now v3.
 
           ## Install
+
+          System requirements: macOS 13 or later (required by the Go 1.27 core).
 
           Open the DMG for your architecture and drag RelayHub to Applications. **This build is unsigned and not notarized** (needs an Apple Developer certificate): right-click the app and choose Open, or run \`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`.
 
