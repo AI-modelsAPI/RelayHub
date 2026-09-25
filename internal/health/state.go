@@ -1,6 +1,7 @@
 package health
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -58,6 +59,9 @@ type State struct {
 	Reason           string
 	CircuitThreshold int
 	ProbeInFlight    bool
+	// ProbeStartedAt is when a half-open probe was admitted; a wedged probe
+	// stops holding the channel out after probeStaleAfter.
+	ProbeStartedAt   time.Time
 	ConsecutiveTrips int
 	LastFailureAt    time.Time
 	LastSuccessAt    time.Time
@@ -109,6 +113,10 @@ type Registry struct {
 	states   map[string]State
 	windows  map[string]*window
 	observer func(Transition)
+	// recoveryProbe is set while a cheap-probe loop is running (AUDIT §5 B5):
+	// a tripped channel is then held out of routing until a probe succeeds
+	// instead of being handed real traffic as soon as the cooldown elapses.
+	recoveryProbe bool
 }
 
 func NewRegistry() *Registry {
@@ -173,6 +181,13 @@ func (r *Registry) Available(id string, now time.Time) bool {
 		return false
 	}
 	if s.Status == CircuitOpen {
+		// With a recovery loop running the channel waits for a cheap probe,
+		// so a tripped breaker never takes real traffic by surprise; the
+		// stale in-flight case falls back to real traffic so a wedged probe
+		// cannot strand the channel.
+		if r.RecoveryProbeEnabled() {
+			return s.ProbeInFlight && now.Sub(s.ProbeStartedAt) >= probeStaleAfter
+		}
 		// An open circuit blocks traffic only until its cooldown elapses; after
 		// that a probe request is allowed through so the breaker can recover.
 		// Without this, a tripped channel is excluded forever (no prod caller
@@ -180,6 +195,11 @@ func (r *Registry) Available(id string, now time.Time) bool {
 		return !s.CooldownUntil.IsZero() && !now.Before(s.CooldownUntil)
 	}
 	if s.Status == CircuitHalfOpen {
+		// A half-open circuit is a probe in progress: real traffic waits for
+		// its verdict (or for the probe to go stale).
+		if r.RecoveryProbeEnabled() {
+			return s.ProbeInFlight && now.Sub(s.ProbeStartedAt) >= probeStaleAfter
+		}
 		return true
 	}
 	if !s.CooldownUntil.IsZero() && now.Before(s.CooldownUntil) {
@@ -383,6 +403,7 @@ func (r *Registry) recordSuccess(id string, latency time.Duration, now time.Time
 		}
 		s.FailureCount = 0
 		s.ProbeInFlight = false
+		s.ProbeStartedAt = time.Time{}
 		s.ConsecutiveTrips = 0
 		s.LastSuccessAt = now
 		s.LastError = ""
@@ -423,6 +444,7 @@ func (r *Registry) recordFailure(id string, threshold int, now time.Time, reason
 			threshold = 3
 		}
 		s.ProbeInFlight = false
+		s.ProbeStartedAt = time.Time{}
 		switch {
 		case s.Status == CircuitHalfOpen || s.FailureCount >= threshold:
 			s.ConsecutiveTrips++
@@ -459,6 +481,48 @@ func backoff(trips int) time.Duration {
 	return d
 }
 
+// SetRecoveryProbe records that a cheap-probe loop is running: while it is on,
+// a tripped channel stays out of routing until a probe closes the breaker.
+func (r *Registry) SetRecoveryProbe(on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recoveryProbe = on
+}
+
+// RecoveryProbeEnabled reports whether the breaker gate is on.
+func (r *Registry) RecoveryProbeEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.recoveryProbe
+}
+
+// ProbeCandidates lists the channels a recovery probe should try: tripped
+// breakers whose cooldown has elapsed and that have no probe in flight,
+// sorted by channel ID.
+func (r *Registry) ProbeCandidates(now time.Time) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for id, s := range r.states {
+		if s.Status != CircuitOpen && s.Status != CircuitHalfOpen {
+			continue
+		}
+		if s.ProbeInFlight && now.Sub(s.ProbeStartedAt) < probeStaleAfter {
+			continue
+		}
+		if !s.CooldownUntil.IsZero() && now.Before(s.CooldownUntil) {
+			continue
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// probeStaleAfter is how long a half-open probe may hold a channel out. A
+// probe whose request wedged must not strand the channel forever.
+const probeStaleAfter = 2 * time.Minute
+
 func (r *Registry) AllowProbe(id string, now time.Time) bool {
 	r.mu.Lock()
 	s := r.states[id]
@@ -469,6 +533,7 @@ func (r *Registry) AllowProbe(id string, now time.Time) bool {
 	prev := s.Status
 	s.Status = CircuitHalfOpen
 	s.ProbeInFlight = true
+	s.ProbeStartedAt = now
 	r.states[id] = s
 	obs := r.observer
 	r.mu.Unlock()

@@ -111,6 +111,14 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	healthProbe, err := fileCfg.HealthProbe()
+	if err != nil {
+		return err
+	}
+	commitWindow, commitDisabled, err := fileCfg.StreamCommit()
+	if err != nil {
+		return err
+	}
 	a, err := app.New(app.Config{
 		DataDir:        dataDir,
 		HTTPProxyAddr:  httpProxyAddr,
@@ -138,6 +146,13 @@ func run(args []string) error {
 		},
 		// Authenticity probes (AUDIT §5 B1): verify_probe_interval, default 12h.
 		VerifyProbeInterval: probeEvery,
+		// Cheap recovery probes for tripped channels (AUDIT §5 B5):
+		// health_probe_interval, default 30s.
+		HealthProbeInterval: healthProbe,
+		// Stream commit window (AUDIT §5 B4): stream_commit_window,
+		// default 10s; "off" forwards upstream bytes immediately.
+		StreamCommitWindow:  commitWindow,
+		DisableStreamCommit: commitDisabled,
 	})
 	if err != nil {
 		return err

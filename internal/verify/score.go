@@ -90,6 +90,13 @@ func (r *Registry) Observe(rec domain.RequestRecord) Score {
 		s.Score -= 20
 		s.Signals = append(s.Signals, "model_mismatch")
 	}
+	if rec.ErrorClass == "upstream_error_event" {
+		// The upstream answered 200 and then reported a failure inside the
+		// stream: as bad as an HTTP 5xx, but invisible to the status check
+		// (AUDIT §5 B5).
+		s.Score -= 25
+		s.Signals = append(s.Signals, "upstream_error_event")
+	}
 	if rec.ErrorClass == "upstream_eof_no_finish" {
 		s.Score -= 15
 		s.Signals = append(s.Signals, "truncated")

@@ -81,6 +81,12 @@ type Runtime struct {
 	probePass   func(context.Context)
 	probeCancel context.CancelFunc
 
+	// Cheap recovery probes for tripped channels (AUDIT §5 B5);
+	// healthProbeEvery 0 disables the loop and the breaker gate.
+	healthProbeEvery  time.Duration
+	healthProbePass   func(context.Context)
+	healthProbeCancel context.CancelFunc
+
 	stopCh  chan struct{}
 	stopped chan struct{}
 	mu      sync.Mutex
@@ -440,11 +446,19 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if cfg.VerifyProbeInterval > 0 {
 		log.Printf("relayhub: authenticity probes every %s", cfg.VerifyProbeInterval)
 	}
+	if cfg.HealthProbeInterval > 0 {
+		log.Printf("relayhub: recovery probes for tripped channels every %s", cfg.HealthProbeInterval)
+	}
 	gwHandler := gateway.New(gateway.Config{
 		Resolver: res,
 		Upstream: upstream,
 		Health:   healthReg,
 		Auth:     localKeys,
+		// The stream commit window (AUDIT §5 B4): 0 keeps the gateway's own
+		// 10s default; DisableStreamCommit forwards the first upstream byte
+		// immediately, trading failover for latency.
+		StreamCommitWindow:  cfg.StreamCommitWindow,
+		DisableStreamCommit: cfg.DisableStreamCommit,
 		DisableKey: func(ctx context.Context, keyID string) {
 			k, err := repo.GetChannelKey(ctx, keyID)
 			if err != nil {
@@ -495,6 +509,8 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		Verify:                verifyReg,
 		probeEvery:            cfg.VerifyProbeInterval,
 		probePass:             probes.pass,
+		healthProbeEvery:      cfg.HealthProbeInterval,
+		healthProbePass:       probes.healthPass,
 	}
 
 	return rt, nil
@@ -665,6 +681,15 @@ func (r *Runtime) Start(ctx context.Context) error {
 		r.probeCancel = cancel
 		go runProbeLoop(probeCtx, r.probeEvery, probeInitialDelay, r.probePass)
 	}
+	if r.healthProbeEvery > 0 && r.healthProbePass != nil {
+		// The gate goes on with the loop: from here on a tripped breaker is
+		// released by a cheap probe, never by real client traffic (AUDIT §5
+		// B5).
+		r.Health.SetRecoveryProbe(true)
+		healthCtx, cancel := context.WithCancel(ctx)
+		r.healthProbeCancel = cancel
+		go runProbeLoop(healthCtx, r.healthProbeEvery, probeInitialDelay, r.healthProbePass)
+	}
 
 	apiSrv := &http.Server{
 		Handler:           r.APIServer.Handler(),
@@ -693,6 +718,11 @@ func (r *Runtime) Start(ctx context.Context) error {
 func (r *Runtime) Shutdown(ctx context.Context) error {
 	if r.probeCancel != nil {
 		r.probeCancel()
+	}
+	if r.healthProbeCancel != nil {
+		r.healthProbeCancel()
+		r.healthProbeCancel = nil
+		r.Health.SetRecoveryProbe(false)
 	}
 	_ = r.Scheduler.Stop(ctx)
 	if r.MgmtHTTP != nil {

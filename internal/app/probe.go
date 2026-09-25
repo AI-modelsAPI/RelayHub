@@ -43,6 +43,8 @@ type channelProber struct {
 	logf     func(string, ...any)
 	// spacing pauses between channels in a pass so probes never burst.
 	spacing time.Duration
+	// now is the clock (tests); nil means time.Now.
+	now func() time.Time
 }
 
 // probe runs one probe against channelID's binding of modelID (empty: the
@@ -102,6 +104,57 @@ func (p *channelProber) recentModels(ctx context.Context, channelID string) []st
 
 // pass probes every enabled, routable and currently available channel once,
 // one model each, sequentially.
+// healthPass probes every channel whose breaker tripped and whose cooldown has
+// elapsed: the channel is held out of routing until one cheap request proves it
+// works (AUDIT §5 B5). A channel with no probeable binding is left untouched,
+// so it is not parked half-open forever by a probe that can never run.
+func (p *channelProber) healthPass(ctx context.Context) {
+	if p.health == nil || p.resolver == nil || !p.health.RecoveryProbeEnabled() {
+		return
+	}
+	if p.prober.Upstream == nil {
+		return
+	}
+	now := time.Now()
+	if p.now != nil {
+		now = p.now()
+	}
+	for _, id := range p.health.ProbeCandidates(now) {
+		if ctx.Err() != nil {
+			return
+		}
+		bindings := p.resolver.ChannelBindings(id)
+		d, ok := pickProbeBinding(bindings, "", nil)
+		if !ok {
+			continue
+		}
+		// Claim the probe before spending a request; a second pass (or a
+		// concurrent one) must not double-probe.
+		if !p.health.AllowProbe(id, now) {
+			continue
+		}
+		res := p.prober.ProbeLiveness(ctx, d)
+		if res.OK {
+			p.health.RecordOutcome(id, true, res.Latency, now)
+			p.log("relayhub: recovery probe: channel %s is back after %s", id, res.Latency.Round(time.Millisecond))
+		} else {
+			// A failed probe re-opens the breaker with a longer cooldown;
+			// real traffic keeps flowing to the other channels meanwhile.
+			p.health.RecordFailureReason(id, 0, now, "recovery probe: "+res.Error)
+			p.log("relayhub: recovery probe: channel %s still down: %s", id, res.Error)
+		}
+		if p.spacing > 0 {
+			t := time.NewTimer(p.spacing)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+		}
+	}
+}
+
 func (p *channelProber) pass(ctx context.Context) {
 	if p.repo == nil {
 		return
