@@ -148,6 +148,7 @@ func (r Resolver) snapshot() Resolver {
 			Rand:           r.Rand,
 			Sticky:         r.Sticky,
 			Trust:          r.Trust,
+			Price:          r.Price,
 		}
 	}
 	return Resolver{
@@ -164,6 +165,7 @@ func (r Resolver) snapshot() Resolver {
 		Rand:           r.Rand,
 		Sticky:         r.Sticky,
 		Trust:          r.Trust,
+		Price:          r.Price,
 	}
 }
 
