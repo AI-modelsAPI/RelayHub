@@ -39,6 +39,10 @@ const (
 	// channel answering with another model, a canned reply or without tool
 	// support; routing now prefers other channels.
 	KindAuthenticitySuspect Kind = "authenticity_suspect"
+	// KindBillingDrift: reconciling the local token ledger against the site's
+	// own consumption log (AUDIT §5 B2) found a rate change or an
+	// overcharge on one channel.
+	KindBillingDrift Kind = "billing_drift"
 )
 
 type Severity string

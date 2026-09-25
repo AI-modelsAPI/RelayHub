@@ -11,6 +11,7 @@ const state = {
   selected: {},
   summary: null,
   scores: [],
+  billing: null,
   identity: [],
   lab: [],
   labEnabled: false,
@@ -378,11 +379,32 @@ function renderLab() {
   );
 }
 
+// Billing reconciliation (AUDIT §5 B2): what the relays say they charged for
+// today's traffic, against the catalog price of the same tokens.
+function billingLine() {
+  const b = state.billing;
+  if (!b) return "";
+  const s = b.summary || {};
+  if (!b.supported || !s.channels) return "计费对账：还没有可用的对账结果（需要站点支持消费日志）。";
+  const notes = [];
+  if (s.overcharge) notes.push(`${s.overcharge} 个渠道多扣费`);
+  if (s.drift) notes.push(`${s.drift} 个渠道倍率漂移`);
+  const where = notes.length ? "⚠ " + notes.join(" · ") : "单价与基线一致";
+  return `计费对账：${s.channels} 个渠道 · 已付 $${money(s.charged_usd)} · 省下 $${money(s.savings_usd)} · ${where}`;
+}
+
+function money(v) {
+  return Number(v || 0).toFixed(4);
+}
+
 function renderUsage() {
   const rec = state.usage || [];
+  const bs = (state.billing && state.billing.summary) || {};
   $("#usage-metrics").innerHTML = [
     ["请求", rec.length],
     ["渠道", state.channels.length],
+    ["今日省下", "$" + money(bs.savings_usd)],
+    ["今日已付", "$" + money(bs.charged_usd)],
   ]
     .map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`)
     .join("");
@@ -392,6 +414,10 @@ function renderUsage() {
         .join("")
     : `<li class="row"><span class="n">暂无用量</span></li>`;
   $$("#usage-rows .row").forEach((el) => el.addEventListener("click", () => explainRequest(el.dataset.id)));
+  // The inspector starts on the reconciliation summary; clicking a request
+  // replaces it with that request's route explanation.
+  const ins = $("#usage-ins");
+  if (ins) ins.innerHTML = `<div class="ins-block"><p class="lede">${esc(billingLine())}</p></div>`;
 }
 
 async function explainRequest(requestID) {
@@ -485,7 +511,7 @@ function render() {
 }
 
 async function boot() {
-  const [ov, ch, md, us, ck, sm, sc, idn, lb, ag, st] = await Promise.allSettled([
+  const [ov, ch, md, us, ck, sm, sc, idn, lb, ag, st, bl] = await Promise.allSettled([
     api("overview"),
     api("channels"),
     api("models"),
@@ -497,6 +523,7 @@ async function boot() {
     api("lab"),
     api("cli-sync"),
     api("settings"),
+    api("billing/reconcile"),
   ]);
   const ok = (r) => r.status === "fulfilled";
   if (ok(ov)) state.overview = ov.value;
@@ -516,6 +543,7 @@ async function boot() {
     state.agentRecords = ag.value.records || [];
   }
   if (ok(st)) state.settings = st.value;
+  if (ok(bl)) state.billing = bl.value;
 
   // The Core indicator follows the overview heartbeat. Previously every fetch
   // could fail and the dot stayed green because the catch never ran (RH-29).

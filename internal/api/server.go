@@ -24,6 +24,7 @@ import (
 	"relayhub/internal/affinity"
 	"relayhub/internal/audit"
 	"relayhub/internal/auth"
+	"relayhub/internal/billing"
 	"relayhub/internal/browser"
 	"relayhub/internal/checkin"
 	"relayhub/internal/clisync"
@@ -103,6 +104,12 @@ type Server struct {
 	// Prober runs an authenticity probe against a channel (AUDIT §5 B1);
 	// nil keeps POST /api/v1/verify/probe on the passive score.
 	Prober func(ctx context.Context, channelID, modelID string) (verify.ProbeResult, error)
+	// Billing holds the newest billing reconciliation per channel (AUDIT §5
+	// B2); nil means reconciliation is not wired and the endpoints report it.
+	Billing *billing.Registry
+	// Reconciler runs a reconciliation pass on demand; nil keeps POST
+	// /api/v1/billing/reconcile on 501.
+	Reconciler func(ctx context.Context, channelID string) ([]billing.Report, error)
 }
 
 type peerPolicy struct {
@@ -352,6 +359,7 @@ func (s *Server) managementRoutes() http.Handler {
 	mux.HandleFunc("/api/v1/usage/summary", s.usageSummary)
 	mux.HandleFunc("/api/v1/verify/scores", s.verifyScores)
 	mux.HandleFunc("/api/v1/verify/probe", s.verifyProbe)
+	mux.HandleFunc("/api/v1/billing/reconcile", s.billingReconcile)
 	mux.HandleFunc("/api/v1/identity", s.identityList)
 	mux.HandleFunc("/api/v1/identity/", s.identityPatch)
 	mux.HandleFunc("/api/v1/sessions", s.sessions)

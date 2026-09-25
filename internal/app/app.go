@@ -51,6 +51,10 @@ type Config struct {
 	// DisableStreamCommit forwards upstream bytes immediately instead.
 	StreamCommitWindow  time.Duration
 	DisableStreamCommit bool
+	// BillingReconcileInterval is how often RelayHub compares its own token
+	// ledger with what the site says it charged (AUDIT §5 B2); 0 disables
+	// the periodic pass (the management endpoint still reconciles on demand).
+	BillingReconcileInterval time.Duration
 }
 
 // NotifyConfig mirrors config.NotifyConfig without importing the config

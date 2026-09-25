@@ -60,6 +60,9 @@ type Resolver struct {
 	// Trust demotes channels whose authenticity probes failed (AUDIT §5
 	// B1); nil disables the check.
 	Trust TrustSource
+	// Price feeds the "cheapest" strategy with the observed effective price
+	// of each channel (AUDIT §5 B2); nil disables cost-based ordering.
+	Price PriceSource
 }
 
 type resolverState struct {
@@ -298,7 +301,7 @@ func (r Resolver) resolve(ctx context.Context, req Request, excluded map[string]
 	// Channels that failed an authenticity probe yield to trusted ones
 	// before the strategy and session affinity pick (AUDIT §5 B1).
 	candidates = preferTrusted(candidates, r.Trust, &d)
-	chosen := selectCandidate(candidates, d.Strategy, r.FixedChannel, r.Health, r.Rand, req.Source)
+	chosen := selectCandidate(candidates, d.Strategy, r.FixedChannel, r.Health, r.Price, r.Rand, req.Source)
 	if req.SessionKey != "" && r.Sticky != nil {
 		if chID, _, ok := r.Sticky.Lookup(req.SessionKey); ok {
 			for _, c := range candidates {
@@ -520,7 +523,7 @@ func isQuotaStrategy(strategy string) bool {
 	return false
 }
 
-func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, rand RandomSource, source uint64) Candidate {
+func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, price PriceSource, rand RandomSource, source uint64) Candidate {
 	if fixed != "" {
 		for _, v := range c {
 			if v.Channel.ID == fixed {
@@ -533,6 +536,12 @@ func selectCandidate(c []Candidate, strategy, fixed string, h *health.Registry, 
 	// would otherwise prefer". Priority remains the tie-breaker.
 	if isQuotaStrategy(strategy) {
 		return quotaFirst(c, h)
+	}
+	// cheapest is the second strategy that looks across priority tiers: its
+	// point is "spend the least per token", not "spend the least among the
+	// channels I already prefer".
+	if isPriceStrategy(strategy) {
+		return cheapFirst(c, price)
 	}
 	c = highestPriority(c)
 	switch strings.ToLower(strategy) {

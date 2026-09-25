@@ -88,6 +88,8 @@ type StatusRepository interface {
 	ListRequestRecordsByChannel(context.Context, string, int) ([]domain.RequestRecord, error)
 	RequestUsageTotals(context.Context) (int64, int64, int64, error)
 	PruneRequestRecords(context.Context, time.Time) (int64, error)
+	CreateBillingReport(context.Context, domain.BillingReport) error
+	ListBillingReports(context.Context, string, int) ([]domain.BillingReport, error)
 	CreateCLISyncRecord(context.Context, domain.CLISyncRecord) error
 	GetCLISyncRecord(context.Context, string) (domain.CLISyncRecord, error)
 	ListCLISyncRecords(context.Context) ([]domain.CLISyncRecord, error)
@@ -962,6 +964,71 @@ func (s *Store) PruneRequestRecords(ctx context.Context, olderThan time.Time) (i
 	}
 	affected, err := result.RowsAffected()
 	return affected, err
+}
+
+const billingReportColumns = `id,channel_id,window_start,window_end,source,requests,input_tokens,output_tokens,cache_read_tokens,tokens,charged_tokens,charged_quota,charged_usd,declared_usd,declared_known,effective_usd_per_mtok,declared_usd_per_mtok,baseline_usd_per_mtok,drift,token_drift,multiplier_drift,savings_usd,group_ratio,model_ratio,entries,matched_models,truncated,verdict,reason,created_at`
+
+func (s *Store) CreateBillingReport(ctx context.Context, r domain.BillingReport) error {
+	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO billing_reports(`+billingReportColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.ChannelID, stamp(r.WindowStart), stamp(r.WindowEnd), r.Source, r.Requests,
+		r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.Tokens, r.ChargedTokens, r.ChargedQuota,
+		r.ChargedUSD, r.DeclaredUSD, boolInt(r.DeclaredKnown), r.EffectiveUSDPerMTok, r.DeclaredUSDPerMTok,
+		r.BaselineUSDPerMTok, r.Drift, r.TokenDrift, r.MultiplierDrift, r.SavingsUSD, r.GroupRatio, r.ModelRatio,
+		r.Entries, r.MatchedModels, boolInt(r.Truncated), r.Verdict, r.Reason, stamp(r.CreatedAt))
+	return err
+}
+
+func scanBillingReport(row interface{ Scan(...any) error }) (domain.BillingReport, error) {
+	var r domain.BillingReport
+	var start, end, created string
+	var declaredKnown, truncated int
+	err := row.Scan(&r.ID, &r.ChannelID, &start, &end, &r.Source, &r.Requests,
+		&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.Tokens, &r.ChargedTokens, &r.ChargedQuota,
+		&r.ChargedUSD, &r.DeclaredUSD, &declaredKnown, &r.EffectiveUSDPerMTok, &r.DeclaredUSDPerMTok,
+		&r.BaselineUSDPerMTok, &r.Drift, &r.TokenDrift, &r.MultiplierDrift, &r.SavingsUSD, &r.GroupRatio, &r.ModelRatio,
+		&r.Entries, &r.MatchedModels, &truncated, &r.Verdict, &r.Reason, &created)
+	if err != nil {
+		return r, err
+	}
+	r.DeclaredKnown = declaredKnown != 0
+	r.Truncated = truncated != 0
+	if r.WindowStart, err = parseTime(start); err != nil {
+		return r, err
+	}
+	if r.WindowEnd, err = parseTime(end); err != nil {
+		return r, err
+	}
+	r.CreatedAt, err = parseTime(created)
+	return r, err
+}
+
+// ListBillingReports returns the newest reconciliation reports, optionally
+// limited to one channel. An empty channelID means "every channel". The limit
+// is bounded so history display cannot scan an unbounded table (AUDIT RH-32).
+func (s *Store) ListBillingReports(ctx context.Context, channelID string, limit int) ([]domain.BillingReport, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	query := `SELECT ` + billingReportColumns + ` FROM billing_reports ORDER BY created_at DESC LIMIT ?`
+	args := []any{limit}
+	if channelID != "" {
+		query = `SELECT ` + billingReportColumns + ` FROM billing_reports WHERE channel_id=? ORDER BY created_at DESC LIMIT ?`
+		args = []any{channelID, limit}
+	}
+	rows, err := s.repositoryExecutor().QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.BillingReport
+	for rows.Next() {
+		r, e := scanBillingReport(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) CreateCLISyncRecord(ctx context.Context, r domain.CLISyncRecord) error {
