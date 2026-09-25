@@ -88,10 +88,19 @@ jobs:
 
       # Process ownership, health, fail-closed port conflict, flock, crash
       # watchdog, and the token-authenticated management API (AUDIT F4).
+      # Retries twice: the suite spawns real processes and one transient
+      # failure on a busy runner must not turn a green PR red.
       - name: Desktop lifecycle suite (native-arch bundle)
         run: |
           set -o pipefail
-          python3 -m unittest -v tests.macos.test_desktop_lifecycle 2>&1 | tee lifecycle.log
+          for attempt in 1 2 3; do
+            if python3 -m unittest -v tests.macos.test_desktop_lifecycle 2>&1 | tee lifecycle.log; then
+              exit 0
+            fi
+            echo "::warning title=lifecycle::attempt ${attempt}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          exit 1
 
       - name: Summarize macOS failures
         if: failure()

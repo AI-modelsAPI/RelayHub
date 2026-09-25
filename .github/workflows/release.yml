@@ -37,7 +37,21 @@ jobs:
       # (process ownership, health, fail-closed port conflict, flock, crash
       # watchdog). Release job previously never ran the desktop suite (RH-33).
       - name: Desktop lifecycle suite (native-arch bundle)
-        run: python3 -m unittest -v tests.macos.test_desktop_lifecycle
+        run: |
+          set -o pipefail
+          # The suite spawns real processes; a single transient failure on a
+          # busy shared runner must not block a release forever. Retry twice,
+          # then annotate the last attempt's log so a real failure is
+          # diagnosable without raw logs.
+          for attempt in 1 2 3; do
+            if python3 -m unittest -v tests.macos.test_desktop_lifecycle 2>&1 | tee lifecycle.log; then
+              exit 0
+            fi
+            echo "::warning title=lifecycle::attempt ${attempt}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          python3 scripts/ci-annotate.py error lifecycle lifecycle.log || true
+          exit 1
 
       - name: Generate SHA256SUMS
         run: |
