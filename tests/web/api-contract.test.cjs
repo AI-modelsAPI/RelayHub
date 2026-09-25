@@ -96,4 +96,9 @@ test("the models view shows the provenance review queue (AUDIT §5 B3)", () => {
   // The queue is rendered, and its container exists in the shell.
   assert.match(appJs, /function pendingHTML\(/);
   assert.match(html, /id="md-queue"/);
+  // One-key undo is a button in the channel inspector, wired to the real
+  // endpoint, not a claim in the docs.
+  assert.match(appJs, /id="ch-undo"/);
+  assert.match(appJs, /api\("channels\/sync-undo", JSON_POST\(\{ channel_id: ch\.id \}\)\)/);
+  assert.match(appJs, /function undoChannelSync\(/);
 });

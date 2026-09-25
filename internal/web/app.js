@@ -241,8 +241,34 @@ function inspectChannel(ch) {
       <h3>真实度</h3>
       ${trustHTML(scoreFor(ch.id))}
       <div class="actions"><button class="ghost" id="ch-probe" type="button">立即探测</button><span class="probe-msg" id="ch-probe-msg"></span></div>
+      <div class="actions"><button class="ghost" id="ch-undo" type="button">撤销上一次同步</button><span class="probe-msg" id="ch-undo-msg"></span></div>
     </div>`;
   $("#ch-probe")?.addEventListener("click", () => probeChannel(ch));
+  $("#ch-undo")?.addEventListener("click", () => undoChannelSync(ch));
+}
+
+// One-click rollback of a channel's newest model sync (AUDIT §5 B3): the
+// snapshot restores the old bindings and the models this sync invented are
+// reaped, so a relay's surprise model list can be undone without touching the
+// catalog by hand.
+async function undoChannelSync(ch) {
+  const btn = $("#ch-undo");
+  const msg = $("#ch-undo-msg");
+  if (btn) btn.disabled = true;
+  if (msg) msg.textContent = "撤销中…";
+  try {
+    const r = await api("channels/sync-undo", JSON_POST({ channel_id: ch.id }));
+    const md = await api("models").catch(() => null);
+    if (md) state.models = md.models || md.catalog || [];
+    const pd = await api("models/pending").catch(() => null);
+    if (pd) state.pending = pd.pending || [];
+    renderModels();
+    if (msg) msg.textContent = `已撤销：恢复 ${r.restored || 0} 条绑定，回收 ${r.removed_models || 0} 个模型`;
+    if (btn) btn.disabled = false;
+  } catch (e) {
+    if (msg) msg.textContent = / 404$/.test(e.message) ? "没有可撤销的同步" : "撤销失败：" + e.message;
+    if (btn) btn.disabled = false;
+  }
 }
 
 // Authenticity probes (AUDIT §5 B1): the backend sends a canary ("repeat

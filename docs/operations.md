@@ -226,3 +226,56 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 ```
 
 `GET` 返回每个渠道的最新结论（`reports`）和汇总（`summary`：各判定的渠道数、今日已付、省下多少、混合单价）；`POST` 立即跑一轮（`channel_id` 留空表示所有启用渠道，未知渠道返回 404，未配置对账时 GET 会给出 `supported: false`、POST 返回 503）。控制台「用量」页的「今日省下 / 今日已付」两个数字和渠道 Inspector 顶部的对账一行都来自这里。
+
+## 8. 模型来源与审批（AUDIT §5 B3）
+
+**要解决的问题**：上游 `/v1/models` 只是一份「声明」。一个被攻陷或本就打算冒名的中转站，只要在列表里写上 `claude-sonnet-4` / `gpt-4o`，同步之后就能分走本应发往正规渠道的流量。所以同步不再无条件相信上游列表：受保护的名称要人工批准，每次同步都可回退。
+
+**保留名单**：`claude`、`gpt`、`chatgpt`、`gemini`、`grok`、`dall-e`、`whisper`、`sora`、`text-embedding` 这些家族，`o` + 数字（`o1`、`o3-mini`、`o4`），以及 `openai/`、`anthropic/`、`google/`、`xai/` 命名空间。判定是「家族名后面跟分隔符或数字」：`claude-3-5-haiku`、`gpt4` 会被拦下，而 `claudette-3`、`my-claude-proxy`、`openai-gpt-4o`、`opus-relay`、`orion-mini` 不受影响。
+
+**渠道标记「官方同源」**：只有标记过的渠道才能自动绑定保留名。不标记的渠道同步到保留名时，绑定会创建但处于**禁用**状态，并带上待审原因，等人工决定：
+
+| 待审原因 | 含义 |
+|---|---|
+| `reserved_model_name` | 渠道不是官方同源，却声明了保留名 |
+| `served_elsewhere` | 已上线渠道在**后台**重同步里新声明了其他渠道已在提供的普通模型（F6 的旧规则） |
+
+渠道的**首次**同步照常启用（新加入的池成员要能马上参与负载均衡），手动同步也照常；只有已上线渠道的后台重同步会因为 `served_elsewhere` 被挂起。保留名不受此豁免，任何同步下都要人工批准。
+
+**待审队列与决定**：
+
+```bash
+TOKEN=$(cat "<data-dir>/management.token")
+# 队列：每条是 渠道 / 模型 / 原因 / 上游模型名 / 是否官方同源
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/models/pending
+
+# 批准
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel_id":"c1","model_id":"gpt-4o","action":"approve"}' \
+  http://127.0.0.1:8790/api/v1/models/pending
+
+# 批准并映射到另一个全局名（目标必须已存在）
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel_id":"c1","model_id":"gpt-4o","action":"approve","model_id_target":"gpt-4o-2024"}' \
+  http://127.0.0.1:8790/api/v1/models/pending
+
+# 拒绝（删除该绑定）
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel_id":"c1","model_id":"gpt-4o","action":"reject"}' \
+  http://127.0.0.1:8790/api/v1/models/pending
+```
+
+- 批准会清掉待审原因、启用绑定和对应的全局模型；运维已经决定过的绑定在后续同步/重同步里不会再被挂起。
+- 拒绝会删除绑定；如果这个全局模型名是**这次同步凭空造出来的**（没有任何绑定还在引用、并且出现在这次同步的快照里），一并回收，避免目录里留一堆没人用的名字。
+- 同步接口的响应现在多一个 `held` 字段，列出本次被挂起的模型名，后台同步会在有挂起时记一条日志。
+
+**快照与一键撤销**：每次同步（手动 / 后台）都会写一条 `model_sync_snapshot`，内容包括变更前的绑定镜像、本次新增的全局模型、被挂起的名字、来源（`manual` / `background`）和时间。撤销会把绑定恢复成同步前的样子、回收本次新增的模型：
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel_id":"c1"}' http://127.0.0.1:8790/api/v1/channels/sync-undo
+```
+
+没有快照返回 404，已经撤销过的那条返回 409（撤销只作用于最新一条未撤销的快照，不会连着回退更早的同步）。恢复动作在一个事务里完成；快照写库失败只记日志，不会让同步本身失败——最坏情况是这一次没法撤销。
+
+控制台里，待审队列在「模型」页顶部（渠道、模型、原因、上游模型名，带批准 / 拒绝按钮）；「撤销上一次同步」按钮在渠道 Inspector 里（选中左侧渠道即可看到），点一下就会回退那个渠道最近一次同步并刷新目录和队列。
