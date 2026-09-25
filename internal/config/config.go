@@ -82,6 +82,12 @@ type Config struct {
 	// upstream bytes immediately, empty for DefaultStreamCommitWindow.
 	// Env: RELAYHUB_STREAM_COMMIT_WINDOW.
 	StreamCommitWindow string `json:"stream_commit_window"`
+	// BillingReconcileInterval is how often RelayHub compares its own token
+	// ledger with the site's consumption log (AUDIT §5 B2): a Go duration of
+	// at least 1m, "off" or "0" to disable the pass, empty for
+	// DefaultBillingReconcileInterval. Env:
+	// RELAYHUB_BILLING_RECONCILE_INTERVAL.
+	BillingReconcileInterval string `json:"billing_reconcile_interval"`
 }
 
 // DefaultHealthProbeInterval applies when health_probe_interval is unset.
@@ -135,6 +141,36 @@ const (
 	minHealthProbeInterval = 100 * time.Millisecond
 	minStreamCommitWindow  = 100 * time.Millisecond
 )
+
+// DefaultBillingReconcileInterval applies when billing_reconcile_interval is
+// unset: hourly is often enough to catch a rate change the same day without
+// hammering the site's log endpoint.
+const DefaultBillingReconcileInterval = time.Hour
+
+// minBillingReconcileInterval keeps a typo from turning the reconciler into a
+// poll loop against the relay.
+const minBillingReconcileInterval = time.Minute
+
+// BillingReconcile parses BillingReconcileInterval: empty means the default,
+// "off"/"0" disables reconciliation, anything else must be a Go duration of at
+// least 1m. Invalid values fail startup instead of silently changing cadence.
+func (c Config) BillingReconcile() (time.Duration, error) {
+	v := strings.ToLower(strings.TrimSpace(c.BillingReconcileInterval))
+	switch v {
+	case "":
+		return DefaultBillingReconcileInterval, nil
+	case "0", "off", "false", "disabled":
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid billing_reconcile_interval %q: %v", c.BillingReconcileInterval, err)
+	}
+	if d < minBillingReconcileInterval {
+		return 0, fmt.Errorf("billing_reconcile_interval %q is below the %s minimum (use \"off\" to disable)", c.BillingReconcileInterval, minBillingReconcileInterval)
+	}
+	return d, nil
+}
 
 // DefaultVerifyProbeInterval applies when verify_probe_interval is unset.
 const DefaultVerifyProbeInterval = 12 * time.Hour
@@ -199,6 +235,7 @@ func ApplyEnv(cfg *Config) {
 	set(&cfg.VerifyProbeInterval, "RELAYHUB_VERIFY_PROBE_INTERVAL")
 	set(&cfg.HealthProbeInterval, "RELAYHUB_HEALTH_PROBE_INTERVAL")
 	set(&cfg.StreamCommitWindow, "RELAYHUB_STREAM_COMMIT_WINDOW")
+	set(&cfg.BillingReconcileInterval, "RELAYHUB_BILLING_RECONCILE_INTERVAL")
 	if v, ok := os.LookupEnv("RELAYHUB_NOTIFY_QUOTA_LOW_USD"); ok && v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			cfg.Notify.QuotaLowUSD = f
@@ -385,5 +422,8 @@ func merge(dst *Config, src Config) {
 	}
 	if src.StreamCommitWindow != "" {
 		dst.StreamCommitWindow = src.StreamCommitWindow
+	}
+	if src.BillingReconcileInterval != "" {
+		dst.BillingReconcileInterval = src.BillingReconcileInterval
 	}
 }

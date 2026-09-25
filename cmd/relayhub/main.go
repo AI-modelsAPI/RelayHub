@@ -119,6 +119,10 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	billingEvery, err := fileCfg.BillingReconcile()
+	if err != nil {
+		return err
+	}
 	a, err := app.New(app.Config{
 		DataDir:        dataDir,
 		HTTPProxyAddr:  httpProxyAddr,
@@ -153,6 +157,9 @@ func run(args []string) error {
 		// default 10s; "off" forwards upstream bytes immediately.
 		StreamCommitWindow:  commitWindow,
 		DisableStreamCommit: commitDisabled,
+		// Billing reconciliation (AUDIT §5 B2):
+		// billing_reconcile_interval, default 1h.
+		BillingReconcileInterval: billingEvery,
 	})
 	if err != nil {
 		return err

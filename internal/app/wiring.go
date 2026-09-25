@@ -26,6 +26,7 @@ import (
 	"relayhub/internal/api"
 	"relayhub/internal/audit"
 	"relayhub/internal/auth"
+	"relayhub/internal/billing"
 	"relayhub/internal/browser"
 	"relayhub/internal/catalog"
 	"relayhub/internal/checkin"
@@ -86,6 +87,14 @@ type Runtime struct {
 	healthProbeEvery  time.Duration
 	healthProbePass   func(context.Context)
 	healthProbeCancel context.CancelFunc
+
+	// Billing holds the newest reconciliation per channel (AUDIT §5 B2)
+	// and feeds the router's "cheapest" strategy; reconcileEvery 0 keeps the
+	// periodic pass off (the management endpoint still runs on demand).
+	Billing        *billing.Registry
+	reconcileEvery time.Duration
+	reconcilePass  func(context.Context)
+	reconcileDone  context.CancelFunc
 
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -443,11 +452,33 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		spacing:  2 * time.Second,
 	}
 	apiServer.WithProber(probes.probe)
+
+	// Billing reconciliation (AUDIT §5 B2): compare the local token ledger
+	// with the site's own consumption log, persist the verdicts and let the
+	// router rank channels by their observed price.
+	billReg := billing.NewRegistry()
+	recon := &channelReconciler{
+		repo:       repo,
+		adapters:   adpReg,
+		reports:    billReg,
+		notify:     notifier.Notify,
+		logf:       log.Printf,
+		threshold:  DefaultReconcileThreshold,
+		minTokens:  DefaultReconcileMinTokens,
+		maxEntries: DefaultReconcileMaxEntries,
+		spacing:    reconcileSpacing,
+		source:     "reconcile",
+	}
+	res.Price = billReg
+	apiServer.WithBilling(billReg, recon.run)
 	if cfg.VerifyProbeInterval > 0 {
 		log.Printf("relayhub: authenticity probes every %s", cfg.VerifyProbeInterval)
 	}
 	if cfg.HealthProbeInterval > 0 {
 		log.Printf("relayhub: recovery probes for tripped channels every %s", cfg.HealthProbeInterval)
+	}
+	if cfg.BillingReconcileInterval > 0 {
+		log.Printf("relayhub: billing reconciliation every %s", cfg.BillingReconcileInterval)
 	}
 	gwHandler := gateway.New(gateway.Config{
 		Resolver: res,
@@ -511,6 +542,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		probePass:             probes.pass,
 		healthProbeEvery:      cfg.HealthProbeInterval,
 		healthProbePass:       probes.healthPass,
+		Billing:               billReg,
+		reconcileEvery:        cfg.BillingReconcileInterval,
+		reconcilePass:         recon.pass,
 	}
 
 	return rt, nil
@@ -690,6 +724,11 @@ func (r *Runtime) Start(ctx context.Context) error {
 		r.healthProbeCancel = cancel
 		go runProbeLoop(healthCtx, r.healthProbeEvery, probeInitialDelay, r.healthProbePass)
 	}
+	if r.reconcileEvery > 0 && r.reconcilePass != nil {
+		reconCtx, cancel := context.WithCancel(ctx)
+		r.reconcileDone = cancel
+		go runProbeLoop(reconCtx, r.reconcileEvery, reconcileInitialDelay, r.reconcilePass)
+	}
 
 	apiSrv := &http.Server{
 		Handler:           r.APIServer.Handler(),
@@ -723,6 +762,10 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		r.healthProbeCancel()
 		r.healthProbeCancel = nil
 		r.Health.SetRecoveryProbe(false)
+	}
+	if r.reconcileDone != nil {
+		r.reconcileDone()
+		r.reconcileDone = nil
 	}
 	_ = r.Scheduler.Stop(ctx)
 	if r.MgmtHTTP != nil {

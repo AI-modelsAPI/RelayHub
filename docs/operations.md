@@ -194,3 +194,35 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/verify/score
 - 上游对 Anthropic 的 `overloaded` 经常返回 529；现在它和 429/5xx 一样会触发渠道切换，单个渠道时原样返回 529 给客户端。
 - 恢复探针每轮只处理冷却期已过的渠道，渠道之间间隔 2 秒，启动 2 分钟后跑第一轮；渠道没有可探测的已启用模型时跳过（不会把它卡在半开状态）。
 - 探活请求本身不计入被动真实度分，但结论会直接改写渠道健康：成功即恢复 Healthy，失败则重开熔断并拉长冷却。
+
+## 7. 计费对账（AUDIT §5 B2）
+
+**对账做什么**：RelayHub 手里有两本账——本地记账（网关自己数出来的 token 数）和中转站的消费日志（`GET /api/log/self?type=2` 里每条请求扣掉的 quota 和站点用的倍率）。对账把两者按「站点当前计费日」拉到一起，算出**有效单价**（站点扣费 ÷ 站点记的 token，USD / 百万 token），再和两个参照物比：
+
+- **目录价**：`models` 里该模型的 input/output 价格。实际单价高于目录价 15% 以上且目录价覆盖了窗口内至少一半 token 时，判 `overcharge`。
+- **基线**：上一次判为 `ok` 的对账结果（没有 `ok` 时取最早的一次异常）。有效单价或站点上报的倍率相对基线变化超过 15% 时判 `drift`。
+- **站点记账**：站点记的 token 比本地统计多 25% 以上时判 `overcharge`（同样的流量被多记了 token）。
+
+判定优先级：截断的日志 → 没有消费记录 → 窗口 token 不足 1000（都记 `unknown`，绝不写 `ok`），然后才是上面三种。窗口 token 少于 1000、日志没取全（明文标注 `truncated`）、目录价覆盖不到一半时一律 `unknown`，不猜。
+
+| 配置 | `config.json` | 环境变量 | 说明 |
+|---|---|---|---|
+| 对账间隔 | `billing_reconcile_interval` | `RELAYHUB_BILLING_RECONCILE_INTERVAL` | Go 时长格式，默认 `1h`，最小 `1m`；`off` 或 `0` 关闭定期对账（手动对账仍可用）；非法值启动时报错 |
+
+- 每轮读取窗口内的本地请求记录（上限 5000 条）和站点消费日志（上限 1000 条），渠道之间间隔 1 秒，启动 3 分钟后跑第一轮；单渠道超时 60 秒。
+- 结论落库到 `billing_reports`（每轮每渠道一行，只存 token 数、金额、站点倍率和判定，不含任何 prompt/响应内容），同时留在内存里供控制台和路由读取。
+- 只有**从正常转为异常**时才发通知（`billing_drift`，warning），内容是一句话结论加一行金额；持续异常不会反复打扰。
+- 站点的 quota 单位取自 `/api/status` 的 `quota_per_unit`，取不到时按 new-api 默认的 $1 = 500,000 计算。
+
+**对路由的影响**：路由策略新增 `cheapest`（别名 `cost` / `price` / `effective-price` / `effective_price`）：在健康、可信的候选里选有效单价最低的渠道，**跨优先级选择**（和 `quota` 策略一样，价格压过 priority），没有对账数据的渠道排在最后。没有任何渠道有价格数据时退回原来的优先级顺序。
+
+**手动对账与控制台**：
+
+```bash
+TOKEN=$(cat "<data-dir>/management.token")
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/billing/reconcile
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel_id":""}' http://127.0.0.1:8790/api/v1/billing/reconcile
+```
+
+`GET` 返回每个渠道的最新结论（`reports`）和汇总（`summary`：各判定的渠道数、今日已付、省下多少、混合单价）；`POST` 立即跑一轮（`channel_id` 留空表示所有启用渠道，未知渠道返回 404，未配置对账时 GET 会给出 `supported: false`、POST 返回 503）。控制台「用量」页的「今日省下 / 今日已付」两个数字和渠道 Inspector 顶部的对账一行都来自这里。
