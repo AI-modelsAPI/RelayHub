@@ -42,7 +42,12 @@ build_arch() {
 
     # 2. Compile native Objective-C/Cocoa desktop shell executable into Contents/MacOS/RelayHub
     echo "  Compiling native macOS shell for $CLANG_ARCH..."
+    # Pin the deployment target. Without it clang stamps the SDK of the build
+    # host (CI runs macos-latest = macOS 15+) into the binary and macOS 14
+    # refuses to launch it ("cannot be used with this version of macOS").
+    # 13.0 matches the floor of the Go Core (Go 1.27 requires macOS 13).
     clang -arch "$CLANG_ARCH" \
+        -mmacosx-version-min=13.0 \
         -O2 \
         -fobjc-arc \
         -framework Cocoa \
