@@ -19,6 +19,7 @@ import (
 	"relayhub/internal/domain"
 	"relayhub/internal/egress"
 	"relayhub/internal/identity"
+	"relayhub/internal/keybind"
 )
 
 const (
@@ -102,6 +103,11 @@ func (b *BaseNewAPIAdapter) ResolveCredential(ctx context.Context, channel domai
 	}
 	if b.Secrets == nil {
 		return nil, fmt.Errorf("%w: no secret store configured on adapter", ErrSecretRequired)
+	}
+	// A channel may not borrow another channel's key or send a bound key to
+	// a different origin (AUDIT 2026-09-24 F5).
+	if !keybind.Allows(channel.CredentialRef, channel.ID, channel.BaseURL) {
+		return nil, fmt.Errorf("%w: credential is bound to a different channel or origin", ErrSecretRequired)
 	}
 	raw, err := b.Secrets.Get(ctx, channel.CredentialRef)
 	if err != nil {

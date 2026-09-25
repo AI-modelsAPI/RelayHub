@@ -3,9 +3,12 @@ package export
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"golang.org/x/crypto/argon2"
 	"time"
 
 	"relayhub/internal/domain"
@@ -16,7 +19,13 @@ import (
 // SHA-256 checksum and remain importable (AUDIT RH-13: an unkeyed checksum
 // detects corruption but cannot detect tampering, since an attacker can
 // recompute the hash after editing the payload).
-const CurrentPackageVersion = 2
+//
+// Version 3 derives the HMAC key with a random per-package salt (stored in
+// the manifest) and a higher Argon2id time cost. Version 2's fixed, public
+// salt let an attacker precompute password guesses once and test them
+// against every user's package (AUDIT 2026-09-24 F17). v2 packages are still
+// accepted on import.
+const CurrentPackageVersion = 3
 
 type Manifest struct {
 	Version       int       `json:"version"`
@@ -33,6 +42,8 @@ type Manifest struct {
 	ModelGroupCount    int    `json:"model_group_count,omitempty"`
 	ChannelKeyCount    int    `json:"channel_key_count,omitempty"`
 	Checksum           string `json:"checksum"`
+	// ChecksumSalt is the base64 random salt for the v3 keyed checksum.
+	ChecksumSalt string `json:"checksum_salt,omitempty"`
 }
 
 type PackageData struct {
@@ -70,6 +81,11 @@ type Preview struct {
 	HasSecrets    bool           `json:"has_secrets"`
 	TotalEntities int            `json:"total_entities"`
 	Conflicts     []ConflictItem `json:"conflicts"`
+	// Integrity tells the UI how much the checksum proves: "unauthenticated"
+	// (password-less packages carry only a corruption check — anyone can edit
+	// and re-hash them, so treat them like untrusted config) or
+	// "verified_on_import" (keyed HMAC, checked with the password on apply).
+	Integrity string `json:"integrity"`
 }
 
 type SecretImporter func(ctx context.Context, secrets map[string][]byte) error
@@ -98,4 +114,32 @@ func ComputePackageChecksumV2(pkg PackageData, password string) (string, error) 
 	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write(dataWithoutChecksum)
 	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// ComputePackageChecksumV3 is the v3 keyed checksum: HMAC-SHA256 keyed with
+// Argon2id(password, per-package salt, t=3, m=64 MiB). The salt is part of
+// the manifest and therefore covered by the MAC itself.
+func ComputePackageChecksumV3(pkg PackageData, password string) (string, error) {
+	salt, err := base64.StdEncoding.DecodeString(pkg.Manifest.ChecksumSalt)
+	if err != nil || len(salt) < 16 {
+		return "", ErrTamperedPackage
+	}
+	pkg.Manifest.Checksum = ""
+	data, err := json.Marshal(pkg)
+	if err != nil {
+		return "", err
+	}
+	key := argon2.IDKey([]byte(password), salt, 3, 64*1024, 4, 32)
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write(data)
+	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// newChecksumSalt returns a random base64 salt for v3 packages.
+func newChecksumSalt() (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(salt), nil
 }

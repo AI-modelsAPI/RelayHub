@@ -36,7 +36,10 @@ func ApplyToChannel(ch *domain.Channel, b Bundle) {
 	if ch.CustomHeaders == nil {
 		ch.CustomHeaders = map[string]string{}
 	}
-	if b.ProxyURL != "" || ch.ProxyURL != "" {
+	// An empty bundle field means "not specified", never "clear": the old
+	// condition wiped a configured proxy whenever the bundle omitted it,
+	// silently switching the channel to direct egress (AUDIT 2026-09-24 F12).
+	if b.ProxyURL != "" {
 		ch.ProxyURL = b.ProxyURL
 	}
 	if b.UserAgent != "" {
@@ -105,7 +108,22 @@ func ApplyRequestHeaders(h http.Header, ch domain.Channel) {
 
 // ProbeEgress fetches a public IP via the channel proxy. Empty on failure.
 func ProbeEgress(ctx context.Context, proxyRaw string) string {
-	client := HTTPClient(proxyRaw, 8*time.Second)
+	// An invalid proxy must not degrade to a direct probe: that reported the
+	// operator's real IP as the channel's egress and disclosed it to the
+	// probe service (AUDIT 2026-09-24 F13).
+	client, err := HTTPClientE(proxyRaw, 8*time.Second)
+	if err != nil {
+		return ""
+	}
+	return ProbeEgressWith(ctx, client)
+}
+
+// ProbeEgressWith asks the public IP echo service which address client exits
+// from. Callers pass the same client the channel's real traffic uses.
+func ProbeEgressWith(ctx context.Context, client *http.Client) string {
+	if client == nil {
+		return ""
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org", nil)
 	if err != nil {
 		return ""

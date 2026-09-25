@@ -69,6 +69,7 @@ Channel.proxy_url  >  egress_proxy_url（config / 环境变量）  >  进程环�
 验证配置：
 
 ```bash
+TOKEN=$(cat "<data-dir>/management.token")   # 或 config.json 里的 management_token
 curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/notify/test
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/settings | jq .notify
 ```
@@ -82,3 +83,57 @@ CDP 签到默认寻找 `#checkin-btn, .checkin-btn, button[data-action="checkin"
 ```
 
 注意：DOM 上的"成功"只是提示。签到调度器随后会用站点自己的记录（签到日历 / 奖励日志）核验；服务端没有记录就记为 `failed`，无法核验记为 `need_manual`，绝不凭页面元素宣布成功。
+
+## 4. 安全相关配置（AUDIT 2026-09-24）
+
+`config.json` 可以存放下面几个凭据类字段，启动时文件会被收紧为 `0600`，数据目录收紧为 `0700`。也可以改用环境变量传入，文件里就不必出现明文。
+
+| 字段 | 环境变量 | 作用 |
+|---|---|---|
+| `management_auth` | `RELAYHUB_MANAGEMENT_AUTH` | `token`（默认）或 `off`。`token` 模式下，除 `/api/v1/health`、`/healthz` 和配对接口外，所有管理 API（包括读取）都要求 `Authorization: Bearer <token>`。`off` 恢复旧行为：本机任何进程都可以不带凭据读写管理 API，启动日志会打印警告 |
+| `management_token` | `RELAYHUB_MANAGEMENT_TOKEN` | 显式指定管理令牌。不设置时，首次启动会随机生成一个，写入 `<data-dir>/management.token`（权限 `0600`），之后重启沿用。与 `management_auth: off` 同时设置会阻止启动 |
+| `proxy_username` / `proxy_password` | `RELAYHUB_PROXY_USERNAME` / `RELAYHUB_PROXY_PASSWORD` | 两个都设置时，本地 HTTP 代理要求 Basic 认证，SOCKS5 要求 RFC 1929 认证；只设置其中一个会阻止启动 |
+| `master_key_store` | `RELAYHUB_MASTER_KEY_STORE` | `file`（默认，`<data-dir>/master.key`）或 `keychain`（仅 macOS）。选 `keychain` 后主密钥存入登录钥匙串：已有的 `master.key` 会先迁移过去，回读校验通过后才删除文件；如果文件和钥匙串里的值不一致，就拒绝启动。之后备份和同步盘里就不再有明文主密钥（旧备份里仍然有，必要时请轮换渠道 Key）。钥匙串处于锁定状态时启动会失败，不会悄悄生成新密钥 |
+| `http_proxy_target_policy` / `socks5_target_policy` | — | 可选 `open`（默认）、`public_private`、`public_only`、`local_only`。无论选哪个，都会拒绝 RelayHub 自身的端口和云元数据地址；CGNAT（100.64/10）按私网处理 |
+
+### 管理 API 认证与控制台配对
+
+管理 API 默认要求令牌（`management_auth: token`）。浏览器通过一次性配对链接拿到令牌，令牌本身不会出现在任何 URL 里：
+
+- 启动日志会打印 `http://127.0.0.1:8790/#pair=<code>`。这个链接只能用一次，10 分钟后过期。
+- 运行 `relayhub pair` 会打印一个新链接（需要能读到令牌：`RELAYHUB_MANAGEMENT_TOKEN`、`config.json` 里的 `management_token`，或 `<data-dir>/management.token`；非默认数据目录请加 `-data-dir` 或设置 `RELAYHUB_DATA_DIR`）。
+- 配对码放在 URL 的 `#` 片段里，浏览器不会把它发给服务器，也就不会进入访问日志。控制台兑换成功后会把它从地址栏和历史记录中去掉，令牌只保存在该来源的 localStorage 里。
+- 没有配对码时，控制台会显示一个登录框，可以粘贴配对链接、配对码，或 `management.token` 里的令牌。
+- macOS 桌面应用会自动把令牌交给内嵌网页；菜单里的“在浏览器中打开”会附带一个新的配对链接。
+- `relayhub mcp` 按同样的顺序自己查找令牌。CLI 同步写入 Claude Code 的 MCP 条目只包含 `RELAYHUB_DATA_DIR`，不包含令牌。
+- 脚本可以直接读 `<data-dir>/management.token`，然后在请求中带上 `Authorization: Bearer $(cat …/management.token)`。
+- 审计日志的操作者字段会附带令牌指纹（`token:` 加 SHA-256 前 8 位十六进制），不会记录令牌本身。
+
+### 渠道请求头档案
+
+默认情况下，网关会把客户端 SDK 的身份头（`User-Agent`、`X-Stainless-*`、`anthropic-*`）原样转发，因为不少中转站只接受“看起来像 Claude Code”的请求。如果某个渠道不需要这些头，可以在该渠道的 `custom_headers` 里配置：
+
+```json
+{"X-Stainless-*": "", "X-Stainless-Lang": "js", "Anthropic-Beta": ""}
+```
+
+- 值为空：删除这个客户端头。
+- 名字以 `*` 结尾且值为空：删除所有以该前缀开头的头。
+- 先执行删除，再设置非空值，所以可以先整组删掉，再单独保留其中某一项。
+
+`Accept-Encoding`、hop-by-hop 头、`Origin`/`Referer`/`Sec-*`、`OpenAI-Organization`/`OpenAI-Project` 一律不会转发。
+
+### 渠道 Key 与地址绑定
+
+录入 Key 时，它会绑定到渠道当时 `base_url` 的 origin（协议 + 主机 + 端口）。之后如果把 `base_url` 改到另一个 origin，这些 Key 会被锁定：测试渠道时返回 `409 key_origin_mismatch`，网关也不会使用它们。需要在新地址下重新录入 Key。旧版本留下的 Key 在升级后首次启动时，会自动绑定到渠道当时的地址。
+
+### 导出包
+
+- 带密码的导出为 v3 格式：代理密码和敏感请求头只放在加密区，校验值使用随机盐。
+- 不带密码的导出只含遮蔽后的值。导入时，已有渠道保留本机原值；新渠道则直接丢弃这些占位值。
+
+### 模型自动同步
+
+- 手动同步和渠道的首次同步保持原有行为：上游列出的模型全部绑定并启用，多个中转站提供同一模型时照常负载均衡。
+- 已经上线的渠道在**后台定时同步**中新声明了某个模型，而这个模型已经由其他渠道提供（例如某个中转站突然开始列出 `gpt-4o`）时，绑定会被创建但保持**禁用**，同时发送 `models_held` 通知。确认可信后，在模型页手动启用即可；启用状态在之后的同步中会保留。
+- 每次同步最多接受 2000 个模型 ID。ID 最长 200 个字符，不能包含空白或控制字符。运维手工调整过的优先级、权重、启用状态和上游名映射不会被同步覆盖。

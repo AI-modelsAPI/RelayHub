@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -59,18 +58,6 @@ func NewCDPExecutor(rt *Runtime, dataDir string, detector func() Info) *CDPExecu
 	}
 }
 
-// findFreePort locates an available TCP port on localhost.
-func findFreePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	addr := l.Addr().(*net.TCPAddr)
-	return addr.Port, nil
-}
-
-// sanitizeTargetURL validates target URLs to ensure security boundaries.
 func sanitizeTargetURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -111,10 +98,11 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 		return CheckinResult{}, fmt.Errorf("failed to prepare profile dir: %w", err)
 	}
 
-	port, err := findFreePort()
-	if err != nil {
-		return CheckinResult{}, fmt.Errorf("failed to find free debugging port: %w", err)
+	// The profile directory is private to this user (AUDIT 2026-09-24 F15).
+	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
+		return CheckinResult{}, fmt.Errorf("failed to create profile dir: %w", err)
 	}
+	_ = os.Chmod(userDataDir, 0o700)
 
 	timeout := req.Timeout
 	if timeout <= 0 {
@@ -126,15 +114,39 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 	// Launch headless browser with remote debugging port, exiting through
 	// the channel's egress proxy when one is configured (launchArgs refuses
 	// credentialed proxies rather than silently going direct).
-	args, err := launchArgs(port, userDataDir, req.ProxyURL)
+	args, err := launchArgs(userDataDir, req.ProxyURL)
 	if err != nil {
 		return CheckinResult{}, err
 	}
 
+	// DevTools runs over a pair of pipes (--remote-debugging-pipe): the
+	// browser reads commands from fd 3 and writes replies to fd 4. A TCP
+	// debugging port — even one Chrome picks itself — is reachable by every
+	// local process and user, and CDP has no authentication: anyone could
+	// attach while the check-in runs and read the site's session cookies
+	// (AUDIT 2026-09-24 F15).
+	cmdR, cmdW, err := os.Pipe()
+	if err != nil {
+		return CheckinResult{}, fmt.Errorf("failed to create devtools pipe: %w", err)
+	}
+	respR, respW, err := os.Pipe()
+	if err != nil {
+		_ = cmdR.Close()
+		_ = cmdW.Close()
+		return CheckinResult{}, fmt.Errorf("failed to create devtools pipe: %w", err)
+	}
 	cmd := exec.CommandContext(runCtx, info.Path, args...)
+	cmd.ExtraFiles = []*os.File{cmdR, respW} // child fd 3 and fd 4
 	if err := e.runtime.StartProcess(cmd); err != nil {
+		for _, f := range []*os.File{cmdR, cmdW, respR, respW} {
+			_ = f.Close()
+		}
 		return CheckinResult{}, fmt.Errorf("failed to start browser process: %w", err)
 	}
+	// The child holds its own copies; closing ours lets the reader see EOF
+	// as soon as the browser exits.
+	_ = cmdR.Close()
+	_ = respW.Close()
 	// Guarantee process tree cleanup on exit
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -145,40 +157,30 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 		}
 	}()
 
-	// Wait for CDP endpoint to become ready
-	var target *cdp.TargetPage
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	client := cdp.ConnectPipe(respR, cmdW)
+	defer client.Close()
+
+	// Attaching waits for the browser to come up, which can take a large
+	// part of the budget on a loaded machine (seen under the -race suite on
+	// CI), so it shares the run's overall timeout instead of a tighter one.
+	page, err := cdp.AttachFirstPage(runCtx, client)
+	if err != nil {
 		if runCtx.Err() != nil {
 			return CheckinResult{}, runCtx.Err()
 		}
-		t, err := cdp.GetFirstPageTarget(runCtx, port)
-		if err == nil && t.WebSocketDebuggerURL != "" {
-			target = t
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+		return CheckinResult{}, fmt.Errorf("failed to attach to browser page: %w", err)
 	}
-	if target == nil {
-		return CheckinResult{}, errors.New("timeout waiting for browser remote debugging websocket endpoint")
-	}
-
-	client, err := cdp.Connect(runCtx, target.WebSocketDebuggerURL)
-	if err != nil {
-		return CheckinResult{}, fmt.Errorf("failed to connect to cdp: %w", err)
-	}
-	defer client.Close()
 
 	// Enable Page & Runtime domains
-	if _, err := client.Call(runCtx, "Page.enable", nil); err != nil {
+	if _, err := page.Call(runCtx, "Page.enable", nil); err != nil {
 		return CheckinResult{}, fmt.Errorf("cdp Page.enable failed: %w", err)
 	}
-	if _, err := client.Call(runCtx, "Runtime.enable", nil); err != nil {
+	if _, err := page.Call(runCtx, "Runtime.enable", nil); err != nil {
 		return CheckinResult{}, fmt.Errorf("cdp Runtime.enable failed: %w", err)
 	}
 
 	// Navigate to target URL
-	_, err = client.Call(runCtx, "Page.navigate", map[string]interface{}{
+	_, err = page.Call(runCtx, "Page.navigate", map[string]interface{}{
 		"url": req.URL,
 	})
 	if err != nil {
@@ -200,7 +202,7 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 		case <-runCtx.Done():
 			return CheckinResult{}, fmt.Errorf("checkin flow timed out: %w", runCtx.Err())
 		case <-pollTicker.C:
-			resRaw, err := client.Call(runCtx, "Runtime.evaluate", map[string]interface{}{
+			resRaw, err := page.Call(runCtx, "Runtime.evaluate", map[string]interface{}{
 				"expression":    probe,
 				"returnByValue": true,
 				"awaitPromise":  true,
@@ -228,7 +230,7 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 				if !clicked {
 					// Mark before sending: an ambiguous CDP reply must not repeat a mutation.
 					clicked = true
-					_, err := client.Call(runCtx, "Runtime.evaluate", map[string]interface{}{
+					_, err := page.Call(runCtx, "Runtime.evaluate", map[string]interface{}{
 						"expression": click,
 					})
 					if err != nil {

@@ -39,11 +39,15 @@ The management API / Web UI (`8790`) is loopback-only **by design** and cannot
 be rebound; reach it from inside the container:
 
 ```bash
-docker exec relayhub curl -s http://127.0.0.1:8790/api/v1/overview
+docker exec relayhub sh -c 'curl -s -H "Authorization: Bearer $(cat /data/management.token)" http://127.0.0.1:8790/api/v1/overview'
 ```
 
+The management API requires the token RelayHub generates into
+`/data/management.token` on first start (`management_auth: off` disables this;
+see `docs/operations.md` §4).
+
 Never publish `8787`/`8788` to a non-loopback host interface: the proxies are
-unauthenticated unless `Username`/`Password` are configured, and an open proxy
+unauthenticated unless `proxy_username`/`proxy_password` are configured, and an open proxy
 on a LAN is a relay for anyone on it. The gateway (`8789`) requires a local API
 key, but treat it the same way.
 

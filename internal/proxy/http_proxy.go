@@ -27,7 +27,10 @@ type HTTPConfig struct {
 	DialTimeout    time.Duration
 	IdleTimeout    time.Duration
 	TargetPolicy   TargetPolicy
-	Logger         *logging.Logger
+	// Guard lists RelayHub's own listener ports that must never be proxied
+	// to. The server's own port is always added (AUDIT 2026-09-24 F1/F3).
+	Guard  *SelfGuard
+	Logger *logging.Logger
 }
 
 type HTTPServer struct {
@@ -62,6 +65,7 @@ func NewHTTP(cfg HTTPConfig) (*HTTPServer, error) {
 		return nil, err
 	}
 	b.dialTimeout, b.idleTimeout = cfg.DialTimeout, cfg.IdleTimeout
+	b.useGuard(cfg.Guard)
 	return &HTTPServer{baseServer: b, cfg: cfg}, nil
 }
 
@@ -181,11 +185,19 @@ func minInt(a, b int) int {
 
 func (s *HTTPServer) handleHTTP(ctx context.Context, c net.Conn, r *http.Request, requestID string) {
 	_ = ctx
-	authority := r.URL.Host
-	if authority == "" {
-		authority = r.Host
+	// A forward proxy only accepts absolute-form request targets
+	// ("GET http://host/path"). Origin-form requests ("GET /") used to fall
+	// back to the Host header, which for a direct hit is the proxy itself:
+	// the proxy dialed itself recursively until file descriptors ran out and
+	// every RelayHub plane stopped accepting connections (AUDIT 2026-09-24
+	// F1). A web page could trigger that with <img src=http://127.0.0.1:8787/>.
+	if !r.URL.IsAbs() || r.URL.Host == "" {
+		s.log("warn", "proxy_http", requestID, map[string]any{"reason": "origin_form_rejected"})
+		_, _ = fmt.Fprint(c, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 50\r\nConnection: close\r\n\r\nRelayHub proxy requires absolute-form request URIs")
+		return
 	}
-	if authority == "" || r.URL.IsAbs() && !strings.EqualFold(r.URL.Scheme, "http") {
+	authority := r.URL.Host
+	if !strings.EqualFold(r.URL.Scheme, "http") {
 		return
 	}
 	// Do not forward proxy-only hop-by-hop headers or absolute-form URLs.

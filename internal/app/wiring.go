@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,6 +34,7 @@ import (
 	"relayhub/internal/gateway"
 	"relayhub/internal/guard"
 	"relayhub/internal/health"
+	"relayhub/internal/keybind"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/notify"
@@ -66,6 +69,9 @@ type Runtime struct {
 	// for in-flight management requests instead of hard-cutting the listener).
 	MgmtHTTP *http.Server
 	Notifier *notify.Dispatcher
+	// ManagementTokenSource says where the management token came from:
+	// "config", "off", or the path of <data-dir>/management.token.
+	ManagementTokenSource string
 
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -85,6 +91,15 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err := os.MkdirAll(absDataDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create data dir: %w", err)
 	}
+	// MkdirAll only applies 0700 to directories it creates; a pre-existing
+	// dir (Docker's /data, a hand-made dir, an older install) kept 0755 and
+	// the database landed world-readable (AUDIT 2026-09-24 F19).
+	restrictToOwner(absDataDir, 0o700)
+
+	mgmtToken, mgmtTokenSource, err := resolveManagementToken(absDataDir, cfg.ManagementAuth, cfg.ManagementToken)
+	if err != nil {
+		return nil, err
+	}
 
 	// Database
 	dbPath := filepath.Join(absDataDir, "relayhub.db")
@@ -97,6 +112,15 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migration failed: %w", err)
 	}
+	// SQLite creates files per umask (typically 0644); the DB holds proxy
+	// URLs, custom headers and request metadata. WAL/SHM files inherit the
+	// database file's mode once it is restricted.
+	for _, f := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		restrictToOwner(f, 0o600)
+	}
+	// config.json may hold the management token, proxy credentials and
+	// notification secrets (AUDIT 2026-09-24 F20).
+	restrictToOwner(filepath.Join(absDataDir, "config.json"), 0o600)
 
 	repo := repository.New(db.DB)
 	healthReg := health.NewRegistry()
@@ -159,7 +183,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	}
 
 	// Secret Store
-	keyProvider, err := secrets.NewFileKeyProvider(filepath.Join(absDataDir, "master.key"))
+	keyProvider, err := newKeyProvider(ctx, cfg.MasterKeyStore, filepath.Join(absDataDir, "master.key"), runtime.GOOS)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create key provider: %w", err)
@@ -168,6 +192,11 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create secret store: %w", err)
+	}
+	if n, err := bindLegacyChannelKeys(ctx, repo, secStore); err != nil {
+		log.Printf("relayhub: warning: binding legacy channel keys to their origin: %v", err)
+	} else if n > 0 {
+		log.Printf("relayhub: bound %d legacy channel key(s) to their channel's current origin", n)
 	}
 
 	// Local Auth
@@ -212,13 +241,26 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if httpPAddr == "" {
 		httpPAddr = "127.0.0.1:8787"
 	}
-	httpTargetPolicy := proxy.OpenPolicy()
-	if cfg.HTTPProxyTargetPolicy == "local_only" {
-		httpTargetPolicy = proxy.LocalOnlyPolicy()
+	httpTargetPolicy, err := targetPolicyFor(cfg.HTTPProxyTargetPolicy)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("http proxy: %w", err)
+	}
+	// One guard shared by both proxies: it holds every RelayHub listener
+	// port (proxies, gateway, management) so neither proxy can relay to the
+	// loopback management API or to itself (AUDIT 2026-09-24 F1/F3). The
+	// configured addresses are protected up front; the actual bound ports are
+	// added below once the listeners exist (they differ when ":0" is used).
+	selfGuard := proxy.NewSelfGuard()
+	for _, a := range []string{cfg.GatewayAddr, cfg.ManagementAddr} {
+		selfGuard.ProtectAddr(a)
 	}
 	httpProxy, err := proxy.NewHTTP(proxy.HTTPConfig{
 		Addr:         httpPAddr,
 		TargetPolicy: httpTargetPolicy,
+		Guard:        selfGuard,
+		Username:     cfg.ProxyUsername,
+		Password:     cfg.ProxyPassword,
 	})
 	if err != nil {
 		_ = db.Close()
@@ -229,13 +271,18 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	if socksAddr == "" {
 		socksAddr = "127.0.0.1:8788"
 	}
-	socksTargetPolicy := proxy.OpenPolicy()
-	if cfg.SOCKS5TargetPolicy == "local_only" {
-		socksTargetPolicy = proxy.LocalOnlyPolicy()
+	socksTargetPolicy, err := targetPolicyFor(cfg.SOCKS5TargetPolicy)
+	if err != nil {
+		_ = httpProxy.Shutdown(ctx)
+		_ = db.Close()
+		return nil, fmt.Errorf("socks5 proxy: %w", err)
 	}
 	socksProxy, err := proxy.NewSOCKS5(proxy.SOCKS5Config{
 		Addr:         socksAddr,
 		TargetPolicy: socksTargetPolicy,
+		Guard:        selfGuard,
+		Username:     cfg.ProxyUsername,
+		Password:     cfg.ProxyPassword,
 	})
 	if err != nil {
 		_ = httpProxy.Shutdown(ctx)
@@ -268,6 +315,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to listen on api addr %s: %w", apiAddr, err)
 	}
+	selfGuard.ProtectAddr(apiL.Addr().String())
 
 	refreshResolver := func(ctx context.Context) error {
 		if err := catalogSvc.Load(ctx); err != nil {
@@ -299,6 +347,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to listen on gateway addr %s: %w", gwAddr, err)
 	}
+	selfGuard.ProtectAddr(gwL.Addr().String())
 
 	browserRt := browser.NewRuntime()
 	sched.SetBrowserExecutor(browser.NewCDPExecutor(browserRt, absDataDir, browser.Detect))
@@ -317,6 +366,8 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	apiServer, err := api.NewConfiguredServer(api.Config{
 		Management:     apiAddr,
 		LocalOnly:      true,
+		Token:          mgmtToken,
+		DataDir:        absDataDir,
 		Repo:           repo,
 		SecretStore:    secStore,
 		AuditLogger:    auditLog,
@@ -411,7 +462,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		AuditLogger: auditLog,
 		Notifier:    notifier,
 		stopCh:      make(chan struct{}),
-		stopped:     make(chan struct{}),
+		// Source of the management credential, for the startup log.
+		ManagementTokenSource: mgmtTokenSource,
+		stopped:               make(chan struct{}),
 	}
 
 	return rt, nil
@@ -424,7 +477,9 @@ func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepos
 	if keys, err := repo.ListChannelKeys(ctx, ch.ID); err == nil && len(keys) > 0 {
 		enabled := make([]domain.ChannelKey, 0, len(keys))
 		for _, k := range keys {
-			if !k.Disabled {
+			// Keys are only released to the origin they were entered for
+			// (AUDIT 2026-09-24 F5).
+			if !k.Disabled && keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
 				enabled = append(enabled, k)
 			}
 		}
@@ -445,7 +500,7 @@ func resolveChannelCredential(ctx context.Context, repo repository.ResourceRepos
 			}
 		}
 	}
-	if ch.CredentialRef == "" {
+	if ch.CredentialRef == "" || !keybind.Allows(ch.CredentialRef, ch.ID, ch.BaseURL) {
 		return "", "", nil
 	}
 	secretBytes, err := secStore.Get(ctx, ch.CredentialRef)
@@ -484,12 +539,88 @@ func isLoopbackListen(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// bindLegacyChannelKeys re-seals channel keys created before origin binding
+// under a ref bound to the channel's current base_url origin, so they are no
+// longer released to whatever host base_url is changed to later (AUDIT
+// 2026-09-24 F5). The upgrade moment is trusted: the stored base_url is the
+// one the operator entered the key for.
+func bindLegacyChannelKeys(ctx context.Context, repo *repository.Store, store *secrets.Store) (int, error) {
+	channels, err := repo.ListChannels(ctx, "")
+	if err != nil {
+		return 0, err
+	}
+	bound := 0
+	for _, ch := range channels {
+		if keybind.Origin(ch.BaseURL) == "" {
+			continue
+		}
+		keys, err := repo.ListChannelKeys(ctx, ch.ID)
+		if err != nil {
+			return bound, err
+		}
+		for _, k := range keys {
+			if !keybind.Unbound(k.SecretRef) || !keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
+				continue
+			}
+			value, err := store.Get(ctx, k.SecretRef)
+			if err != nil {
+				continue
+			}
+			newRef := keybind.Bind(k.SecretRef, ch.BaseURL)
+			if err := store.Put(ctx, newRef, value); err != nil {
+				return bound, err
+			}
+			if err := repo.RebindChannelKeySecret(ctx, k.ID, newRef); err != nil {
+				_ = store.Delete(ctx, newRef)
+				return bound, err
+			}
+			_ = store.Delete(ctx, k.SecretRef)
+			bound++
+		}
+	}
+	return bound, nil
+}
+
+// restrictToOwner drops group/other permission bits from an existing path.
+// Failures (e.g. a directory owned by another user) are logged, not fatal.
+func restrictToOwner(path string, mode os.FileMode) {
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		log.Printf("relayhub: warning: %s is accessible to other users (mode %v) and could not be restricted: %v", path, info.Mode().Perm(), err)
+	}
+}
+
+// targetPolicyFor maps a configured policy name to a proxy target policy.
+// Unknown names fail startup instead of silently falling back to "open".
+// RelayHub's own listener ports and cloud metadata addresses are refused by
+// every policy (proxy.SelfGuard / metadata deny list).
+func targetPolicyFor(name string) (proxy.TargetPolicy, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "open":
+		return proxy.OpenPolicy(), nil
+	case "local_only":
+		return proxy.LocalOnlyPolicy(), nil
+	case "public_private":
+		return proxy.TargetPolicy{AllowPrivate: true, AllowPublic: true}, nil
+	case "public_only":
+		return proxy.TargetPolicy{AllowPublic: true}, nil
+	}
+	return proxy.TargetPolicy{}, fmt.Errorf("unknown proxy target policy %q (use open, public_private, public_only or local_only)", name)
+}
+
 func describeTargetPolicy(p proxy.TargetPolicy) string {
 	switch {
 	case p.AllowPublic && p.AllowPrivate && p.AllowLocal:
 		return "open (local+private+public)"
 	case !p.AllowPublic && !p.AllowPrivate && p.AllowLocal:
 		return "local_only"
+	case p.AllowPublic && p.AllowPrivate && !p.AllowLocal:
+		return "public_private"
+	case p.AllowPublic && !p.AllowPrivate && !p.AllowLocal:
+		return "public_only"
 	default:
 		return fmt.Sprintf("custom (local=%t private=%t public=%t)", p.AllowLocal, p.AllowPrivate, p.AllowPublic)
 	}
@@ -541,4 +672,21 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		r.Notifier.Flush(3 * time.Second)
 	}
 	return nil
+}
+
+// newKeyProvider selects where the secret-store key lives (AUDIT 2026-09-24
+// F18). "keychain" keeps it out of the data directory, so backups and sync
+// folders no longer carry the key next to the ciphertext.
+func newKeyProvider(ctx context.Context, store, keyPath, goos string) (secrets.KeyProvider, error) {
+	switch strings.ToLower(strings.TrimSpace(store)) {
+	case "", "file":
+		return secrets.NewFileKeyProvider(keyPath)
+	case "keychain":
+		if goos != "darwin" {
+			return nil, fmt.Errorf("master_key_store %q is only supported on macOS", store)
+		}
+		return secrets.NewKeychainKeyProvider(ctx, secrets.KeychainOptions{FilePath: keyPath})
+	default:
+		return nil, fmt.Errorf("unknown master_key_store %q (want \"file\" or \"keychain\")", store)
+	}
 }

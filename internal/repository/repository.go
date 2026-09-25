@@ -390,6 +390,15 @@ func (s *Store) UpdateChannelKey(ctx context.Context, k domain.ChannelKey) error
 		k.Label, boolInt(k.Disabled), k.ID)
 	return requireAffected(result, err)
 }
+
+// RebindChannelKeySecret points a channel key at a new secret ref. It is
+// deliberately not part of ResourceRepository: only the startup origin
+// binding migration may move key material (AUDIT 2026-09-24 F5).
+func (s *Store) RebindChannelKeySecret(ctx context.Context, id, secretRef string) error {
+	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE channel_keys SET secret_ref=? WHERE id=?`, secretRef, id)
+	return requireAffected(result, err)
+}
+
 func (s *Store) DeleteChannelKey(ctx context.Context, id string) error {
 	result, err := s.repositoryExecutor().ExecContext(ctx, `DELETE FROM channel_keys WHERE id=?`, id)
 	return requireAffected(result, err)

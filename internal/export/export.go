@@ -8,6 +8,7 @@ import (
 
 	"relayhub/internal/domain"
 	"relayhub/internal/repository"
+	"relayhub/internal/secretfields"
 )
 
 type SecretExporter func(ctx context.Context) (map[string][]byte, error)
@@ -63,6 +64,24 @@ func Create(ctx context.Context, repo repository.ResourceRepository, opts Export
 	}
 
 	creds := opts.IncludeSecrets && opts.Password != ""
+
+	// Proxy passwords and credential headers live inside channel rows. They
+	// used to be exported in the readable part of every package (AUDIT
+	// 2026-09-24 F10): the plaintext part now always carries masked forms,
+	// and password-protected packages carry the originals in the encrypted
+	// section so a round trip is lossless.
+	sealed := map[string][]byte{}
+	for i, ch := range channels {
+		if ch.ProxyURL != "" && secretfields.MaskProxyURL(ch.ProxyURL) != ch.ProxyURL {
+			sealed[channelProxyRef(ch.ID)] = []byte(ch.ProxyURL)
+		}
+		for name, value := range ch.CustomHeaders {
+			if value != "" && secretfields.SensitiveHeader(name) {
+				sealed[channelHeaderRef(ch.ID, name)] = []byte(value)
+			}
+		}
+		channels[i] = secretfields.MaskChannel(ch)
+	}
 	version := 1
 	if creds {
 		version = CurrentPackageVersion
@@ -104,6 +123,9 @@ func Create(ctx context.Context, repo repository.ResourceRepository, opts Export
 		} else {
 			secMap = make(map[string][]byte)
 		}
+		for ref, value := range sealed {
+			secMap[ref] = value
+		}
 
 		secretPayload, err := json.Marshal(secMap)
 		if err != nil {
@@ -121,7 +143,12 @@ func Create(ctx context.Context, repo repository.ResourceRepository, opts Export
 	// keep the plain SHA-256 (see manifest docs, AUDIT RH-13).
 	var checksum string
 	if creds {
-		checksum, err = ComputePackageChecksumV2(pkg, opts.Password)
+		salt, serr := newChecksumSalt()
+		if serr != nil {
+			return nil, serr
+		}
+		pkg.Manifest.ChecksumSalt = salt
+		checksum, err = ComputePackageChecksumV3(pkg, opts.Password)
 	} else {
 		checksum, err = ComputePackageChecksum(pkg)
 	}
@@ -131,4 +158,17 @@ func Create(ctx context.Context, repo repository.ResourceRepository, opts Export
 	pkg.Manifest.Checksum = checksum
 
 	return json.MarshalIndent(pkg, "", "  ")
+}
+
+// channelFieldPrefix namespaces channel credentials carried in the encrypted
+// section of an export. Entries under it are applied to channel rows on
+// import and never written to the secret store.
+const channelFieldPrefix = "__relayhub_export/channel/"
+
+func channelProxyRef(channelID string) string {
+	return channelFieldPrefix + channelID + "/proxy_url"
+}
+
+func channelHeaderRef(channelID, header string) string {
+	return channelFieldPrefix + channelID + "/header/" + header
 }

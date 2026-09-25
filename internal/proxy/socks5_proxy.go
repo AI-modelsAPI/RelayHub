@@ -24,7 +24,10 @@ type SOCKS5Config struct {
 	DialTimeout  time.Duration
 	IdleTimeout  time.Duration
 	TargetPolicy TargetPolicy
-	Logger       *logging.Logger
+	// Guard lists RelayHub's own listener ports that must never be proxied
+	// to. The server's own port is always added (AUDIT 2026-09-24 F3).
+	Guard  *SelfGuard
+	Logger *logging.Logger
 }
 
 type SOCKS5Server struct {
@@ -59,6 +62,7 @@ func NewSOCKS5(cfg SOCKS5Config) (*SOCKS5Server, error) {
 		return nil, err
 	}
 	b.dialTimeout, b.idleTimeout = cfg.DialTimeout, cfg.IdleTimeout
+	b.useGuard(cfg.Guard)
 	return &SOCKS5Server{baseServer: b, cfg: cfg}, nil
 }
 

@@ -170,7 +170,13 @@ func (u HTTPUpstream) Do(ctx context.Context, req Request) (Response, error) {
 		// above hands out cached, fail-closed transports (AUDIT RH-10/RH-20).
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(httpReq)
+	// API calls never follow redirects: a 3xx from a relay used to make the
+	// gateway GET an arbitrary (internal) URL and hand that body to the
+	// client as a 200 completion (AUDIT 2026-09-24 F9). The copy shares the
+	// cached transport.
+	noFollow := *client
+	noFollow.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noFollow.Do(httpReq)
 	if err != nil {
 		return Response{}, err
 	}
@@ -267,9 +273,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(ctx)
 		defer cancel()
 	}
-	input, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	input, err := io.ReadAll(io.LimitReader(r.Body, maxGatewayBody+1))
 	if err != nil {
 		writeGatewayError(w, r, http.StatusBadRequest, "client_error", "could not read request")
+		return
+	}
+	// Oversized bodies used to be truncated silently and forwarded as broken
+	// JSON (AUDIT 2026-09-24 F8).
+	if int64(len(input)) > maxGatewayBody {
+		writeGatewayError(w, r, http.StatusRequestEntityTooLarge, "client_error", "request body exceeds 16 MiB")
 		return
 	}
 	model, err := requestModel(protocol, input)
@@ -450,6 +462,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
 		rr.Sticky.Remember(routeReq.SessionKey, decision.Channel.ID, last.CredentialKeyID)
 	}
+	// A relay answering 200 with an HTML page (Cloudflare challenge, login or
+	// "insufficient balance" page) is a failure, not a completion to relay
+	// (AUDIT 2026-09-24 F9: response shape was never checked).
+	if ct := strings.ToLower(last.Header.Get("Content-Type")); strings.HasPrefix(ct, "text/html") {
+		if h.cfg.Health != nil {
+			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
+		}
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "provider_protocol", reqStart)
+		writeGatewayError(w, r, http.StatusBadGateway, "provider_protocol", "upstream returned an HTML page instead of an API response")
+		return
+	}
 	if stream {
 		upProto := normalizeProtocol(decision.ProviderModel.Protocol)
 		meta, err := writeSSE(w, last.Body, protocol, upProto, decision.Model.ID)
@@ -494,7 +517,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(last.Body, 16<<20))
+	body, err := io.ReadAll(io.LimitReader(last.Body, maxGatewayBody+1))
+	if err == nil && int64(len(body)) > maxGatewayBody {
+		err = errUpstreamTooLarge
+	}
+	if errors.Is(err, errUpstreamTooLarge) {
+		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "response_too_large", reqStart)
+		writeGatewayError(w, r, http.StatusBadGateway, "response_too_large", "upstream response exceeds 16 MiB")
+		return
+	}
 	if err != nil {
 		if h.cfg.Health != nil {
 			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
@@ -654,13 +685,42 @@ func endpointProtocol(path string) (string, string, error) {
 		return "", "", ErrUnsupportedPath
 	}
 }
+
+// maxGatewayBody bounds request and non-stream response bodies.
+const maxGatewayBody = 16 << 20
+
+var errUpstreamTooLarge = errors.New("upstream response exceeds gateway limit")
+
+// strippedRequestHeaders are never forwarded upstream.
+//
+// Accept-Encoding: when the client's value is forwarded, Go's transport no
+// longer decompresses transparently, so a relay that honours gzip returned
+// bytes the gateway then failed to parse ("malformed upstream JSON", 502,
+// channel marked unhealthy) — Python httpx/requests and Node fetch send it by
+// default (AUDIT 2026-09-24 F8). The transport negotiates compression itself.
+//
+// Hop-by-hop headers describe the client connection, not the upstream one.
+// Browser-context and OpenAI account headers identify the operator to a
+// third-party relay without being needed by any relay protocol.
+var strippedRequestHeaders = []string{
+	"Authorization", "X-Api-Key", "Cookie", "Set-Cookie", "Proxy-Authorization",
+	"Accept-Encoding", "Content-Length", "Host",
+	"Connection", "Keep-Alive", "Proxy-Connection", "Te", "Trailer", "Transfer-Encoding", "Upgrade",
+	"Origin", "Referer",
+	"Openai-Organization", "Openai-Project",
+}
+
 func requestHeaders(r *http.Request, protocol string, stream bool, decision router.Decision) http.Header {
 	h := r.Header.Clone()
-	h.Del("Authorization")
-	h.Del("x-api-key")
-	h.Del("Cookie")
-	h.Del("Set-Cookie")
-	h.Del("Proxy-Authorization")
+	for _, name := range strippedRequestHeaders {
+		h.Del(name)
+	}
+	for name := range h {
+		// Fetch-metadata and client hints only exist on browser requests.
+		if strings.HasPrefix(name, "Sec-") {
+			h.Del(name)
+		}
+	}
 	// Clients may spoof forwarding headers; the gateway speaks to the upstream
 	// itself, so these must never be forwarded verbatim (AUDIT RH-11).
 	h.Del("X-Forwarded-For")
@@ -679,13 +739,42 @@ func requestHeaders(r *http.Request, protocol string, stream bool, decision rout
 	if stream {
 		h.Set("Accept", "text/event-stream")
 	}
-	// Inject channel-specific custom headers (e.g. User-Agent, custom authorization headers)
-	if decision.Channel.CustomHeaders != nil {
-		for k, v := range decision.Channel.CustomHeaders {
+	applyChannelHeaders(h, decision.Channel.CustomHeaders)
+	return h
+}
+
+// applyChannelHeaders injects a channel's custom headers (User-Agent, custom
+// authorization headers, …). An empty value removes a forwarded client
+// header, and a name ending in "*" with an empty value removes every header
+// with that prefix — {"X-Stainless-*": ""} drops the SDK fingerprint (OS,
+// arch, runtime versions) for relays that do not need it, while relays that
+// only accept Claude-Code-looking traffic keep receiving it by default
+// (AUDIT 2026-09-24 F8). Removals run before sets, so a profile can strip a
+// family and pin selected members.
+func applyChannelHeaders(h http.Header, custom map[string]string) {
+	for k, v := range custom {
+		if strings.TrimSpace(v) != "" {
+			continue
+		}
+		prefix, wildcard := strings.CutSuffix(strings.TrimSpace(k), "*")
+		if !wildcard {
+			h.Del(k)
+			continue
+		}
+		if prefix == "" {
+			continue // "*" alone would strip everything, including Content-Type
+		}
+		for name := range h {
+			if len(name) >= len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+				h.Del(name)
+			}
+		}
+	}
+	for k, v := range custom {
+		if strings.TrimSpace(v) != "" {
 			h.Set(k, v)
 		}
 	}
-	return h
 }
 func retryableStatus(status int) bool {
 	return status == 401 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504

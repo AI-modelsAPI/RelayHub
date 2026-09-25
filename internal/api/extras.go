@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
+	"time"
 
 	"relayhub/internal/affinity"
 	"relayhub/internal/domain"
@@ -14,6 +14,7 @@ import (
 	"relayhub/internal/lab"
 	"relayhub/internal/mcp"
 	"relayhub/internal/ratelimit"
+	"relayhub/internal/secretfields"
 	"relayhub/internal/verify"
 )
 
@@ -109,21 +110,83 @@ func (s *Server) identityPatch(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, mapRepoError(err, "channel"))
 		return
 	}
-	var b identity.Bundle
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&b); err != nil {
+	// PATCH semantics: an absent field keeps the stored value, an explicit
+	// empty string clears it. The old handler decoded into a plain Bundle, so
+	// a request that only set user_agent carried proxy_url="" and silently
+	// switched the channel to a direct connection — exposing the operator's
+	// real IP to the relay (AUDIT 2026-09-24 F12). It also skipped channel
+	// validation and the audit log.
+	var in struct {
+		ChannelID string  `json:"channel_id"`
+		ProxyURL  *string `json:"proxy_url"`
+		UserAgent *string `json:"user_agent"`
+		Timezone  *string `json:"timezone"`
+		// Read-only fields a client may echo back from GET; ignored.
+		EgressIP *string `json:"egress_ip"`
+		Drift    *bool   `json:"drift"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&in); err != nil {
 		s.fail(w, r, badRequest("invalid_json", "malformed identity bundle"))
 		return
 	}
-	identity.ApplyToChannel(&ch, b)
-	if err := s.Repo.UpdateChannel(r.Context(), ch); err != nil {
-		s.fail(w, r, mapRepoError(err, "channel"))
+	if in.ChannelID != "" && in.ChannelID != ch.ID {
+		s.fail(w, r, badRequest("validation_error", "channel_id does not match the request path"))
 		return
 	}
-	s.notifyConfigChange(r.Context())
+	changed := []string{}
+	if in.ProxyURL != nil {
+		next := strings.TrimSpace(*in.ProxyURL)
+		// A client that GETs the (masked) bundle and PATCHes it back must not
+		// overwrite the stored proxy password with the masked form.
+		if next != ch.ProxyURL && !(next != "" && next == maskProxyUserinfo(ch.ProxyURL)) {
+			ch.ProxyURL = next
+			changed = append(changed, "proxy_url")
+		}
+	}
+	if ch.CustomHeaders == nil {
+		ch.CustomHeaders = map[string]string{}
+	}
+	setHeader := func(field, header string, v *string) {
+		if v == nil {
+			return
+		}
+		next := strings.TrimSpace(*v)
+		if next == ch.CustomHeaders[header] {
+			return
+		}
+		if next == "" {
+			delete(ch.CustomHeaders, header)
+		} else {
+			ch.CustomHeaders[header] = next
+		}
+		changed = append(changed, field)
+	}
+	setHeader("user_agent", "User-Agent", in.UserAgent)
+	setHeader("timezone", "X-Timezone", in.Timezone)
+	if err := validateChannel(ch); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if len(changed) > 0 {
+		if err := s.Repo.UpdateChannel(r.Context(), ch); err != nil {
+			s.fail(w, r, mapRepoError(err, "channel"))
+			return
+		}
+		s.auditEvent(r.Context(), "identity_update", r, map[string]string{"channel_id": ch.ID, "fields": strings.Join(changed, ",")})
+		s.notifyConfigChange(r.Context())
+	}
 	out := identity.FromChannel(ch)
 	if r.URL.Query().Get("probe") == "1" {
-		out.EgressIP = identity.ProbeEgress(r.Context(), ch.ProxyURL)
+		// Probe through the exact egress the channel's traffic uses (global
+		// default + fail-closed channel proxy), not a lookalike client
+		// (AUDIT 2026-09-24 F13).
+		out.EgressIP = identity.ProbeEgressWith(r.Context(), s.upstreamProbeClient(ch, 8*time.Second))
 	}
+	// Proxy credentials are never echoed (AUDIT RH-31); the PATCH response
+	// used to return them unmasked.
+	out.ProxyURL = maskProxyUserinfo(out.ProxyURL)
 	s.write(w, r, 200, map[string]any{"bundle": out})
 }
 
@@ -225,7 +288,13 @@ func (m mcpAdapter) ListChannels(ctx context.Context) (any, error) {
 	if m.s.Repo == nil {
 		return []any{}, nil
 	}
-	return m.s.Repo.ListChannels(ctx, "")
+	chs, err := m.s.Repo.ListChannels(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	// MCP output reaches LLM agents and their logs: same masking as the
+	// management API (AUDIT 2026-09-24 F10; RH-31 covered only /channels).
+	return safeChannels(chs), nil
 }
 func (m mcpAdapter) QuotaStatus(ctx context.Context) (any, error) {
 	if m.s.Repo == nil {
@@ -307,19 +376,4 @@ func (s *Server) methodAllowed(w http.ResponseWriter, r *http.Request, methods .
 
 // maskProxyUserinfo strips credentials from a proxy URL before it is echoed
 // by the management API (AUDIT RH-31: proxy passwords were returned in clear).
-func maskProxyUserinfo(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u == nil {
-		return raw
-	}
-	if u.User != nil {
-		if _, hasPassword := u.User.Password(); hasPassword {
-			u.User = url.User(u.User.Username())
-		}
-	}
-	return u.String()
-}
+func maskProxyUserinfo(raw string) string { return secretfields.MaskProxyURL(raw) }

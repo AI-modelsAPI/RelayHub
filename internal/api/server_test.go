@@ -122,12 +122,12 @@ func TestResourceCRUDAndRelationshipValidation(t *testing.T) {
 	post("/api/v1/routes", `{"id":"r1","name":"Default","protocol":"openai-chat","model_pattern":"m1","strategy":"priority","enabled":true}`)
 
 	for _, path := range []string{"providers", "channels", "models", "provider-models", "model-groups", "routes"} {
-		w := request(t, h, http.MethodGet, "/api/v1/"+path, "", "")
+		w := request(t, h, http.MethodGet, "/api/v1/"+path, "secret", "")
 		if w.Code != http.StatusOK {
 			t.Fatalf("GET %s: %d %s", path, w.Code, w.Body.String())
 		}
 	}
-	w := request(t, h, http.MethodGet, "/api/v1/model-groups/g1", "", "")
+	w := request(t, h, http.MethodGet, "/api/v1/model-groups/g1", "secret", "")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "m1") {
 		t.Fatalf("group=%d %s", w.Code, w.Body.String())
 	}
@@ -217,7 +217,7 @@ func TestInternalErrorsAreGenericAndLoggedWithRequestID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := request(t, s.Handler(), http.MethodGet, "/api/v1/providers", "", "")
+	w := request(t, s.Handler(), http.MethodGet, "/api/v1/providers", "token", "")
 	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "sentinel-secret-path") || !strings.Contains(w.Body.String(), "internal management error") {
 		t.Fatalf("response leaked or wrong: %d %s", w.Code, w.Body.String())
 	}

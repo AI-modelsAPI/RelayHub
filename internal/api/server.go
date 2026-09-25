@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -17,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"relayhub/internal/affinity"
 	"relayhub/internal/audit"
@@ -32,11 +35,13 @@ import (
 	"relayhub/internal/export"
 	"relayhub/internal/health"
 	"relayhub/internal/identity"
+	"relayhub/internal/keybind"
 	"relayhub/internal/lab"
 	"relayhub/internal/logging"
 	"relayhub/internal/notify"
 	"relayhub/internal/ratelimit"
 	"relayhub/internal/repository"
+	"relayhub/internal/secretfields"
 	"relayhub/internal/secrets"
 	"relayhub/internal/verify"
 	webassets "relayhub/internal/web"
@@ -48,7 +53,9 @@ const apiPrefix = "/api/v1/"
 // directly; remote servers can only be served through NewServerOnListener,
 // which enforces the listener peer policy before routing requests.
 type Server struct {
-	Token          string
+	Token string
+	// pairing holds one-time console pairing codes (see pairing.go).
+	pairing        pairingStore
 	Repo           repository.ResourceRepository
 	LocalOnly      bool
 	Management     string
@@ -138,6 +145,11 @@ type Config struct {
 	// boundary. Direct Handler use remains available for local in-process tests.
 	Listener net.Listener
 
+	// DataDir is the RelayHub data directory. The Claude Code MCP entry
+	// passes it to `relayhub mcp` so the bridge finds management.token even
+	// with a non-default data directory.
+	DataDir string
+
 	// CLISync / ImportExport configuration
 	BackupDir   string
 	ClaudePath  string
@@ -200,7 +212,7 @@ func NewConfiguredServer(cfg Config) (*Server, error) {
 	}
 	syncEngine := clisync.NewEngine(cfg.Repo, cfg.BackupDir)
 	cliSyncSvc := clisync.NewService(syncEngine, cfg.LocalKeys, gatewayBase, map[string]clisync.Syncer{
-		"claude": &claude.Syncer{Engine: syncEngine, Path: cfg.ClaudePath, GatewayAddr: gatewayBase},
+		"claude": &claude.Syncer{Engine: syncEngine, Path: cfg.ClaudePath, GatewayAddr: gatewayBase, ManagementAddr: cfg.Management, DataDir: cfg.DataDir},
 		"codex":  &codex.Syncer{Engine: syncEngine, Path: cfg.CodexPath, GatewayAddr: gatewayBase},
 		"hermes": &hermes.Syncer{Engine: syncEngine, Home: cfg.HermesHome, GatewayAddr: gatewayBase},
 	})
@@ -293,6 +305,8 @@ func (s *Server) managementRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/api/v1/health", s.health)
+	mux.HandleFunc("/api/v1/auth/pair", s.authPair)
+	mux.HandleFunc("/api/v1/auth/pair-codes", s.authPairCodes)
 	mux.HandleFunc("/api/v1/overview", s.overview)
 	mux.HandleFunc("/api/v1/providers", s.providers)
 	mux.HandleFunc("/api/v1/providers/", s.providers)
@@ -354,7 +368,27 @@ func (s *Server) managementRoutes() http.Handler {
 		}
 		http.FileServer(http.FS(webassets.Assets)).ServeHTTP(w, r)
 	}))
-	return s.browserBoundary(mux)
+	return s.browserBoundary(s.requireAuthorization(mux))
+}
+
+// publicAPIPaths are the only /api/ endpoints served without authorization.
+// Pairing redeems a one-time code, so it cannot require the token it hands
+// out (AUDIT 2026-09-24 F4).
+var publicAPIPaths = map[string]bool{"/api/v1/health": true, "/api/v1/auth/pair": true}
+
+// requireAuthorization applies the shared authorization check to every /api/
+// request before routing. Authorization used to be opt-in per handler, and
+// none of the extras handlers (usage, verify, identity, sessions, lab, route
+// explain, MCP) called it, so a configured token did not protect them
+// (AUDIT 2026-09-24 F11). Handlers may still call s.authorize; the check is
+// stateless and idempotent.
+func (s *Server) requireAuthorization(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && !publicAPIPaths[r.URL.Path] && !s.authorize(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) peerAllowed(w http.ResponseWriter, r *http.Request) bool {
@@ -465,7 +499,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.write(w, r, http.StatusOK, map[string]any{"status": "ok", "management": s.Management, "local_only": s.LocalOnly, "request_id": requestID(r)})
 }
 func (s *Server) healthRequestAllowed(w http.ResponseWriter, r *http.Request) bool {
-	if !s.authorize(w, r) {
+	// Liveness stays public on the loopback management plane: the desktop
+	// shell and scripts probe it before they hold a credential, and it
+	// reveals nothing but the listen address. Remote management keeps
+	// requiring the token.
+	if !s.LocalOnly && !s.authorize(w, r) {
 		return false
 	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
@@ -504,12 +542,14 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 	// Loopback local mode without a configured token: allow everything.
 	// The listener/peer policy already guarantees the peer is loopback.
+	// The shipped binary always configures a token unless the operator sets
+	// management_auth to "off" (AUDIT 2026-09-24 F4).
 	if s.LocalOnly && s.Token == "" {
 		return true
 	}
-	if s.LocalOnly && (r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions) {
-		return true
-	}
+	// With a token, reads are protected as well: request logs, lab captures
+	// and usage history are as sensitive as the mutations. Reads used to stay
+	// open on loopback, so any local process or user could pull them.
 	if s.Token == "" {
 		s.fail(w, r, unauthorized())
 		return false
@@ -544,10 +584,16 @@ func (s *Server) auditEvent(ctx context.Context, action string, r *http.Request,
 	}
 	// Previously the error was discarded; a failed audit write must at least be
 	// observable in the server log (AUDIT RH-30).
+	// The actor names the credential (a hash prefix, never the token) so
+	// token-authenticated changes can be told apart (AUDIT 2026-09-24 F4).
+	actor := r.RemoteAddr
+	if id := s.credentialID(r); id != "" {
+		actor += " " + id
+	}
 	if err := s.AuditLogger.Record(ctx, audit.Event{
 		Action:    action,
 		RequestID: requestID(r),
-		Actor:     r.RemoteAddr,
+		Actor:     actor,
 		Metadata:  metadata,
 	}); err != nil && s.Logger != nil {
 		_ = s.Logger.Event("warn", "audit_write_failed", "", map[string]any{"action": action, "error": err.Error()})
@@ -609,11 +655,16 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 
 	// Build the upstream /models endpoint. Prefer /v1/models; fall back to /models.
 	// Existing channels go out through their configured proxy / identity headers
-	// (AUDIT RH-10); draft-channel probes have no channel identity to apply.
-	client := &http.Client{Timeout: 20 * time.Second}
+	// (AUDIT RH-10). Draft-channel probes have no channel identity, but they
+	// still leave through the global egress (same-origin redirects only)
+	// instead of a bare direct client that bypassed the egress policy and
+	// exposed the operator's own IP to the relay being evaluated (AUDIT
+	// 2026-09-24 F7).
+	probeCh := domain.Channel{BaseURL: baseURL}
 	if haveChannel {
-		client = s.upstreamProbeClient(ch, 20*time.Second)
+		probeCh = ch
 	}
+	client := s.upstreamProbeClient(probeCh, 20*time.Second)
 	endpoints := []string{baseURL + "/v1/models", baseURL + "/models"}
 	var lastErr error
 	for _, ep := range endpoints {
@@ -723,24 +774,49 @@ var errInvalidPattern = errors.New("invalid pattern")
 // optional regex pattern, and rebuilds the channel's provider-model bindings.
 // Extracted so both the HTTP handler and the scheduler auto-sync callback share
 // one implementation. Returns the surviving model names and the count bound.
+// maxSyncedModels bounds how many models one upstream sync may register.
+const maxSyncedModels = 2000
+
+// validSyncedModelID accepts printable model identifiers of sane length.
+func validSyncedModelID(id string) bool {
+	if id == "" || len(id) > 200 {
+		return false
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || r == utf8.RuneError {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern string) ([]string, int, error) {
+	filtered, created, _, err := s.syncChannelModelsMode(ctx, channelID, pattern, false)
+	return filtered, created, err
+}
+
+// syncChannelModelsMode performs the sync. In background mode (scheduler
+// auto-sync) it also returns the model IDs whose new bindings were held
+// disabled; see heldForReview.
+func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern string, background bool) ([]string, int, []string, error) {
+	var held []string
 	if s.Repo == nil {
-		return nil, 0, errors.New("resource persistence is not configured")
+		return nil, 0, nil, errors.New("resource persistence is not configured")
 	}
 	ch, err := s.Repo.GetChannel(ctx, channelID)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	apiKey := s.resolveChannelAPIKey(ctx, ch)
 	models, err := s.fetchUpstreamModelList(ctx, ch, apiKey)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	filtered := models
 	if pattern != "" {
 		re, reErr := regexp.Compile(pattern)
 		if reErr != nil {
-			return nil, 0, fmt.Errorf("%w: %s", errInvalidPattern, reErr.Error())
+			return nil, 0, nil, fmt.Errorf("%w: %s", errInvalidPattern, reErr.Error())
 		}
 		filtered = filtered[:0]
 		for _, m := range models {
@@ -748,6 +824,44 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 				filtered = append(filtered, m)
 			}
 		}
+	}
+	// Upstream model lists are untrusted input from a third-party relay:
+	// drop malformed IDs and refuse absurd lists instead of registering
+	// every entry as a global model (AUDIT 2026-09-24 F6).
+	valid := filtered[:0:0]
+	seen := map[string]bool{}
+	for _, m := range filtered {
+		if validSyncedModelID(m) && !seen[m] {
+			seen[m] = true
+			valid = append(valid, m)
+		}
+	}
+	filtered = valid
+	if len(filtered) > maxSyncedModels {
+		return nil, 0, nil, fmt.Errorf("%w: upstream listed %d models (limit %d); narrow auto_sync_pattern", errInvalidPattern, len(filtered), maxSyncedModels)
+	}
+	// Operator edits to existing bindings (priority, weight, enabled, upstream
+	// name mapping, protocol, transforms) survive a re-sync; the old
+	// delete-and-recreate reset them on every scheduled auto-sync.
+	previous := map[string]domain.ProviderModel{}
+	servedElsewhere := map[string]bool{}
+	if all, lerr := s.Repo.ListProviderModels(ctx, ""); lerr == nil {
+		for _, pm := range all {
+			if pm.ChannelID == channelID {
+				previous[pm.ModelID] = pm
+			} else if pm.Enabled {
+				servedElsewhere[pm.ModelID] = true
+			}
+		}
+	}
+	// Background re-syncs of an onboarded channel do not let it silently
+	// take a share of a model other channels already serve: a relay that
+	// later starts listing "gpt-4o" gets a disabled binding the operator has
+	// to enable (AUDIT 2026-09-24 F6). Manual syncs and a channel's first
+	// sync keep enabling everything, so multi-relay load balancing still
+	// works out of the box.
+	heldForReview := func(model string) bool {
+		return background && len(previous) > 0 && servedElsewhere[model]
 	}
 	// Bindings inherit the provider protocol instead of hard-coded openai-chat:
 	// anthropic upstreams previously got non-routable "openai-chat" bindings
@@ -766,7 +880,7 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 	}
 	plans := make([]bindingPlan, 0, len(filtered))
 	for _, m := range filtered {
-		plans = append(plans, bindingPlan{pm: domain.ProviderModel{
+		pm := domain.ProviderModel{
 			ID:                fmt.Sprintf("pm-%s-%s", channelID, m),
 			ProviderID:        ch.ProviderID,
 			ChannelID:         channelID,
@@ -776,7 +890,22 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 			Priority:          ch.Priority,
 			Weight:            ch.Weight,
 			Enabled:           true,
-		}})
+		}
+		if _, ok := previous[m]; !ok && heldForReview(m) {
+			pm.Enabled = false
+			held = append(held, m)
+		}
+		if old, ok := previous[m]; ok {
+			pm.ID = old.ID
+			pm.UpstreamModelName = old.UpstreamModelName
+			pm.Protocol = old.Protocol
+			pm.RequestTransform = old.RequestTransform
+			pm.ResponseTransform = old.ResponseTransform
+			pm.Priority = old.Priority
+			pm.Weight = old.Weight
+			pm.Enabled = old.Enabled
+		}
+		plans = append(plans, bindingPlan{pm: pm})
 	}
 	created := 0
 	apply := func(tx *repository.Tx) error {
@@ -803,19 +932,19 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 		WithTx(context.Context, func(*repository.Tx) error) error
 	}); ok {
 		if err := storeWithTx.WithTx(ctx, apply); err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 	} else {
 		// Repositories without transaction support (test fakes) get the same
 		// logic without the atomicity wrapper.
 		if err := s.Repo.DeleteProviderModelsByChannel(ctx, channelID); err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		created = 0
 		for _, plan := range plans {
 			_ = s.Repo.CreateModel(ctx, domain.Model{ID: plan.pm.ModelID, DisplayName: plan.pm.ModelID, Enabled: true})
 			if err := s.Repo.CreateProviderModel(ctx, plan.pm); err != nil {
-				return nil, 0, fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
+				return nil, 0, nil, fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
 			}
 			created++
 		}
@@ -825,13 +954,27 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 	// automatic model syncs updated the DB while the gateway kept routing with
 	// stale bindings (AUDIT RH-15).
 	s.notifyConfigChange(ctx)
-	return filtered, created, nil
+	return filtered, created, held, nil
 }
 
 // SyncChannelModels is the exported entry the scheduler's auto-sync callback
 // uses; it discards the model list and reports only an error.
 func (s *Server) SyncChannelModels(ctx context.Context, channelID, pattern string) error {
-	_, _, err := s.syncChannelModels(ctx, channelID, pattern)
+	_, _, held, err := s.syncChannelModelsMode(ctx, channelID, pattern, true)
+	if err == nil && len(held) > 0 {
+		shown := held
+		if len(shown) > 10 {
+			shown = shown[:10]
+		}
+		log.Printf("relayhub: model auto-sync: channel %s newly lists %d model(s) already served by other channels; bindings held disabled: %s", channelID, len(held), strings.Join(shown, ", "))
+		s.Notifier.Notify(notify.Event{
+			Kind:      notify.KindModelsHeld,
+			Severity:  notify.SeverityWarning,
+			Title:     "模型同步：新声明的模型已暂停",
+			Body:      fmt.Sprintf("渠道 %s 新声明了 %d 个其他渠道已在提供的模型（%s）。这些绑定已创建但处于禁用状态，确认可信后请在模型页手动启用。", channelID, len(held), strings.Join(shown, ", ")),
+			ChannelID: channelID,
+		})
+	}
 	return err
 }
 
@@ -1148,12 +1291,15 @@ func (s *Server) channelKeys(w http.ResponseWriter, r *http.Request) {
 			s.fail(w, r, badRequest("validation_error", "channel_id and value are required"))
 			return
 		}
-		if _, err := s.Repo.GetChannel(ctx, input.ChannelID); err != nil {
+		keyCh, err := s.Repo.GetChannel(ctx, input.ChannelID)
+		if err != nil {
 			s.fail(w, r, mapRepoError(err, "channel"))
 			return
 		}
 		keyID := "chk-" + newID()
-		secretRef := "chkey:" + input.ChannelID + ":" + keyID
+		// The ref carries the origin the key is entered for; it is only ever
+		// released to that origin (AUDIT 2026-09-24 F5).
+		secretRef := keybind.Bind(keybind.ChannelKeyPrefix+input.ChannelID+":"+keyID, keyCh.BaseURL)
 		if err := s.SecretStore.Put(ctx, secretRef, []byte(input.Value)); err != nil {
 			s.fail(w, r, internal(err))
 			return
@@ -1420,25 +1566,19 @@ func (s *Server) channelTest(w http.ResponseWriter, r *http.Request) {
 				s.fail(w, r, notFound("channel key not found for this channel"))
 				return
 			}
+			if !keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
+				s.fail(w, r, keyOriginMismatch())
+				return
+			}
 			if secret, err := s.SecretStore.Get(r.Context(), k.SecretRef); err == nil {
 				apiKey = string(secret)
 			}
 		} else {
-			if keys, err := s.Repo.ListChannelKeys(r.Context(), input.ChannelID); err == nil {
-				for _, k := range keys {
-					if k.Disabled {
-						continue
-					}
-					if secret, err := s.SecretStore.Get(r.Context(), k.SecretRef); err == nil {
-						apiKey = string(secret)
-						break
-					}
-				}
-			}
-			if apiKey == "" && ch.CredentialRef != "" {
-				if secret, err := s.SecretStore.Get(r.Context(), ch.CredentialRef); err == nil {
-					apiKey = string(secret)
-				}
+			var locked bool
+			apiKey, locked = s.channelKeyFor(r.Context(), ch)
+			if apiKey == "" && locked {
+				s.fail(w, r, keyOriginMismatch())
+				return
 			}
 		}
 	}
@@ -1545,25 +1685,44 @@ func (s *Server) fetchUpstreamModelList(ctx context.Context, ch domain.Channel, 
 // resolveChannelAPIKey mirrors the key selection used by test/sync paths:
 // first enabled per-channel key, falling back to the legacy CredentialRef.
 func (s *Server) resolveChannelAPIKey(ctx context.Context, ch domain.Channel) string {
+	key, _ := s.channelKeyFor(ctx, ch)
+	return key
+}
+
+// channelKeyFor returns the first enabled key the channel may send to its
+// current base_url, falling back to the legacy CredentialRef. locked reports
+// that keys exist but are bound to a different origin (AUDIT 2026-09-24 F5).
+func (s *Server) channelKeyFor(ctx context.Context, ch domain.Channel) (key string, locked bool) {
 	if s.SecretStore == nil {
-		return ""
+		return "", false
 	}
 	if keys, err := s.Repo.ListChannelKeys(ctx, ch.ID); err == nil {
 		for _, k := range keys {
 			if k.Disabled {
 				continue
 			}
+			if !keybind.Allows(k.SecretRef, ch.ID, ch.BaseURL) {
+				locked = true
+				continue
+			}
 			if secret, gerr := s.SecretStore.Get(ctx, k.SecretRef); gerr == nil {
-				return string(secret)
+				return string(secret), false
 			}
 		}
 	}
 	if ch.CredentialRef != "" {
+		if !keybind.Allows(ch.CredentialRef, ch.ID, ch.BaseURL) {
+			return "", true
+		}
 		if secret, gerr := s.SecretStore.Get(ctx, ch.CredentialRef); gerr == nil {
-			return string(secret)
+			return string(secret), false
 		}
 	}
-	return ""
+	return "", locked
+}
+
+func keyOriginMismatch() error {
+	return fault{status: http.StatusConflict, code: "key_origin_mismatch", message: "the channel's keys were entered for a different base_url origin; re-enter the key for the new address"}
 }
 
 func (s *Server) secrets(w http.ResponseWriter, r *http.Request) {
@@ -1787,6 +1946,7 @@ func (s *Server) channelResource(w http.ResponseWriter, r *http.Request, ctx con
 			// that omits them must not erase the last observation.
 			if existing, gErr := s.Repo.GetChannel(ctx, c.ID); gErr == nil {
 				preserveSystemFields(&c, existing)
+				restoreMaskedSecrets(&c, existing)
 			}
 			e = s.Repo.UpdateChannel(ctx, c)
 		}
@@ -2464,6 +2624,9 @@ func cliSyncFault(err error) error {
 	if errors.Is(err, clisync.ErrUnknownCLI) {
 		return badRequest("unknown_cli", err.Error())
 	}
+	if errors.Is(err, clisync.ErrUntrustedBaseURL) {
+		return badRequest("untrusted_base_url", err.Error())
+	}
 	return fault{status: http.StatusInternalServerError, code: "cli_sync_failed", message: err.Error(), cause: err}
 }
 
@@ -2841,9 +3004,19 @@ func preserveSystemFields(c *domain.Channel, existing domain.Channel) {
 }
 
 func safeChannel(c domain.Channel) domain.Channel {
-	c.ProxyURL = maskProxyUserinfo(c.ProxyURL)
-	return c
+	// custom_headers is documented as the place for custom authorization
+	// headers, yet GET /channels and MCP echoed them verbatim (AUDIT
+	// 2026-09-24 F10); the rules are shared with exports.
+	return secretfields.MaskChannel(c)
 }
+
+// restoreMaskedSecrets keeps stored credentials when an update echoes the
+// masked forms produced by safeChannel (a GET-modify-PUT round trip used to
+// overwrite the proxy password with the masked URL).
+func restoreMaskedSecrets(c *domain.Channel, existing domain.Channel) {
+	secretfields.RestoreMasked(c, existing)
+}
+
 func safeChannels(v []domain.Channel) []domain.Channel {
 	for i := range v {
 		v[i] = safeChannel(v[i])

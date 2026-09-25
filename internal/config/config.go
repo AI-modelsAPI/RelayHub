@@ -26,15 +26,41 @@ type Config struct {
 	SOCKS5Addr     string `json:"socks5_addr"`
 	GatewayAddr    string `json:"gateway_addr"`
 	ManagementAddr string `json:"management_addr"`
-	// Proxy target policies: "open" allows public internet targets (default for out-of-the-box operation);
-	// "local_only" limits targets to loopback/link-local.
+	// Proxy target policies: "open" (default) allows local, private and public
+	// targets; "public_private" drops loopback/link-local; "public_only" also
+	// drops RFC1918 ranges; "local_only" limits targets to loopback/link-local.
+	// Every policy refuses RelayHub's own listener ports and cloud metadata
+	// addresses (AUDIT 2026-09-24 F1-F3).
 	HTTPProxyTargetPolicy string `json:"http_proxy_target_policy"`
 	SOCKS5TargetPolicy    string `json:"socks5_target_policy"`
+	// ProxyUsername / ProxyPassword, when both set, require credentials on
+	// the local HTTP (Proxy-Authorization: Basic) and SOCKS5 (RFC 1929)
+	// proxies, so other local processes and users cannot borrow the egress
+	// (AUDIT 2026-09-24 F2). Env: RELAYHUB_PROXY_USERNAME / _PASSWORD.
+	ProxyUsername string `json:"proxy_username"`
+	ProxyPassword string `json:"proxy_password"`
+	// MasterKeyStore selects where the secret-store key lives: "file"
+	// (default, <data-dir>/master.key) or "keychain" (macOS login keychain;
+	// an existing master.key is migrated and removed). AUDIT 2026-09-24 F18.
+	// Env: RELAYHUB_MASTER_KEY_STORE.
+	MasterKeyStore string `json:"master_key_store"`
 	// EgressProxyURL is the global default exit for outbound AI gateway,
 	// check-in and browser traffic (http://, https://, socks5://, or
 	// "direct"). A channel's own proxy_url takes precedence. Empty means the
 	// process environment (HTTPS_PROXY etc.) decides. Env: RELAYHUB_EGRESS_PROXY.
 	EgressProxyURL string `json:"egress_proxy_url"`
+	// ManagementToken, when set, is the bearer token ("Authorization: Bearer
+	// …") the management API requires; otherwise a random token is generated
+	// into <data-dir>/management.token (see ManagementAuth). Before this field
+	// existed the server had no way to enable its token check (AUDIT
+	// 2026-09-24 F4).
+	ManagementToken string `json:"management_token"`
+	// ManagementAuth controls management API authentication: "token"
+	// (default) requires a bearer token on every /api/ call except liveness
+	// and pairing — management_token when set, otherwise a random token kept
+	// in <data-dir>/management.token; "off" restores the unauthenticated
+	// loopback API (AUDIT 2026-09-24 F4). Env: RELAYHUB_MANAGEMENT_AUTH.
+	ManagementAuth string `json:"management_auth"`
 	// Notify configures outbound notifications (check-in failures, quota
 	// low, breaker open). All fields optional; env overrides see ApplyEnv.
 	Notify NotifyConfig `json:"notify"`
@@ -63,6 +89,11 @@ func ApplyEnv(cfg *Config) {
 		}
 	}
 	set(&cfg.EgressProxyURL, "RELAYHUB_EGRESS_PROXY")
+	set(&cfg.ManagementToken, "RELAYHUB_MANAGEMENT_TOKEN")
+	set(&cfg.ManagementAuth, "RELAYHUB_MANAGEMENT_AUTH")
+	set(&cfg.ProxyUsername, "RELAYHUB_PROXY_USERNAME")
+	set(&cfg.ProxyPassword, "RELAYHUB_PROXY_PASSWORD")
+	set(&cfg.MasterKeyStore, "RELAYHUB_MASTER_KEY_STORE")
 	set(&cfg.Notify.WebhookURL, "RELAYHUB_NOTIFY_WEBHOOK_URL")
 	set(&cfg.Notify.BarkURL, "RELAYHUB_NOTIFY_BARK_URL")
 	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
@@ -83,6 +114,7 @@ func Defaults(dataDir string) Config {
 		HTTPProxyAddr: DefaultHTTPProxyAddr, SOCKS5Addr: DefaultSOCKS5Addr,
 		GatewayAddr: DefaultGatewayAddr, ManagementAddr: DefaultManagementAddr,
 		HTTPProxyTargetPolicy: "open", SOCKS5TargetPolicy: "open",
+		ManagementAuth: "token",
 	}
 }
 
@@ -210,6 +242,21 @@ func merge(dst *Config, src Config) {
 	}
 	if src.SOCKS5TargetPolicy != "" {
 		dst.SOCKS5TargetPolicy = src.SOCKS5TargetPolicy
+	}
+	if src.ManagementToken != "" {
+		dst.ManagementToken = src.ManagementToken
+	}
+	if src.ManagementAuth != "" {
+		dst.ManagementAuth = src.ManagementAuth
+	}
+	if src.ProxyUsername != "" {
+		dst.ProxyUsername = src.ProxyUsername
+	}
+	if src.ProxyPassword != "" {
+		dst.ProxyPassword = src.ProxyPassword
+	}
+	if src.MasterKeyStore != "" {
+		dst.MasterKeyStore = src.MasterKeyStore
 	}
 	if src.EgressProxyURL != "" {
 		dst.EgressProxyURL = src.EgressProxyURL

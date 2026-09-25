@@ -18,7 +18,7 @@ func TestLaunchArgsProxy(t *testing.T) {
 		}
 		return false
 	}
-	args, err := launchArgs(9222, "/tmp/p", "")
+	args, err := launchArgs("/tmp/p", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,22 +30,22 @@ func TestLaunchArgsProxy(t *testing.T) {
 	if args[len(args)-1] != "about:blank" {
 		t.Fatalf("about:blank must stay the final positional argument: %v", args)
 	}
-	args, err = launchArgs(9222, "/tmp/p", "socks5h://127.0.0.1:1080")
+	args, err = launchArgs("/tmp/p", "socks5h://127.0.0.1:1080")
 	if err != nil || !has(args, "--proxy-server=socks5://127.0.0.1:1080") {
 		t.Fatalf("socks5 proxy flag missing: %v %v", args, err)
 	}
-	args, err = launchArgs(9222, "/tmp/p", "http://127.0.0.1:7890")
+	args, err = launchArgs("/tmp/p", "http://127.0.0.1:7890")
 	if err != nil || !has(args, "--proxy-server=http://127.0.0.1:7890") {
 		t.Fatalf("http proxy flag missing: %v %v", args, err)
 	}
-	args, err = launchArgs(9222, "/tmp/p", "direct")
+	args, err = launchArgs("/tmp/p", "direct")
 	if err != nil || !has(args, "--no-proxy-server") {
 		t.Fatalf("direct must disable proxies: %v %v", args, err)
 	}
-	if _, err := launchArgs(9222, "/tmp/p", "http://user:pw@127.0.0.1:7890"); !errors.Is(err, ErrProxyCredentialsUnsupported) {
+	if _, err := launchArgs("/tmp/p", "http://user:pw@127.0.0.1:7890"); !errors.Is(err, ErrProxyCredentialsUnsupported) {
 		t.Fatalf("credentials must fail closed, got %v", err)
 	}
-	if _, err := launchArgs(9222, "/tmp/p", "ftp://x:1"); err == nil {
+	if _, err := launchArgs("/tmp/p", "ftp://x:1"); err == nil {
 		t.Fatal("unsupported scheme must fail")
 	}
 }

@@ -62,7 +62,7 @@ func run(args []string) error {
 	fs.StringVar(&socks5Addr, "socks5-addr", envOr("RELAYHUB_SOCKS5_ADDR", config.DefaultSOCKS5Addr), "SOCKS5 proxy listen address (overrides RELAYHUB_SOCKS5_ADDR)")
 	fs.StringVar(&gatewayAddr, "gateway-addr", envOr("RELAYHUB_GATEWAY_ADDR", config.DefaultGatewayAddr), "AI gateway listen address (overrides RELAYHUB_GATEWAY_ADDR)")
 	fs.BoolVar(&showVersion, "version", false, "print version information and exit")
-	fs.StringVar(&dataDir, "data-dir", defaultDataDir(), "directory for RelayHub state")
+	fs.StringVar(&dataDir, "data-dir", envOr("RELAYHUB_DATA_DIR", defaultDataDir()), "directory for RelayHub state (overrides RELAYHUB_DATA_DIR)")
 	fs.BoolVar(&fullStack, "full-stack", false, "start full stack (proxies, gateway, management API)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -74,7 +74,17 @@ func run(args []string) error {
 	}
 
 	if fs.NArg() == 1 && fs.Arg(0) == "mcp" {
-		return runMCPStdio(managementAddr)
+		token := func() string {
+			t, err := clientManagementToken(dataDir)
+			if err != nil {
+				log.Printf("relayhub mcp: %v", err) // stderr; stdout carries JSON-RPC
+			}
+			return t
+		}
+		return runMCPStdio(managementAddr, token, os.Stdin, os.Stdout)
+	}
+	if fs.NArg() == 1 && fs.Arg(0) == "pair" {
+		return runPair(managementAddr, dataDir, os.Stdout, os.Stderr)
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
@@ -105,6 +115,16 @@ func run(args []string) error {
 		ManagementAddr: managementAddr,
 		WireFullStack:  fullStack,
 		EgressProxyURL: fileCfg.EgressProxyURL,
+		// The target policies were parsed from config.json / env but never
+		// handed to the app, so "local_only" silently stayed "open" (AUDIT
+		// 2026-09-24 F2).
+		ManagementToken:       fileCfg.ManagementToken,
+		ManagementAuth:        fileCfg.ManagementAuth,
+		ProxyUsername:         fileCfg.ProxyUsername,
+		ProxyPassword:         fileCfg.ProxyPassword,
+		MasterKeyStore:        fileCfg.MasterKeyStore,
+		HTTPProxyTargetPolicy: fileCfg.HTTPProxyTargetPolicy,
+		SOCKS5TargetPolicy:    fileCfg.SOCKS5TargetPolicy,
 		Notify: app.NotifyConfig{
 			WebhookURL:       fileCfg.Notify.WebhookURL,
 			BarkURL:          fileCfg.Notify.BarkURL,
@@ -125,6 +145,7 @@ func run(args []string) error {
 		return err
 	}
 	log.Printf("relayhub started: %s (data-dir %s)", a.Info(), dataDir)
+	logManagementAccess(a.Runtime())
 
 	// Block until a shutdown signal arrives.
 	<-ctx.Done()

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"relayhub/internal/domain"
+	"relayhub/internal/keybind"
 )
 
 type DeclarativeStep struct {
@@ -193,7 +194,7 @@ func (d *DeclarativeAdapter) executeStep(ctx context.Context, channel domain.Cha
 	for k, v := range step.Headers {
 		req.Header.Set(k, v)
 	}
-	if channel.CredentialRef != "" && req.Header.Get("Authorization") == "" && d.Secrets != nil {
+	if channel.CredentialRef != "" && req.Header.Get("Authorization") == "" && d.Secrets != nil && keybind.Allows(channel.CredentialRef, channel.ID, channel.BaseURL) {
 		// Resolve the ref to an actual credential; without a resolver the ref
 		// is a locator, not a token (AUDIT RH-26).
 		if token, terr := d.Secrets.Get(ctx, channel.CredentialRef); terr == nil && len(token) > 0 {

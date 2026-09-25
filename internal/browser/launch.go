@@ -149,10 +149,11 @@ func proxyArgs(proxyURL string) ([]string, error) {
 }
 
 // launchArgs assembles the Chromium command line for one check-in run.
-func launchArgs(port int, userDataDir, proxyURL string) ([]string, error) {
+func launchArgs(userDataDir, proxyURL string) ([]string, error) {
 	args := []string{
 		"--headless=new",
-		fmt.Sprintf("--remote-debugging-port=%d", port),
+		// DevTools over fds 3/4 instead of a TCP port (AUDIT 2026-09-24 F15).
+		"--remote-debugging-pipe",
 		fmt.Sprintf("--user-data-dir=%s", userDataDir),
 		"--no-first-run",
 		"--no-default-browser-check",

@@ -16,6 +16,8 @@ For standard OpenAI, Anthropic, or Gemini compatible relays:
 
 ## 2. Declarative Check-in Adapters (YAML/JSON)
 
+> **Status:** the declarative engine (`adapter.NewDeclarativeAdapter`) is implemented and tested, but RelayHub does not load YAML/JSON adapter files from configuration yet — files written from this section are not picked up at runtime (AUDIT 2026-09-24 F21). Use a built-in adapter or `generic` until loading is wired.
+
 For custom daily check-ins:
 ```yaml
 name: custom-relay

@@ -43,12 +43,18 @@ type Client struct {
 	// writeMu serializes frame writes: two concurrent writers interleaving
 	// bytes on the shared bufio.Writer corrupt both frames (AUDIT RH-03).
 	writeMu sync.Mutex
+	// send writes one serialized CDP message on the underlying transport
+	// (WebSocket text frame or NUL-terminated pipe message); closer releases
+	// that transport.
+	send   func([]byte) error
+	closer io.Closer
 }
 
 type cdpRequest struct {
-	ID     uint64      `json:"id"`
-	Method string      `json:"method"`
-	Params interface{} `json:"params,omitempty"`
+	ID        uint64      `json:"id"`
+	Method    string      `json:"method"`
+	Params    interface{} `json:"params,omitempty"`
+	SessionID string      `json:"sessionId,omitempty"`
 }
 
 type cdpResponse struct {
@@ -183,7 +189,9 @@ func Connect(ctx context.Context, wsURL string) (*Client, error) {
 		pending:    make(map[uint64]chan cdpResponse),
 		eventChans: make(map[string][]chan json.RawMessage),
 		closeCh:    make(chan struct{}),
+		closer:     conn,
 	}
+	c.send = func(b []byte) error { return c.writeFrame(1, b) } // 1 = text frame
 
 	go c.readLoop()
 	return c, nil
@@ -204,7 +212,9 @@ func computeAccept(key string) string {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
-		c.conn.Close()
+		if c.closer != nil {
+			_ = c.closer.Close()
+		}
 		// Do NOT close pending channels: dispatch may already hold a reference
 		// to one of them, and sending on a closed channel panics (AUDIT RH-03).
 		// Waiters are released through closeCh in Call's select instead.
@@ -221,11 +231,16 @@ func (c *Client) Close() error {
 
 // Call sends a CDP command and waits for the response.
 func (c *Client) Call(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
+	return c.call(ctx, method, params, "")
+}
+
+func (c *Client) call(ctx context.Context, method string, params interface{}, sessionID string) (json.RawMessage, error) {
 	id := atomic.AddUint64(&c.msgID, 1)
 	req := cdpRequest{
-		ID:     id,
-		Method: method,
-		Params: params,
+		ID:        id,
+		Method:    method,
+		Params:    params,
+		SessionID: sessionID,
 	}
 	data, err := json.Marshal(req)
 	if err != nil {
@@ -243,7 +258,7 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}) (j
 		c.pendingMu.Unlock()
 	}()
 
-	if err := c.writeFrame(1, data); err != nil { // 1 = text frame
+	if err := c.send(data); err != nil {
 		return nil, fmt.Errorf("failed to send frame: %w", err)
 	}
 

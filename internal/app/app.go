@@ -16,10 +16,25 @@ type Config struct {
 	ManagementAddr        string
 	HTTPProxyTargetPolicy string
 	SOCKS5TargetPolicy    string
-	WireFullStack         bool
+	// ProxyUsername / ProxyPassword enable authentication on both local
+	// proxies when both are set (AUDIT 2026-09-24 F2).
+	ProxyUsername string
+	ProxyPassword string
+	// MasterKeyStore is "file" (default) or "keychain" (macOS only).
+	MasterKeyStore string
+	WireFullStack  bool
 	// EgressProxyURL is the global default exit for outbound traffic; a
 	// channel's proxy_url overrides it. See internal/egress.
 	EgressProxyURL string
+	// ManagementToken is an explicit management API bearer token (AUDIT
+	// 2026-09-24 F4).
+	ManagementToken string
+	// ManagementAuth: "token" requires a token on the management API,
+	// generating <data-dir>/management.token when ManagementToken is empty;
+	// "off" disables authentication; "" (embedders and tests) uses
+	// ManagementToken as given, so an empty token means no authentication.
+	// The relayhub binary passes config's default, "token".
+	ManagementAuth string
 	// Notify configures outbound notification sinks (see internal/notify).
 	Notify NotifyConfig
 }

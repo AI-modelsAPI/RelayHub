@@ -11,7 +11,7 @@ RelayHub only operates accounts you own. It does not bypass captchas, forge fing
 - **Unified AI Gateway (`127.0.0.1:8789`)**: Compatible with OpenAI (`/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`) and Anthropic (`/v1/messages`).
 - **Transparent Proxies**: Local HTTP/HTTPS CONNECT proxy (`:8787`) and SOCKS5 proxy (`:8788`).
 - **Six-Layer Decoupling**: Provider -> Channel -> Model -> ProviderModel -> ModelGroup -> Route.
-- **Automated Check-ins**: Built-in adapters for AgentRouter, JustDoWork, GoRouter, SeekAI, and KKtoken AI plus YAML declarative check-in runtime. Browser (CDP) check-ins are verified against the site's own records.
+- **Automated Check-ins**: Built-in adapters for AgentRouter, JustDoWork, GoRouter, SeekAI, and KKtoken AI. A YAML declarative adapter engine exists as a library (`internal/adapter/declarative.go`) but is not loaded from configuration yet. Browser (CDP) check-ins are verified against the site's own records.
 - **Quota-Aware Routing**: Balances are refreshed after every check-in and hourly; the `quota-first` strategy routes to channels that still have credit, and exhausted channels are skipped with an explicit reason. Real latency and success-rate windows feed the other strategies.
 - **One Egress Policy**: `Channel.proxy_url` > global `egress_proxy_url` > environment, applied identically to the gateway, the check-in adapters and the headless browser. Invalid proxies fail closed. See [docs/operations.md](docs/operations.md).
 - **Notifications**: Webhook / Bark / Telegram for check-in failures, manual fallbacks, low or exhausted quota, breaker trips and recoveries, with per-channel cooldown.
@@ -29,6 +29,8 @@ go build -o bin/relayhub ./cmd/relayhub
 ```
 
 The desktop-paradigm console is served at `http://127.0.0.1:8790` during development (icon rail + inspector; not a website admin). See `docs/ui/desktop-paradigm.md`.
+
+The management API requires a token by default. On first start RelayHub generates one into `<data-dir>/management.token` and logs a one-time pairing link (`http://127.0.0.1:8790/#pair=…`) that signs the console in; `./bin/relayhub pair` prints a fresh link. Set `management_auth` to `off` to restore the unauthenticated loopback API. See `docs/operations.md` §4.
 
 ### 2. Run with Docker Compose
 

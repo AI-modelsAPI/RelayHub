@@ -105,6 +105,29 @@ if [ "$API_READY" -ne 1 ]; then
 fi
 echo "==> Core health check passed!"
 
+# The management API is authenticated by default (AUDIT 2026-09-24 F4): the
+# token is generated into the data dir on first start.
+echo "==> Checking management authentication..."
+MGMT_TOKEN=$(cat "$DATA_DIR/management.token")
+MGMT_AUTH=(-H "Authorization: Bearer $MGMT_TOKEN")
+ANON_STATUS=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8790/api/v1/channels")
+if [ "$ANON_STATUS" != "401" ]; then
+    echo "ERROR: anonymous management read returned $ANON_STATUS, want 401"
+    exit 1
+fi
+PAIR_URL=$("$BIN_PATH" -data-dir "$DATA_DIR" pair 2>/dev/null)
+PAIR_CODE=${PAIR_URL##*#pair=}
+if [ -z "$PAIR_CODE" ] || [ "$PAIR_CODE" = "$PAIR_URL" ]; then
+    echo "ERROR: relayhub pair did not print a pairing link: $PAIR_URL"
+    exit 1
+fi
+PAIRED=$(curl -fsS -X POST "http://127.0.0.1:8790/api/v1/auth/pair" -H "Content-Type: application/json" -d "{\"code\":\"$PAIR_CODE\"}")
+if ! echo "$PAIRED" | grep -q "$MGMT_TOKEN"; then
+    echo "ERROR: redeeming the pairing code did not return the management token"
+    exit 1
+fi
+echo "==> Management authentication OK!"
+
 echo "==> Testing HTTP proxy..."
 HTTP_RESP=$(curl -s -x "http://127.0.0.1:8787" "http://127.0.0.1:$MOCK_PORT/direct-test")
 if [ "$HTTP_RESP" != "smoke-mock-ok" ]; then
@@ -122,28 +145,28 @@ fi
 echo "==> SOCKS5 proxy OK!"
 
 echo "==> Configuring Gateway routing via Management API..."
-curl -fsS -X POST "http://127.0.0.1:8790/api/v1/secrets" \
+curl -fsS -X POST "${MGMT_AUTH[@]}" "http://127.0.0.1:8790/api/v1/secrets" \
     -H "Content-Type: application/json" \
     -d '{"ref":"cred-smoke-key","value":"smoke-upstream-secret"}' >/dev/null
 
-curl -fsS -X POST "http://127.0.0.1:8790/api/v1/providers" \
+curl -fsS -X POST "${MGMT_AUTH[@]}" "http://127.0.0.1:8790/api/v1/providers" \
     -H "Content-Type: application/json" \
     -d "{\"id\":\"p-smoke\",\"name\":\"SmokeProvider\",\"adapter_type\":\"generic\",\"protocol\":\"openai-chat\",\"base_url_template\":\"http://127.0.0.1:$MOCK_PORT\",\"enabled\":true}" >/dev/null
 
-curl -fsS -X POST "http://127.0.0.1:8790/api/v1/channels" \
+curl -fsS -X POST "${MGMT_AUTH[@]}" "http://127.0.0.1:8790/api/v1/channels" \
     -H "Content-Type: application/json" \
     -d "{\"id\":\"c-smoke\",\"provider_id\":\"p-smoke\",\"name\":\"SmokeChan\",\"base_url\":\"http://127.0.0.1:$MOCK_PORT\",\"credential_ref\":\"cred-smoke-key\",\"enabled\":true,\"routing_enabled\":true}" >/dev/null
 
-curl -fsS -X POST "http://127.0.0.1:8790/api/v1/models" \
+curl -fsS -X POST "${MGMT_AUTH[@]}" "http://127.0.0.1:8790/api/v1/models" \
     -H "Content-Type: application/json" \
     -d '{"id":"smoke-model","display_name":"SmokeModel","enabled":true}' >/dev/null
 
-curl -fsS -X POST "http://127.0.0.1:8790/api/v1/provider-models" \
+curl -fsS -X POST "${MGMT_AUTH[@]}" "http://127.0.0.1:8790/api/v1/provider-models" \
     -H "Content-Type: application/json" \
     -d '{"id":"pm-smoke","provider_id":"p-smoke","channel_id":"c-smoke","model_id":"smoke-model","upstream_model_name":"gpt-smoke","protocol":"openai-chat","enabled":true}' >/dev/null
 
 echo "==> Issuing local API key..."
-KEY_RESP=$(curl -fsS -X POST "http://127.0.0.1:8790/api/v1/keys" -H "Content-Type: application/json" -d '{}')
+KEY_RESP=$(curl -fsS -X POST "${MGMT_AUTH[@]}" "http://127.0.0.1:8790/api/v1/keys" -H "Content-Type: application/json" -d '{}')
 API_KEY=$(echo "$KEY_RESP" | python3 -c 'import sys, json; print(json.load(sys.stdin)["key"])')
 
 if [ -z "$API_KEY" ]; then

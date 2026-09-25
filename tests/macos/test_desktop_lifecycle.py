@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -61,8 +62,33 @@ def read_token(data_dir, timeout=10.0):
     return None, None
 
 
+def wait_healthy(port, timeout=15.0):
+    """Wait until the core answers /healthz. The shell records the core's PID
+    as soon as it launches it, before the core has bound its port, so a
+    request right after read_token() can race the listener (seen on CI as
+    "Connection refused")."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, ConnectionError, OSError):
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def spawn(port, data_dir, home):
-    env = dict(os.environ, HOME=home, RELAYHUB_NO_ALERT_MODAL="1")
+    # The core inherits this environment. Give its proxies and gateway free
+    # ports instead of the fixed 8787-8789: a core from the previous test can
+    # still hold those while it shuts down, and the new core then exits with
+    # "address already in use" (seen on CI as a vanished core PID or a
+    # refused /healthz).
+    env = dict(os.environ, HOME=home, RELAYHUB_NO_ALERT_MODAL="1",
+               RELAYHUB_HTTP_PROXY_ADDR=f"127.0.0.1:{get_free_port()}",
+               RELAYHUB_SOCKS5_ADDR=f"127.0.0.1:{get_free_port()}",
+               RELAYHUB_GATEWAY_ADDR=f"127.0.0.1:{get_free_port()}")
     return subprocess.Popen(
         [str(BINARY), "--port", str(port), "--data-dir", str(data_dir)],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -95,6 +121,7 @@ class DesktopLifecycleTests(unittest.TestCase):
             data_dir.mkdir()
             proc = spawn(port, data_dir, td)
             core_pid = None
+            passed = False
             try:
                 core_pid, core_token = read_token(data_dir)
                 self.assertIsNotNone(core_pid, "Core PID not recorded in token")
@@ -105,18 +132,34 @@ class DesktopLifecycleTests(unittest.TestCase):
                 self.assertEqual(int(ps_ppid), proc.pid,
                                  f"Core PPID {ps_ppid} does not match Shell PID {proc.pid}")
 
+                self.assertTrue(wait_healthy(port), "Core never became healthy")
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2) as r:
                     self.assertEqual(r.status, 200)
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
                     self.assertEqual(r.status, 200)
                     self.assertIn("text/html", r.headers.get("Content-Type", ""))
+                # The management API is authenticated by default (AUDIT
+                # 2026-09-24 F4): anonymous reads are refused, and the core
+                # generates its token into the shell's data dir.
+                summary = f"http://127.0.0.1:{port}/api/v1/usage/summary"
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(summary, timeout=2)
+                self.assertEqual(denied.exception.code, 401)
+                token = (data_dir / "management.token").read_text().strip()
+                self.assertGreaterEqual(len(token), 32)
                 # Management API served through the shell's port: the extras
                 # family must be routed (P0-1 / RH-05 regression on real binary).
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/usage/summary", timeout=2) as r:
+                authed = urllib.request.Request(summary, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(authed, timeout=2) as r:
                     self.assertEqual(r.status, 200)
                     self.assertIn(b"cache_hit_ratio", r.read())
+                passed = True
             finally:
-                stop(proc)
+                out = stop(proc)
+                if not passed:
+                    # The shell relays the core's log; without it a failure
+                    # here says nothing about why the core went away.
+                    print("---- shell/core output ----\n" + out[-6000:])
 
             time.sleep(0.5)
             check = subprocess.run(["kill", "-0", str(core_pid)], capture_output=True)
