@@ -82,3 +82,36 @@ CDP 签到默认寻找 `#checkin-btn, .checkin-btn, button[data-action="checkin"
 ```
 
 注意：DOM 上的"成功"只是提示。签到调度器随后会用站点自己的记录（签到日历 / 奖励日志）核验；服务端没有记录就记为 `failed`，无法核验记为 `need_manual`，绝不凭页面元素宣布成功。
+
+## 4. 安全相关配置（AUDIT 2026-09-24）
+
+`config.json` 可以存放下面几个凭据类字段，启动时文件会被收紧为 `0600`，数据目录收紧为 `0700`。也可以改用环境变量传入，文件里就不必出现明文。
+
+| 字段 | 环境变量 | 作用 |
+|---|---|---|
+| `management_token` | `RELAYHUB_MANAGEMENT_TOKEN` | 设置后，所有修改类管理 API 都要求 `Authorization: Bearer <token>`。控制台第一次遇到 401 时会提示输入，令牌只保存在浏览器的 localStorage 里；`relayhub mcp` 读取同一个环境变量 |
+| `proxy_username` / `proxy_password` | `RELAYHUB_PROXY_USERNAME` / `RELAYHUB_PROXY_PASSWORD` | 两个都设置时，本地 HTTP 代理要求 Basic 认证，SOCKS5 要求 RFC 1929 认证；只设置其中一个会阻止启动 |
+| `http_proxy_target_policy` / `socks5_target_policy` | — | 可选 `open`（默认）、`public_private`、`public_only`、`local_only`。无论选哪个，都会拒绝 RelayHub 自身的端口和云元数据地址；CGNAT（100.64/10）按私网处理 |
+
+### 渠道请求头档案
+
+默认情况下，网关会把客户端 SDK 的身份头（`User-Agent`、`X-Stainless-*`、`anthropic-*`）原样转发，因为不少中转站只接受“看起来像 Claude Code”的请求。如果某个渠道不需要这些头，可以在该渠道的 `custom_headers` 里配置：
+
+```json
+{"X-Stainless-*": "", "X-Stainless-Lang": "js", "Anthropic-Beta": ""}
+```
+
+- 值为空：删除这个客户端头。
+- 名字以 `*` 结尾且值为空：删除所有以该前缀开头的头。
+- 先执行删除，再设置非空值，所以可以先整组删掉，再单独保留其中某一项。
+
+`Accept-Encoding`、hop-by-hop 头、`Origin`/`Referer`/`Sec-*`、`OpenAI-Organization`/`OpenAI-Project` 一律不会转发。
+
+### 渠道 Key 与地址绑定
+
+录入 Key 时，它会绑定到渠道当时 `base_url` 的 origin（协议 + 主机 + 端口）。之后如果把 `base_url` 改到另一个 origin，这些 Key 会被锁定：测试渠道时返回 `409 key_origin_mismatch`，网关也不会使用它们。需要在新地址下重新录入 Key。旧版本留下的 Key 在升级后首次启动时，会自动绑定到渠道当时的地址。
+
+### 导出包
+
+- 带密码的导出为 v3 格式：代理密码和敏感请求头只放在加密区，校验值使用随机盐。
+- 不带密码的导出只含遮蔽后的值。导入时，已有渠道保留本机原值；新渠道则直接丢弃这些占位值。

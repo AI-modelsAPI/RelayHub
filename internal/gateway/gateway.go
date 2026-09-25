@@ -739,13 +739,42 @@ func requestHeaders(r *http.Request, protocol string, stream bool, decision rout
 	if stream {
 		h.Set("Accept", "text/event-stream")
 	}
-	// Inject channel-specific custom headers (e.g. User-Agent, custom authorization headers)
-	if decision.Channel.CustomHeaders != nil {
-		for k, v := range decision.Channel.CustomHeaders {
+	applyChannelHeaders(h, decision.Channel.CustomHeaders)
+	return h
+}
+
+// applyChannelHeaders injects a channel's custom headers (User-Agent, custom
+// authorization headers, …). An empty value removes a forwarded client
+// header, and a name ending in "*" with an empty value removes every header
+// with that prefix — {"X-Stainless-*": ""} drops the SDK fingerprint (OS,
+// arch, runtime versions) for relays that do not need it, while relays that
+// only accept Claude-Code-looking traffic keep receiving it by default
+// (AUDIT 2026-09-24 F8). Removals run before sets, so a profile can strip a
+// family and pin selected members.
+func applyChannelHeaders(h http.Header, custom map[string]string) {
+	for k, v := range custom {
+		if strings.TrimSpace(v) != "" {
+			continue
+		}
+		prefix, wildcard := strings.CutSuffix(strings.TrimSpace(k), "*")
+		if !wildcard {
+			h.Del(k)
+			continue
+		}
+		if prefix == "" {
+			continue // "*" alone would strip everything, including Content-Type
+		}
+		for name := range h {
+			if len(name) >= len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+				h.Del(name)
+			}
+		}
+	}
+	for k, v := range custom {
+		if strings.TrimSpace(v) != "" {
 			h.Set(k, v)
 		}
 	}
-	return h
 }
 func retryableStatus(status int) bool {
 	return status == 401 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504
