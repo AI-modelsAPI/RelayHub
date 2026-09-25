@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
   id-token: write
+  # Required by actions/attest-build-provenance: persist the attestation to
+  # the repo (shown on the commit/attestations page) and store artifact metadata.
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release-macos:
@@ -42,14 +46,25 @@ jobs:
           cat SHA256SUMS
 
       # Supply-chain: prove these DMGs were built by this repo's CI (AUDIT D1).
-      # Users can verify offline with `gh attestation verify` or
-      # `sigstore verify` against the attached .attestation files.
+      # Binding the subjects to the published SHA256SUMS means the attestation
+      # covers exactly the bytes being released. Users can verify offline with
+      # `sigstore verify` / `gh attestation verify` using the attached bundle.
       - name: Attest build provenance
+        id: attest
         uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
-          subject-path: |
-            dist/RelayHub-macOS-apple-silicon.dmg
-            dist/RelayHub-macOS-intel.dmg
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Collect attestation bundle
+        run: |
+          test -s "${RUNNER_TEMP}/created_attestation_paths.txt"
+          n=1
+          while IFS= read -r p; do
+            cp "$p" "dist/build-provenance-$n.json"
+            n=$((n + 1))
+          done < "${RUNNER_TEMP}/created_attestation_paths.txt"
+          ls -l dist/build-provenance-*.json
+          echo "Attestation: ${{ steps.attest.outputs.attestation-url }}"
 
       - name: Write release notes
         run: |
@@ -83,7 +98,7 @@ jobs:
           shasum -a 256 -c SHA256SUMS
           \`\`\`
 
-          附带的 \`.attestation\` 文件是本仓库 CI 构建的证明，可用 \`gh attestation verify\` 或 \`sigstore verify\` 离线核验。
+          附带的 \`build-provenance-*.json\` 是本仓库 CI 构建的证明（Sigstore bundle），可用 \`sigstore verify\` 或 \`gh attestation verify\` 离线核验。
 
           ---
           # RelayHub ${TAG}
@@ -115,9 +130,8 @@ jobs:
           gh release upload "$TAG" \
             dist/RelayHub-macOS-apple-silicon.dmg \
             dist/RelayHub-macOS-intel.dmg \
-            dist/RelayHub-macOS-apple-silicon.dmg.attestation \
-            dist/RelayHub-macOS-intel.dmg.attestation \
             dist/SHA256SUMS \
+            dist/build-provenance.json \
             --clobber
           gh release view "$TAG" --json assets --jq '.assets[].name'
 
