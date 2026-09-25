@@ -102,10 +102,11 @@ jobs:
           系统要求：macOS 13 或更高版本（Go 1.27 核心要求）。
 
           1. 下载对应架构的 DMG（apple-silicon = Apple Silicon，intel = Intel）。
-          2. 打开 DMG，把 RelayHub 拖进 Applications。
+          2. 打开 DMG，把 RelayHub 拖到旁边的 Applications 图标上（安装为 \`/Applications/RelayHub.app\`）。
 
-          **本版本未做代码签名和公证**（需要 Apple Developer 证书）。首次打开时 macOS Gatekeeper 会拦截，二选一：
-          - 在 Finder 里**右键** RelayHub → 打开 → 再点"打开"；
+          **本版本只有 ad-hoc 签名，未做 Developer ID 签名和公证**（需要 Apple Developer 证书）。首次打开时 macOS Gatekeeper 会拦截，任选其一：
+          - macOS 13 / 14：在 Finder 里**右键** RelayHub → 打开 → 再点"打开"；
+          - macOS 15 及以上：先双击一次，再到「系统设置 → 隐私与安全性」底部点「仍要打开」；
           - 或终端执行：\`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`
 
           ## 校验
@@ -131,7 +132,7 @@ jobs:
 
           System requirements: macOS 13 or later (required by the Go 1.27 core).
 
-          Open the DMG for your architecture and drag RelayHub to Applications. **This build is unsigned and not notarized** (needs an Apple Developer certificate): right-click the app and choose Open, or run \`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`.
+          Open the DMG for your architecture and drag RelayHub onto the Applications shortcut next to it (installs \`/Applications/RelayHub.app\`). **This build is only ad-hoc signed, not Developer ID signed or notarized** (needs an Apple Developer certificate), so Gatekeeper blocks the first launch: on macOS 13/14 right-click the app and choose Open; on macOS 15+ try to open it once, then click Open Anyway in System Settings > Privacy & Security; or run \`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`.
 
           Verify with \`shasum -a 256 -c SHA256SUMS\`; the attached \`build-provenance-*.json\` Sigstore bundle proves the build came from this repository's CI.
           EOF
