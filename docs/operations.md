@@ -69,6 +69,7 @@ Channel.proxy_url  >  egress_proxy_url（config / 环境变量）  >  进程环�
 验证配置：
 
 ```bash
+TOKEN=$(cat "<data-dir>/management.token")   # 或 config.json 里的 management_token
 curl -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/notify/test
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/v1/settings | jq .notify
 ```
