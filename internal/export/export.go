@@ -121,7 +121,12 @@ func Create(ctx context.Context, repo repository.ResourceRepository, opts Export
 	// keep the plain SHA-256 (see manifest docs, AUDIT RH-13).
 	var checksum string
 	if creds {
-		checksum, err = ComputePackageChecksumV2(pkg, opts.Password)
+		salt, serr := newChecksumSalt()
+		if serr != nil {
+			return nil, serr
+		}
+		pkg.Manifest.ChecksumSalt = salt
+		checksum, err = ComputePackageChecksumV3(pkg, opts.Password)
 	} else {
 		checksum, err = ComputePackageChecksum(pkg)
 	}

@@ -75,6 +75,7 @@ func PreviewPackage(ctx context.Context, packageBytes []byte, repo repository.Re
 
 	return Preview{
 		Version:       pkg.Manifest.Version,
+		Integrity:     integrityLabel(pkg.Manifest),
 		CreatedAt:     pkg.Manifest.CreatedAt,
 		HasSecrets:    pkg.Manifest.HasSecrets,
 		TotalEntities: total,
@@ -122,7 +123,11 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 		if opts.Password == "" {
 			return errors.New("password required to verify package integrity")
 		}
-		expectedChecksum, err := ComputePackageChecksumV2(pkg, opts.Password)
+		compute := ComputePackageChecksumV2
+		if pkg.Manifest.Version >= 3 {
+			compute = ComputePackageChecksumV3
+		}
+		expectedChecksum, err := compute(pkg, opts.Password)
 		if err != nil {
 			return fmt.Errorf("failed to compute package checksum: %w", err)
 		}
@@ -337,4 +342,11 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 	}
 
 	return nil
+}
+
+func integrityLabel(m Manifest) string {
+	if m.Version >= 2 || m.HasSecrets {
+		return "verified_on_import"
+	}
+	return "unauthenticated"
 }
