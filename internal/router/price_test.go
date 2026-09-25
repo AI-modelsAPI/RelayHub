@@ -27,9 +27,11 @@ func priceResolver(prices PriceSource) Resolver {
 			"cheap":   {ID: "cheap", ProviderID: "p", Priority: 3, Enabled: true, RoutingEnabled: true},
 		},
 		ProviderModels: []domain.ProviderModel{
-			{ID: "pm-dear", ProviderID: "p", ModelID: "m", ChannelID: "dear", Enabled: true},
-			{ID: "pm-unknown", ProviderID: "p", ModelID: "m", ChannelID: "unknown", Enabled: true},
-			{ID: "pm-cheap", ProviderID: "p", ModelID: "m", ChannelID: "cheap", Enabled: true},
+			// The binding's priority, not the channel's, orders the
+			// candidates when a binding names its channel explicitly.
+			{ID: "pm-dear", ProviderID: "p", ModelID: "m", ChannelID: "dear", Priority: 1, Enabled: true},
+			{ID: "pm-unknown", ProviderID: "p", ModelID: "m", ChannelID: "unknown", Priority: 2, Enabled: true},
+			{ID: "pm-cheap", ProviderID: "p", ModelID: "m", ChannelID: "cheap", Priority: 3, Enabled: true},
 		},
 		Price: prices,
 	}

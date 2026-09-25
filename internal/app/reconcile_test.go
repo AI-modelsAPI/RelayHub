@@ -173,7 +173,7 @@ func TestReconcileChannelBuildsLedgerFromTodaysRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantSince := time.Date(2026, 9, 24, 16, 0, 0, 0, billingZone) // Beijing midnight
+	wantSince := time.Date(2026, 9, 25, 0, 0, 0, 0, billingZone) // Beijing midnight = 2026-09-24 16:00Z
 	if rep.Requests != 2 || rep.Tokens != 1_000_000 || !rep.Window.Since.Equal(wantSince) {
 		t.Fatalf("ledger window=%+v requests=%d tokens=%d", rep.Window, rep.Requests, rep.Tokens)
 	}
