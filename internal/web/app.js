@@ -20,8 +20,31 @@ const state = {
   online: false,
 };
 
+// Optional management token (config "management_token" / env
+// RELAYHUB_MANAGEMENT_TOKEN). Mutations answer 401 until the operator enters
+// it once; it is kept in this browser's localStorage only.
+const TOKEN_KEY = "relayhub.managementToken";
+function withAuth(init) {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (!token) return init || {};
+  const next = Object.assign({}, init || {});
+  next.headers = Object.assign({}, (init && init.headers) || {}, { Authorization: "Bearer " + token });
+  return next;
+}
+async function authFetch(url, init) {
+  let r = await fetch(url, withAuth(init));
+  if (r.status === 401) {
+    const token = window.prompt("此操作需要 RelayHub 管理令牌（management_token）：");
+    if (token) {
+      localStorage.setItem(TOKEN_KEY, token.trim());
+      r = await fetch(url, withAuth(init));
+    }
+  }
+  return r;
+}
+
 async function api(path, init) {
-  const r = await fetch("/api/v1/" + path, init);
+  const r = await authFetch("/api/v1/" + path, init);
   if (!r.ok) throw new Error(path + " " + r.status);
   return r.json();
 }
@@ -358,7 +381,7 @@ async function boot() {
 
 $("#ch-q")?.addEventListener("input", () => renderChannels());
 $("#ck-now")?.addEventListener("click", async () => {
-  await fetch("/api/v1/checkin", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }).catch(() => {});
+  await authFetch("/api/v1/checkin", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }).catch(() => {});
   boot();
 });
 $("#lab-capture")?.addEventListener("click", async () => {
@@ -369,7 +392,7 @@ $("#lab-capture")?.addEventListener("click", async () => {
   boot();
 });
 $("#lab-clear")?.addEventListener("click", async () => {
-  await fetch("/api/v1/lab/capture", { method: "DELETE" }).catch(() => {});
+  await authFetch("/api/v1/lab/capture", { method: "DELETE" }).catch(() => {});
   boot();
 });
 

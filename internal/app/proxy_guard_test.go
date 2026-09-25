@@ -83,3 +83,36 @@ func TestTargetPolicyForRejectsUnknownNames(t *testing.T) {
 		t.Fatalf("public_only mapped to %+v", p)
 	}
 }
+
+func TestManagementTokenIsWiredIntoTheAPI(t *testing.T) {
+	a, err := New(Config{DataDir: t.TempDir(), HTTPProxyAddr: "127.0.0.1:0", SOCKS5Addr: "127.0.0.1:0", GatewayAddr: "127.0.0.1:0", ManagementAddr: "127.0.0.1:0", WireFullStack: true, ManagementToken: "s3cret-token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Shutdown(context.Background()) }()
+	url := "http://" + a.Runtime().APIListener.Addr().String() + "/api/v1/keys"
+	resp, err := http.Post(url, "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("minting a key without the token: status %d, want 401", resp.StatusCode)
+	}
+	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer s3cret-token")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Fatal("token was not accepted")
+	}
+}

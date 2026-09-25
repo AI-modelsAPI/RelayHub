@@ -38,6 +38,12 @@ type Config struct {
 	// "direct"). A channel's own proxy_url takes precedence. Empty means the
 	// process environment (HTTPS_PROXY etc.) decides. Env: RELAYHUB_EGRESS_PROXY.
 	EgressProxyURL string `json:"egress_proxy_url"`
+	// ManagementToken, when set, is required (as "Authorization: Bearer …")
+	// for every mutating management API call. The web console asks for it on
+	// the first 401; `relayhub mcp` sends RELAYHUB_MANAGEMENT_TOKEN. Before
+	// this field existed the server had no way to enable its token check
+	// (AUDIT 2026-09-24 F4).
+	ManagementToken string `json:"management_token"`
 	// Notify configures outbound notifications (check-in failures, quota
 	// low, breaker open). All fields optional; env overrides see ApplyEnv.
 	Notify NotifyConfig `json:"notify"`
@@ -66,6 +72,7 @@ func ApplyEnv(cfg *Config) {
 		}
 	}
 	set(&cfg.EgressProxyURL, "RELAYHUB_EGRESS_PROXY")
+	set(&cfg.ManagementToken, "RELAYHUB_MANAGEMENT_TOKEN")
 	set(&cfg.Notify.WebhookURL, "RELAYHUB_NOTIFY_WEBHOOK_URL")
 	set(&cfg.Notify.BarkURL, "RELAYHUB_NOTIFY_BARK_URL")
 	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
@@ -213,6 +220,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.SOCKS5TargetPolicy != "" {
 		dst.SOCKS5TargetPolicy = src.SOCKS5TargetPolicy
+	}
+	if src.ManagementToken != "" {
+		dst.ManagementToken = src.ManagementToken
 	}
 	if src.EgressProxyURL != "" {
 		dst.EgressProxyURL = src.EgressProxyURL

@@ -20,6 +20,9 @@ type Config struct {
 	// EgressProxyURL is the global default exit for outbound traffic; a
 	// channel's proxy_url overrides it. See internal/egress.
 	EgressProxyURL string
+	// ManagementToken enables bearer-token authorization for mutating
+	// management API calls (AUDIT 2026-09-24 F4).
+	ManagementToken string
 	// Notify configures outbound notification sinks (see internal/notify).
 	Notify NotifyConfig
 }

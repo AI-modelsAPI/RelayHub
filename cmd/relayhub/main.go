@@ -108,6 +108,7 @@ func run(args []string) error {
 		// The target policies were parsed from config.json / env but never
 		// handed to the app, so "local_only" silently stayed "open" (AUDIT
 		// 2026-09-24 F2).
+		ManagementToken:       fileCfg.ManagementToken,
 		HTTPProxyTargetPolicy: fileCfg.HTTPProxyTargetPolicy,
 		SOCKS5TargetPolicy:    fileCfg.SOCKS5TargetPolicy,
 		Notify: app.NotifyConfig{

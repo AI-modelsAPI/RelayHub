@@ -355,7 +355,25 @@ func (s *Server) managementRoutes() http.Handler {
 		}
 		http.FileServer(http.FS(webassets.Assets)).ServeHTTP(w, r)
 	}))
-	return s.browserBoundary(mux)
+	return s.browserBoundary(s.requireAuthorization(mux))
+}
+
+// publicAPIPaths are the only /api/ endpoints served without authorization.
+var publicAPIPaths = map[string]bool{"/api/v1/health": true}
+
+// requireAuthorization applies the shared authorization check to every /api/
+// request before routing. Authorization used to be opt-in per handler, and
+// none of the extras handlers (usage, verify, identity, sessions, lab, route
+// explain, MCP) called it, so a configured token did not protect them
+// (AUDIT 2026-09-24 F11). Handlers may still call s.authorize; the check is
+// stateless and idempotent.
+func (s *Server) requireAuthorization(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && !publicAPIPaths[r.URL.Path] && !s.authorize(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) peerAllowed(w http.ResponseWriter, r *http.Request) bool {

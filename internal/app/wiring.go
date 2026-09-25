@@ -350,6 +350,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	apiServer, err := api.NewConfiguredServer(api.Config{
 		Management:     apiAddr,
 		LocalOnly:      true,
+		Token:          strings.TrimSpace(cfg.ManagementToken),
 		Repo:           repo,
 		SecretStore:    secStore,
 		AuditLogger:    auditLog,
