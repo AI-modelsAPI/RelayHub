@@ -129,25 +129,43 @@ jobs:
 
           Open the DMG for your architecture and drag RelayHub to Applications. **This build is unsigned and not notarized** (needs an Apple Developer certificate): right-click the app and choose Open, or run \`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`.
 
-          Verify with \`shasum -a 256 -c SHA256SUMS\`; \`.attestation\` files prove the build came from this repository's CI.
+          Verify with \`shasum -a 256 -c SHA256SUMS\`; the attached \`build-provenance-*.json\` Sigstore bundle proves the build came from this repository's CI.
           EOF
 
+      # Idempotent: an earlier failed run of the same tag may have left a
+      # release behind (the first v0.1.0 run created it without assets).
+      # Asset uploads are 1:1 on filenames, so stale assets from partial
+      # runs are deleted before the fresh set is uploaded. (A previous
+      # attempt also failed because it referenced dist/build-provenance.json
+      # while the collect step names files build-provenance-N.json.)
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" \
-            --title "RelayHub ${TAG}" \
-            --notes-file release-notes.md \
-            --verify-tag
+          REPO="${GITHUB_REPOSITORY}"
+
+          if gh release view "$TAG" --json id --jq .id > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "RelayHub ${TAG}" --notes-file release-notes.md
+            echo "Refreshed existing release for ${TAG}"
+          else
+            gh release create "$TAG" --title "RelayHub ${TAG}" --notes-file release-notes.md
+            echo "Created release for ${TAG}"
+          fi
+
+          for id in $(gh api "repos/${REPO}/releases/tags/${TAG}" --jq '.assets[].id' 2>/dev/null); do
+            gh api -X DELETE "repos/${REPO}/releases/assets/${id}" > /dev/null \
+              || gh api -X DELETE "repos/${REPO}/assets/${id}" > /dev/null
+          done
+
           gh release upload "$TAG" \
             dist/RelayHub-macOS-apple-silicon.dmg \
             dist/RelayHub-macOS-intel.dmg \
             dist/SHA256SUMS \
-            dist/build-provenance.json \
-            --clobber
-          gh release view "$TAG" --json assets --jq '.assets[].name'
+            dist/build-provenance-*.json
+
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)  \(.size)"'
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
