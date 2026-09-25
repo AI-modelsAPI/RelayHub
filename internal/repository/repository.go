@@ -239,12 +239,14 @@ func (s *Store) DeleteProvider(ctx context.Context, id string) error {
 func scanChannel(row interface{ Scan(...any) error }) (domain.Channel, error) {
 	var c domain.Channel
 	var checkin, routing, enabled, autoSync int
+	var official int
 	var created, updated, customHeaders string
-	err := row.Scan(&c.ID, &c.ProviderID, &c.Name, &c.BaseURL, &c.CredentialRef, &c.AccountRef, &c.RoutingTags, &c.QuotaState, &c.HealthState, &c.RateLimitState, &c.Priority, &c.Weight, &checkin, &routing, &enabled, &c.Status, &c.ManualModels, &autoSync, &c.AutoSyncPattern, &c.DefaultTestModel, &c.StreamPolicy, &c.ErrorMessage, &c.Remark, &c.ProxyURL, &c.CheckinMode, &customHeaders, &created, &updated)
+	err := row.Scan(&c.ID, &c.ProviderID, &c.Name, &c.BaseURL, &c.CredentialRef, &c.AccountRef, &c.RoutingTags, &c.QuotaState, &c.HealthState, &c.RateLimitState, &c.Priority, &c.Weight, &checkin, &routing, &enabled, &c.Status, &c.ManualModels, &autoSync, &c.AutoSyncPattern, &c.DefaultTestModel, &c.StreamPolicy, &c.ErrorMessage, &c.Remark, &c.ProxyURL, &c.CheckinMode, &customHeaders, &created, &updated, &official)
 	if err != nil {
 		return c, err
 	}
 	c.CheckinEnabled, c.RoutingEnabled, c.Enabled, c.AutoSync = checkin != 0, routing != 0, enabled != 0, autoSync != 0
+	c.OfficialSource = official != 0
 	if customHeaders != "" {
 		_ = json.Unmarshal([]byte(customHeaders), &c.CustomHeaders)
 	}
@@ -261,7 +263,7 @@ func scanChannel(row interface{ Scan(...any) error }) (domain.Channel, error) {
 	return c, scanTimePair(created, updated, &c.CreatedAt, &c.UpdatedAt)
 }
 
-const channelColumns = `id,provider_id,name,base_url,credential_ref,account_ref,routing_tags,quota_state,health_state,rate_limit_state,priority,weight,checkin_enabled,routing_enabled,enabled,status,manual_models,auto_sync,auto_sync_pattern,default_test_model,stream_policy,error_message,remark,proxy_url,checkin_mode,custom_headers,created_at,updated_at`
+const channelColumns = `id,provider_id,name,base_url,credential_ref,account_ref,routing_tags,quota_state,health_state,rate_limit_state,priority,weight,checkin_enabled,routing_enabled,enabled,status,manual_models,auto_sync,auto_sync_pattern,default_test_model,stream_policy,error_message,remark,proxy_url,checkin_mode,custom_headers,created_at,updated_at,official_source`
 
 // jsonOrEmpty encodes a header map for the custom_headers column.
 func jsonOrEmpty(m map[string]string) string {
@@ -296,8 +298,8 @@ func (s *Store) CreateChannel(ctx context.Context, c domain.Channel) error {
 	if c.CheckinMode == "" {
 		c.CheckinMode = "auto"
 	}
-	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO channels(`+channelColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		c.ID, c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, jsonOrEmpty(c.CustomHeaders), stamp(created), stamp(created))
+	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO channels(`+channelColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, jsonOrEmpty(c.CustomHeaders), stamp(created), stamp(created), boolInt(c.OfficialSource))
 	return err
 }
 func (s *Store) GetChannel(ctx context.Context, id string) (domain.Channel, error) {
@@ -337,8 +339,8 @@ func (s *Store) UpdateChannel(ctx context.Context, c domain.Channel) error {
 	if c.CheckinMode == "" {
 		c.CheckinMode = "auto"
 	}
-	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE channels SET provider_id=?,name=?,base_url=?,credential_ref=?,account_ref=?,routing_tags=?,quota_state=?,health_state=?,rate_limit_state=?,priority=?,weight=?,checkin_enabled=?,routing_enabled=?,enabled=?,status=?,manual_models=?,auto_sync=?,auto_sync_pattern=?,default_test_model=?,stream_policy=?,error_message=?,remark=?,proxy_url=?,checkin_mode=?,custom_headers=?,updated_at=? WHERE id=?`,
-		c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, jsonOrEmpty(c.CustomHeaders), stamp(time.Now()), c.ID)
+	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE channels SET provider_id=?,name=?,base_url=?,credential_ref=?,account_ref=?,routing_tags=?,quota_state=?,health_state=?,rate_limit_state=?,priority=?,weight=?,checkin_enabled=?,routing_enabled=?,enabled=?,status=?,manual_models=?,auto_sync=?,auto_sync_pattern=?,default_test_model=?,stream_policy=?,error_message=?,remark=?,proxy_url=?,checkin_mode=?,custom_headers=?,updated_at=?,official_source=? WHERE id=?`,
+		c.ProviderID, c.Name, c.BaseURL, c.CredentialRef, c.AccountRef, c.RoutingTags, c.QuotaState, c.HealthState, c.RateLimitState, c.Priority, c.Weight, boolInt(c.CheckinEnabled), boolInt(c.RoutingEnabled), boolInt(c.Enabled), c.Status, c.ManualModels, boolInt(c.AutoSync), c.AutoSyncPattern, c.DefaultTestModel, c.StreamPolicy, c.ErrorMessage, c.Remark, c.ProxyURL, c.CheckinMode, jsonOrEmpty(c.CustomHeaders), stamp(time.Now()), boolInt(c.OfficialSource), c.ID)
 	return requireAffected(result, err)
 }
 func (s *Store) DeleteChannel(ctx context.Context, id string) error {
@@ -498,7 +500,7 @@ func scanProviderModel(row interface{ Scan(...any) error }) (domain.ProviderMode
 	var channel sql.NullString
 	var enabled int
 	var created, updated string
-	err := row.Scan(&m.ID, &m.ProviderID, &channel, &m.ModelID, &m.UpstreamModelName, &m.Protocol, &m.RequestTransform, &m.ResponseTransform, &m.Priority, &m.Weight, &enabled, &created, &updated)
+	err := row.Scan(&m.ID, &m.ProviderID, &channel, &m.ModelID, &m.UpstreamModelName, &m.Protocol, &m.RequestTransform, &m.ResponseTransform, &m.Priority, &m.Weight, &enabled, &created, &updated, &m.HeldReason)
 	if err != nil {
 		return m, err
 	}
@@ -510,7 +512,7 @@ func scanProviderModel(row interface{ Scan(...any) error }) (domain.ProviderMode
 	return m, err
 }
 
-const providerModelColumns = `id,provider_id,channel_id,model_id,upstream_model_name,protocol,request_transform,response_transform,priority,weight,enabled,created_at,updated_at`
+const providerModelColumns = `id,provider_id,channel_id,model_id,upstream_model_name,protocol,request_transform,response_transform,priority,weight,enabled,created_at,updated_at,held_reason`
 
 func (s *Store) CreateProviderModel(ctx context.Context, m domain.ProviderModel) error {
 	if m.Weight <= 0 {
@@ -524,7 +526,7 @@ func (s *Store) CreateProviderModel(ctx context.Context, m domain.ProviderModel)
 	if m.ChannelID == "" {
 		channel = nil
 	}
-	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO provider_models(`+providerModelColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.ID, m.ProviderID, channel, m.ModelID, m.UpstreamModelName, m.Protocol, m.RequestTransform, m.ResponseTransform, m.Priority, m.Weight, boolInt(m.Enabled), stamp(created), stamp(created))
+	_, err := s.repositoryExecutor().ExecContext(ctx, `INSERT INTO provider_models(`+providerModelColumns+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.ID, m.ProviderID, channel, m.ModelID, m.UpstreamModelName, m.Protocol, m.RequestTransform, m.ResponseTransform, m.Priority, m.Weight, boolInt(m.Enabled), stamp(created), stamp(created), m.HeldReason)
 	return err
 }
 func (s *Store) GetProviderModel(ctx context.Context, id string) (domain.ProviderModel, error) {
@@ -558,7 +560,7 @@ func (s *Store) UpdateProviderModel(ctx context.Context, m domain.ProviderModel)
 	if m.ChannelID == "" {
 		channel = nil
 	}
-	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE provider_models SET provider_id=?,channel_id=?,model_id=?,upstream_model_name=?,protocol=?,request_transform=?,response_transform=?,priority=?,weight=?,enabled=?,updated_at=? WHERE id=?`, m.ProviderID, channel, m.ModelID, m.UpstreamModelName, m.Protocol, m.RequestTransform, m.ResponseTransform, m.Priority, m.Weight, boolInt(m.Enabled), stamp(time.Now()), m.ID)
+	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE provider_models SET provider_id=?,channel_id=?,model_id=?,upstream_model_name=?,protocol=?,request_transform=?,response_transform=?,priority=?,weight=?,enabled=?,updated_at=?,held_reason=? WHERE id=?`, m.ProviderID, channel, m.ModelID, m.UpstreamModelName, m.Protocol, m.RequestTransform, m.ResponseTransform, m.Priority, m.Weight, boolInt(m.Enabled), stamp(time.Now()), m.HeldReason, m.ID)
 	return requireAffected(result, err)
 }
 func (s *Store) DeleteProviderModel(ctx context.Context, id string) error {
@@ -568,16 +570,71 @@ func (s *Store) DeleteProviderModel(ctx context.Context, id string) error {
 
 // --- model sync snapshots (AUDIT 2026-09-24 §5 B3) ---
 
-func (s *Store) CreateModelSyncSnapshot(context.Context, domain.ModelSyncSnapshot) error {
-	return nil
+const modelSyncSnapshotColumns = `id,channel_id,source,bindings,added_models,held,undone,created_at`
+
+func (s *Store) CreateModelSyncSnapshot(ctx context.Context, snap domain.ModelSyncSnapshot) error {
+	bindings, err := json.Marshal(snap.Bindings)
+	if err != nil {
+		return err
+	}
+	added, err := json.Marshal(snap.AddedModels)
+	if err != nil {
+		return err
+	}
+	held, err := json.Marshal(snap.Held)
+	if err != nil {
+		return err
+	}
+	created := snap.CreatedAt
+	if created.IsZero() {
+		created = time.Now().UTC()
+	}
+	_, err = s.repositoryExecutor().ExecContext(ctx, `INSERT INTO model_sync_snapshots(`+modelSyncSnapshotColumns+`) VALUES(?,?,?,?,?,?,?,?)`,
+		snap.ID, snap.ChannelID, snap.Source, string(bindings), string(added), string(held), boolInt(snap.Undone), stamp(created))
+	return err
 }
 
-func (s *Store) LastModelSyncSnapshot(context.Context, string) (domain.ModelSyncSnapshot, error) {
-	return domain.ModelSyncSnapshot{}, ErrNotFound
+func scanModelSyncSnapshot(row interface{ Scan(...any) error }) (domain.ModelSyncSnapshot, error) {
+	var snap domain.ModelSyncSnapshot
+	var bindings, added, held, created string
+	var undone int
+	if err := row.Scan(&snap.ID, &snap.ChannelID, &snap.Source, &bindings, &added, &held, &undone, &created); err != nil {
+		return snap, err
+	}
+	snap.Undone = undone != 0
+	if bindings != "" {
+		if err := json.Unmarshal([]byte(bindings), &snap.Bindings); err != nil {
+			return snap, err
+		}
+	}
+	if added != "" {
+		if err := json.Unmarshal([]byte(added), &snap.AddedModels); err != nil {
+			return snap, err
+		}
+	}
+	if held != "" {
+		if err := json.Unmarshal([]byte(held), &snap.Held); err != nil {
+			return snap, err
+		}
+	}
+	t, err := parseTime(created)
+	if err != nil {
+		return snap, err
+	}
+	snap.CreatedAt = t
+	return snap, nil
 }
 
-func (s *Store) MarkModelSyncSnapshotUndone(context.Context, string) error {
-	return nil
+// LastModelSyncSnapshot returns the newest sync of a channel, undone or not:
+// the caller decides whether there is anything left to roll back.
+func (s *Store) LastModelSyncSnapshot(ctx context.Context, channelID string) (domain.ModelSyncSnapshot, error) {
+	return scanModelSyncSnapshot(s.repositoryExecutor().QueryRowContext(ctx,
+		`SELECT `+modelSyncSnapshotColumns+` FROM model_sync_snapshots WHERE channel_id=? ORDER BY created_at DESC LIMIT 1`, channelID))
+}
+
+func (s *Store) MarkModelSyncSnapshotUndone(ctx context.Context, id string) error {
+	result, err := s.repositoryExecutor().ExecContext(ctx, `UPDATE model_sync_snapshots SET undone=1 WHERE id=?`, id)
+	return requireAffected(result, err)
 }
 
 // DeleteProviderModelsByChannel removes every provider-model binding of one
