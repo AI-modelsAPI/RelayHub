@@ -109,6 +109,8 @@ func run(args []string) error {
 		// handed to the app, so "local_only" silently stayed "open" (AUDIT
 		// 2026-09-24 F2).
 		ManagementToken:       fileCfg.ManagementToken,
+		ProxyUsername:         fileCfg.ProxyUsername,
+		ProxyPassword:         fileCfg.ProxyPassword,
 		HTTPProxyTargetPolicy: fileCfg.HTTPProxyTargetPolicy,
 		SOCKS5TargetPolicy:    fileCfg.SOCKS5TargetPolicy,
 		Notify: app.NotifyConfig{

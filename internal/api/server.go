@@ -631,11 +631,16 @@ func (s *Server) fetchModels(w http.ResponseWriter, r *http.Request) {
 
 	// Build the upstream /models endpoint. Prefer /v1/models; fall back to /models.
 	// Existing channels go out through their configured proxy / identity headers
-	// (AUDIT RH-10); draft-channel probes have no channel identity to apply.
-	client := &http.Client{Timeout: 20 * time.Second, CheckRedirect: egress.SameOriginRedirect}
+	// (AUDIT RH-10). Draft-channel probes have no channel identity, but they
+	// still leave through the global egress (same-origin redirects only)
+	// instead of a bare direct client that bypassed the egress policy and
+	// exposed the operator's own IP to the relay being evaluated (AUDIT
+	// 2026-09-24 F7).
+	probeCh := domain.Channel{BaseURL: baseURL}
 	if haveChannel {
-		client = s.upstreamProbeClient(ch, 20*time.Second)
+		probeCh = ch
 	}
+	client := s.upstreamProbeClient(probeCh, 20*time.Second)
 	endpoints := []string{baseURL + "/v1/models", baseURL + "/models"}
 	var lastErr error
 	for _, ep := range endpoints {

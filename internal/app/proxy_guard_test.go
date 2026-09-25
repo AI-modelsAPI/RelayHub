@@ -3,7 +3,10 @@ package app
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -114,5 +117,70 @@ func TestManagementTokenIsWiredIntoTheAPI(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized {
 		t.Fatal("token was not accepted")
+	}
+}
+
+// AUDIT 2026-09-24 F2: proxy authentication existed in the proxies but could
+// not be enabled from configuration.
+func TestProxyCredentialsAreWired(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("upstream-ok"))
+	}))
+	defer upstream.Close()
+	a, err := New(Config{DataDir: t.TempDir(), HTTPProxyAddr: "127.0.0.1:0", SOCKS5Addr: "127.0.0.1:0", GatewayAddr: "127.0.0.1:0", ManagementAddr: "127.0.0.1:0", WireFullStack: true, ProxyUsername: "alice", ProxyPassword: "pw-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Shutdown(context.Background()) }()
+	proxyAddr := a.Runtime().HTTPProxy.Addr().String()
+	get := func(user *url.Userinfo) int {
+		pu := &url.URL{Scheme: "http", Host: proxyAddr, User: user}
+		c := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(pu)}}
+		resp, err := c.Get(upstream.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get(nil); code != http.StatusProxyAuthRequired {
+		t.Fatalf("no credentials: status %d, want 407", code)
+	}
+	if code := get(url.UserPassword("alice", "wrong")); code != http.StatusProxyAuthRequired {
+		t.Fatalf("wrong credentials: status %d, want 407", code)
+	}
+	if code := get(url.UserPassword("alice", "pw-1")); code != http.StatusOK {
+		t.Fatalf("valid credentials: status %d, want 200", code)
+	}
+}
+
+func TestConfigFileIsRestricted(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chmod(cfgPath, 0o644)
+	a, err := New(Config{DataDir: dir, HTTPProxyAddr: "127.0.0.1:0", SOCKS5Addr: "127.0.0.1:0", GatewayAddr: "127.0.0.1:0", ManagementAddr: "127.0.0.1:0", WireFullStack: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := a.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = a.Shutdown(context.Background()) }()
+	info, err := os.Stat(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("config.json mode %v", info.Mode().Perm())
 	}
 }

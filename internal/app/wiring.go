@@ -109,6 +109,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	for _, f := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		restrictToOwner(f, 0o600)
 	}
+	// config.json may hold the management token, proxy credentials and
+	// notification secrets (AUDIT 2026-09-24 F20).
+	restrictToOwner(filepath.Join(absDataDir, "config.json"), 0o600)
 
 	repo := repository.New(db.DB)
 	healthReg := health.NewRegistry()
@@ -247,6 +250,8 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		Addr:         httpPAddr,
 		TargetPolicy: httpTargetPolicy,
 		Guard:        selfGuard,
+		Username:     cfg.ProxyUsername,
+		Password:     cfg.ProxyPassword,
 	})
 	if err != nil {
 		_ = db.Close()
@@ -267,6 +272,8 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		Addr:         socksAddr,
 		TargetPolicy: socksTargetPolicy,
 		Guard:        selfGuard,
+		Username:     cfg.ProxyUsername,
+		Password:     cfg.ProxyPassword,
 	})
 	if err != nil {
 		_ = httpProxy.Shutdown(ctx)

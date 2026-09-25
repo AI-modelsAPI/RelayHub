@@ -16,7 +16,11 @@ type Config struct {
 	ManagementAddr        string
 	HTTPProxyTargetPolicy string
 	SOCKS5TargetPolicy    string
-	WireFullStack         bool
+	// ProxyUsername / ProxyPassword enable authentication on both local
+	// proxies when both are set (AUDIT 2026-09-24 F2).
+	ProxyUsername string
+	ProxyPassword string
+	WireFullStack bool
 	// EgressProxyURL is the global default exit for outbound traffic; a
 	// channel's proxy_url overrides it. See internal/egress.
 	EgressProxyURL string

@@ -33,6 +33,12 @@ type Config struct {
 	// addresses (AUDIT 2026-09-24 F1-F3).
 	HTTPProxyTargetPolicy string `json:"http_proxy_target_policy"`
 	SOCKS5TargetPolicy    string `json:"socks5_target_policy"`
+	// ProxyUsername / ProxyPassword, when both set, require credentials on
+	// the local HTTP (Proxy-Authorization: Basic) and SOCKS5 (RFC 1929)
+	// proxies, so other local processes and users cannot borrow the egress
+	// (AUDIT 2026-09-24 F2). Env: RELAYHUB_PROXY_USERNAME / _PASSWORD.
+	ProxyUsername string `json:"proxy_username"`
+	ProxyPassword string `json:"proxy_password"`
 	// EgressProxyURL is the global default exit for outbound AI gateway,
 	// check-in and browser traffic (http://, https://, socks5://, or
 	// "direct"). A channel's own proxy_url takes precedence. Empty means the
@@ -73,6 +79,8 @@ func ApplyEnv(cfg *Config) {
 	}
 	set(&cfg.EgressProxyURL, "RELAYHUB_EGRESS_PROXY")
 	set(&cfg.ManagementToken, "RELAYHUB_MANAGEMENT_TOKEN")
+	set(&cfg.ProxyUsername, "RELAYHUB_PROXY_USERNAME")
+	set(&cfg.ProxyPassword, "RELAYHUB_PROXY_PASSWORD")
 	set(&cfg.Notify.WebhookURL, "RELAYHUB_NOTIFY_WEBHOOK_URL")
 	set(&cfg.Notify.BarkURL, "RELAYHUB_NOTIFY_BARK_URL")
 	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
@@ -223,6 +231,12 @@ func merge(dst *Config, src Config) {
 	}
 	if src.ManagementToken != "" {
 		dst.ManagementToken = src.ManagementToken
+	}
+	if src.ProxyUsername != "" {
+		dst.ProxyUsername = src.ProxyUsername
+	}
+	if src.ProxyPassword != "" {
+		dst.ProxyPassword = src.ProxyPassword
 	}
 	if src.EgressProxyURL != "" {
 		dst.EgressProxyURL = src.EgressProxyURL
