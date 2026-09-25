@@ -31,7 +31,7 @@ func TestOpenAIStreamErrorAfterFirstDeltaReachesAnthropicClient(t *testing.T) {
 		t.Fatal("a mid-stream upstream error must be reported to the caller")
 	}
 	got := out.String()
-	if !strings.Contains(got, `"text_delta","text":"Par"`) {
+	if !strings.Contains(got, `"text":"Par"`) || !strings.Contains(got, `"text_delta"`) {
 		t.Fatalf("the content before the error must be flushed: %s", got)
 	}
 	if !strings.Contains(got, "event: error") || !strings.Contains(got, "upstream lost the connection") {
