@@ -126,7 +126,7 @@ jobs:
           gh release create "$TAG" \
             --title "RelayHub ${TAG}" \
             --notes-file release-notes.md \
-            --verify
+            --verify-tag
           gh release upload "$TAG" \
             dist/RelayHub-macOS-apple-silicon.dmg \
             dist/RelayHub-macOS-intel.dmg \
