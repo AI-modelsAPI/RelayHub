@@ -15,14 +15,16 @@ import (
 	"relayhub/internal/router"
 )
 
-// scriptedUpstream answers probe requests in order and records them.
-type scriptedUpstream struct {
+// probeScriptedUpstream answers probe requests in order and records them.
+// (scriptedUpstream in health_signal_test.go is a different helper: delay
+// steps, no request recording.)
+type probeScriptedUpstream struct {
 	replies  []Response
 	errs     []error
 	requests []Request
 }
 
-func (s *scriptedUpstream) Do(_ context.Context, req Request) (Response, error) {
+func (s *probeScriptedUpstream) Do(_ context.Context, req Request) (Response, error) {
 	s.requests = append(s.requests, req)
 	i := len(s.requests) - 1
 	if i < len(s.errs) && s.errs[i] != nil {
@@ -69,7 +71,7 @@ func firstMessageText(t *testing.T, body map[string]any) string {
 }
 
 func TestProbeOpenAIChatCanaryAndTools(t *testing.T) {
-	up := &scriptedUpstream{replies: []Response{
+	up := &probeScriptedUpstream{replies: []Response{
 		response(200, `{"id":"x","model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"Apple, river, stone, cloud."},"finish_reason":"stop"}],"usage":{"prompt_tokens":31,"completion_tokens":6}}`),
 		response(200, `{"model":"gpt-4o","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"record_code","arguments":"{\"code\":\"apple river stone cloud\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":88}}`),
 	}}
@@ -125,7 +127,7 @@ func TestProbeOpenAIChatCanaryAndTools(t *testing.T) {
 }
 
 func TestProbeAnthropicMessages(t *testing.T) {
-	up := &scriptedUpstream{replies: []Response{
+	up := &probeScriptedUpstream{replies: []Response{
 		response(200, `{"type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"apple river stone cloud"}],"stop_reason":"end_turn","usage":{"input_tokens":18,"cache_creation_input_tokens":0,"cache_read_input_tokens":2,"output_tokens":7}}`),
 		response(200, `{"type":"message","model":"claude-sonnet-4-5-20250929","content":[{"type":"tool_use","id":"toolu_1","name":"record_code","input":{"code":"apple river stone cloud"}}],"stop_reason":"tool_use","usage":{"input_tokens":402}}`),
 	}}
@@ -158,7 +160,7 @@ func TestProbeAnthropicMessages(t *testing.T) {
 }
 
 func TestProbeRecordsCannedRepliesAndPlainTextTools(t *testing.T) {
-	up := &scriptedUpstream{replies: []Response{
+	up := &probeScriptedUpstream{replies: []Response{
 		response(200, `{"model":"gpt-4o","choices":[{"message":{"content":"Hello! How can I help you today?"},"finish_reason":"stop"}],"usage":{"prompt_tokens":31}}`),
 		response(200, `{"model":"gpt-4o","choices":[{"message":{"content":"Sure, the code is apple river stone cloud."},"finish_reason":"stop"}]}`),
 	}}
@@ -173,25 +175,25 @@ func TestProbeRecordsCannedRepliesAndPlainTextTools(t *testing.T) {
 
 func TestProbeUpstreamErrorsAreReportedNotJudged(t *testing.T) {
 	// A rejected canary stops the probe: no tool request is spent.
-	up := &scriptedUpstream{replies: []Response{response(401, `{"error":{"message":"invalid api key"}}`)}}
+	up := &probeScriptedUpstream{replies: []Response{response(401, `{"error":{"message":"invalid api key"}}`)}}
 	o := Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("openai-chat", "gpt-4o", domain.Model{ID: "gpt-4o", ToolCallSupport: true}))
 	if o.CanaryStatus != 401 || !strings.Contains(o.CanaryError, "401") || !strings.Contains(o.CanaryError, "invalid api key") || o.ToolsChecked || len(up.requests) != 1 {
 		t.Fatalf("401 canary: %+v (%d requests)", o, len(up.requests))
 	}
 
-	up = &scriptedUpstream{errs: []error{errors.New("dial tcp: i/o timeout")}}
+	up = &probeScriptedUpstream{errs: []error{errors.New("dial tcp: i/o timeout")}}
 	o = Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("anthropic-messages", "claude-sonnet-4-5", domain.Model{ID: "sonnet"}))
 	if o.CanaryStatus != 0 || !strings.Contains(o.CanaryError, "i/o timeout") {
 		t.Fatalf("transport error: %+v", o)
 	}
 
-	up = &scriptedUpstream{replies: []Response{response(200, `<html><body>Just a moment...</body></html>`)}}
+	up = &probeScriptedUpstream{replies: []Response{response(200, `<html><body>Just a moment...</body></html>`)}}
 	o = Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("openai-chat", "gpt-4o", domain.Model{ID: "gpt-4o"}))
 	if o.CanaryStatus != 200 || o.CanaryError == "" || o.CanaryEchoed {
 		t.Fatalf("HTML under 200 is not an answer: %+v", o)
 	}
 
-	up = &scriptedUpstream{replies: []Response{response(200, `{"error":{"type":"overloaded_error","message":"Overloaded"}}`)}}
+	up = &probeScriptedUpstream{replies: []Response{response(200, `{"error":{"type":"overloaded_error","message":"Overloaded"}}`)}}
 	o = Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("anthropic-messages", "claude-sonnet-4-5", domain.Model{ID: "sonnet"}))
 	if o.CanaryError == "" || !strings.Contains(o.CanaryError, "Overloaded") {
 		t.Fatalf("error object under 200 is not an answer: %+v", o)
@@ -199,7 +201,7 @@ func TestProbeUpstreamErrorsAreReportedNotJudged(t *testing.T) {
 }
 
 func TestProbeReasoningModelsGetATokenBudget(t *testing.T) {
-	up := &scriptedUpstream{replies: []Response{
+	up := &probeScriptedUpstream{replies: []Response{
 		response(200, `{"model":"o3","choices":[{"message":{"content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":30}}`),
 	}}
 	o := Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("openai-chat", "o3", domain.Model{ID: "o3", ReasoningSupport: true}))
@@ -217,13 +219,13 @@ func TestProbeReasoningModelsGetATokenBudget(t *testing.T) {
 
 func TestProbeProtocolSelection(t *testing.T) {
 	// No explicit protocol: Claude models are probed over Messages.
-	up := &scriptedUpstream{replies: []Response{response(200, `{"model":"claude-opus-4-1","content":[{"type":"text","text":"apple river stone cloud"}],"stop_reason":"end_turn","usage":{"input_tokens":20}}`)}}
+	up := &probeScriptedUpstream{replies: []Response{response(200, `{"model":"claude-opus-4-1","content":[{"type":"text","text":"apple river stone cloud"}],"stop_reason":"end_turn","usage":{"input_tokens":20}}`)}}
 	o := Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("", "claude-opus-4-1", domain.Model{ID: "opus"}))
 	if o.Protocol != "anthropic-messages" || up.requests[0].Path != "/v1/messages" || !o.CanaryEchoed {
 		t.Fatalf("implicit protocol: %+v", o)
 	}
 	// Protocols the prober cannot speak are reported without a request.
-	up = &scriptedUpstream{}
+	up = &probeScriptedUpstream{}
 	o = Prober{Upstream: up, Code: fixedCode}.Probe(context.Background(), probeDecision("gemini", "gemini-2.5-pro", domain.Model{ID: "gemini-2.5-pro"}))
 	if len(up.requests) != 0 || o.CanaryStatus != 0 || !strings.Contains(o.CanaryError, "gemini") {
 		t.Fatalf("unsupported protocol: %+v", o)
