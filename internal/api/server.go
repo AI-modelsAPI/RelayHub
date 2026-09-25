@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -767,23 +768,32 @@ func validSyncedModelID(id string) bool {
 }
 
 func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern string) ([]string, int, error) {
+	filtered, created, _, err := s.syncChannelModelsMode(ctx, channelID, pattern, false)
+	return filtered, created, err
+}
+
+// syncChannelModelsMode performs the sync. In background mode (scheduler
+// auto-sync) it also returns the model IDs whose new bindings were held
+// disabled; see heldForReview.
+func (s *Server) syncChannelModelsMode(ctx context.Context, channelID, pattern string, background bool) ([]string, int, []string, error) {
+	var held []string
 	if s.Repo == nil {
-		return nil, 0, errors.New("resource persistence is not configured")
+		return nil, 0, nil, errors.New("resource persistence is not configured")
 	}
 	ch, err := s.Repo.GetChannel(ctx, channelID)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	apiKey := s.resolveChannelAPIKey(ctx, ch)
 	models, err := s.fetchUpstreamModelList(ctx, ch, apiKey)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	filtered := models
 	if pattern != "" {
 		re, reErr := regexp.Compile(pattern)
 		if reErr != nil {
-			return nil, 0, fmt.Errorf("%w: %s", errInvalidPattern, reErr.Error())
+			return nil, 0, nil, fmt.Errorf("%w: %s", errInvalidPattern, reErr.Error())
 		}
 		filtered = filtered[:0]
 		for _, m := range models {
@@ -805,18 +815,30 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 	}
 	filtered = valid
 	if len(filtered) > maxSyncedModels {
-		return nil, 0, fmt.Errorf("%w: upstream listed %d models (limit %d); narrow auto_sync_pattern", errInvalidPattern, len(filtered), maxSyncedModels)
+		return nil, 0, nil, fmt.Errorf("%w: upstream listed %d models (limit %d); narrow auto_sync_pattern", errInvalidPattern, len(filtered), maxSyncedModels)
 	}
 	// Operator edits to existing bindings (priority, weight, enabled, upstream
 	// name mapping, protocol, transforms) survive a re-sync; the old
 	// delete-and-recreate reset them on every scheduled auto-sync.
 	previous := map[string]domain.ProviderModel{}
+	servedElsewhere := map[string]bool{}
 	if all, lerr := s.Repo.ListProviderModels(ctx, ""); lerr == nil {
 		for _, pm := range all {
 			if pm.ChannelID == channelID {
 				previous[pm.ModelID] = pm
+			} else if pm.Enabled {
+				servedElsewhere[pm.ModelID] = true
 			}
 		}
+	}
+	// Background re-syncs of an onboarded channel do not let it silently
+	// take a share of a model other channels already serve: a relay that
+	// later starts listing "gpt-4o" gets a disabled binding the operator has
+	// to enable (AUDIT 2026-09-24 F6). Manual syncs and a channel's first
+	// sync keep enabling everything, so multi-relay load balancing still
+	// works out of the box.
+	heldForReview := func(model string) bool {
+		return background && len(previous) > 0 && servedElsewhere[model]
 	}
 	// Bindings inherit the provider protocol instead of hard-coded openai-chat:
 	// anthropic upstreams previously got non-routable "openai-chat" bindings
@@ -845,6 +867,10 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 			Priority:          ch.Priority,
 			Weight:            ch.Weight,
 			Enabled:           true,
+		}
+		if _, ok := previous[m]; !ok && heldForReview(m) {
+			pm.Enabled = false
+			held = append(held, m)
 		}
 		if old, ok := previous[m]; ok {
 			pm.ID = old.ID
@@ -883,19 +909,19 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 		WithTx(context.Context, func(*repository.Tx) error) error
 	}); ok {
 		if err := storeWithTx.WithTx(ctx, apply); err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 	} else {
 		// Repositories without transaction support (test fakes) get the same
 		// logic without the atomicity wrapper.
 		if err := s.Repo.DeleteProviderModelsByChannel(ctx, channelID); err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		created = 0
 		for _, plan := range plans {
 			_ = s.Repo.CreateModel(ctx, domain.Model{ID: plan.pm.ModelID, DisplayName: plan.pm.ModelID, Enabled: true})
 			if err := s.Repo.CreateProviderModel(ctx, plan.pm); err != nil {
-				return nil, 0, fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
+				return nil, 0, nil, fmt.Errorf("bind %s: %w", plan.pm.ModelID, err)
 			}
 			created++
 		}
@@ -905,13 +931,27 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 	// automatic model syncs updated the DB while the gateway kept routing with
 	// stale bindings (AUDIT RH-15).
 	s.notifyConfigChange(ctx)
-	return filtered, created, nil
+	return filtered, created, held, nil
 }
 
 // SyncChannelModels is the exported entry the scheduler's auto-sync callback
 // uses; it discards the model list and reports only an error.
 func (s *Server) SyncChannelModels(ctx context.Context, channelID, pattern string) error {
-	_, _, err := s.syncChannelModels(ctx, channelID, pattern)
+	_, _, held, err := s.syncChannelModelsMode(ctx, channelID, pattern, true)
+	if err == nil && len(held) > 0 {
+		shown := held
+		if len(shown) > 10 {
+			shown = shown[:10]
+		}
+		log.Printf("relayhub: model auto-sync: channel %s newly lists %d model(s) already served by other channels; bindings held disabled: %s", channelID, len(held), strings.Join(shown, ", "))
+		s.Notifier.Notify(notify.Event{
+			Kind:      notify.KindModelsHeld,
+			Severity:  notify.SeverityWarning,
+			Title:     "模型同步：新声明的模型已暂停",
+			Body:      fmt.Sprintf("渠道 %s 新声明了 %d 个其他渠道已在提供的模型（%s）。这些绑定已创建但处于禁用状态，确认可信后请在模型页手动启用。", channelID, len(held), strings.Join(shown, ", ")),
+			ChannelID: channelID,
+		})
+	}
 	return err
 }
 

@@ -32,6 +32,9 @@ const (
 	KindBalanceFailed  Kind = "balance_refresh_failed"
 	KindRecovered      Kind = "channel_recovered"
 	KindTest           Kind = "test"
+	// KindModelsHeld: a background model sync found a channel newly
+	// claiming models other channels serve; the bindings start disabled.
+	KindModelsHeld Kind = "models_held"
 )
 
 type Severity string
