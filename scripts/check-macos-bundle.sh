@@ -65,7 +65,7 @@ check_app() {
 
     local out
     if ! out="$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1)"; then
-        fail "[$label] code signature does not verify (a downloaded copy is reported as \"damaged\"):
+        fail "[$label] code signature does not verify; Gatekeeper refuses a downloaded copy (on Apple Silicon as \"damaged\", with no Open option):
 $out"
     fi
     echo "  [$label] code signature seal verifies"

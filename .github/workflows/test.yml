@@ -92,12 +92,22 @@ jobs:
 
       # The runner is always the newest macOS, so it cannot tell whether an
       # older one opens the app. Keep the PR's DMGs so they can be installed
-      # on a real older Mac before a tag is cut.
-      - name: Upload DMGs
+      # on a real older Mac before a tag is cut (one artifact per CPU, so a
+      # tester on a slow link downloads only the DMG they need).
+      - name: Upload Intel DMG
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: macos-dmgs
-          path: dist/*.dmg
+          name: RelayHub-macOS-intel
+          path: dist/RelayHub-macOS-intel.dmg
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload Apple Silicon DMG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: RelayHub-macOS-apple-silicon
+          path: dist/RelayHub-macOS-apple-silicon.dmg
+          compression-level: 0
           retention-days: 7
 
       # Process ownership, health, fail-closed port conflict, flock, crash
