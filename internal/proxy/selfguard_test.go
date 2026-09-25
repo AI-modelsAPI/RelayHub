@@ -173,3 +173,13 @@ func TestSelfGuardMatchesLocalInterfaceAddresses(t *testing.T) {
 		t.Fatal("nil guard must not block")
 	}
 }
+
+func TestSharedAddressSpaceIsPrivate(t *testing.T) {
+	ip := net.ParseIP("100.101.102.103")
+	if (TargetPolicy{AllowPublic: true}).allows(ip) {
+		t.Fatal("public-only policy must not reach CGNAT/Tailscale addresses")
+	}
+	if !(TargetPolicy{AllowPrivate: true}).allows(ip) {
+		t.Fatal("CGNAT should follow the private-range setting")
+	}
+}

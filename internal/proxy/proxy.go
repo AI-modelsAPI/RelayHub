@@ -44,11 +44,18 @@ func (p TargetPolicy) allows(ip net.IP) bool {
 	if isLocalIP(ip) {
 		return p.AllowLocal
 	}
-	if ip.IsPrivate() {
+	if ip.IsPrivate() || isSharedAddressSpace(ip) {
 		return p.AllowPrivate
 	}
 	return p.AllowPublic
 }
+
+// cgnat is RFC 6598 shared address space (carrier NAT, Tailscale). It is not
+// publicly routable, so it belongs with the private ranges rather than being
+// reachable under a public-only policy (AUDIT 2026-09-24 F2).
+var cgnat = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+func isSharedAddressSpace(ip net.IP) bool { return cgnat.Contains(ip) }
 
 func isLocalIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
