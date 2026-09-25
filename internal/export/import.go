@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"relayhub/internal/domain"
 	"relayhub/internal/repository"
+	"relayhub/internal/secretfields"
 )
 
 func PreviewPackage(ctx context.Context, packageBytes []byte, repo repository.ResourceRepository) (Preview, error) {
@@ -239,8 +241,12 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 		}
 
 		for _, c := range chans {
+			restoreChannelSecrets(&c, decryptedSecrets)
 			existing, err := tx.GetChannel(ctx, c.ID)
 			if err == nil && existing.ID != "" {
+				// Masked fields without a sealed original keep the
+				// installation's current value.
+				secretfields.RestoreMasked(&c, existing)
 				if opts.Policy == ConflictOverwrite {
 					if err := tx.UpdateChannel(ctx, c); err != nil {
 						return fmt.Errorf("update channel %s: %w", c.ID, err)
@@ -248,6 +254,7 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 				}
 				continue
 			}
+			secretfields.RestoreMasked(&c, domain.Channel{})
 			if err := tx.CreateChannel(ctx, c); err != nil {
 				return fmt.Errorf("create channel %s: %w", c.ID, err)
 			}
@@ -335,6 +342,11 @@ func ApplyWithOptions(ctx context.Context, packageBytes []byte, repo repository.
 		return err
 	}
 
+	for ref := range decryptedSecrets {
+		if strings.HasPrefix(ref, channelFieldPrefix) {
+			delete(decryptedSecrets, ref)
+		}
+	}
 	if opts.SecretImporter != nil && len(decryptedSecrets) > 0 {
 		if err := opts.SecretImporter(ctx, decryptedSecrets); err != nil {
 			return err
@@ -349,4 +361,25 @@ func integrityLabel(m Manifest) string {
 		return "verified_on_import"
 	}
 	return "unauthenticated"
+}
+
+// restoreChannelSecrets re-applies the channel credentials a password-
+// protected export sealed into its encrypted section.
+func restoreChannelSecrets(c *domain.Channel, sealed map[string][]byte) {
+	if len(sealed) == 0 {
+		return
+	}
+	if v, ok := sealed[channelProxyRef(c.ID)]; ok {
+		c.ProxyURL = string(v)
+	}
+	prefix := channelHeaderRef(c.ID, "")
+	for ref, v := range sealed {
+		if !strings.HasPrefix(ref, prefix) {
+			continue
+		}
+		if c.CustomHeaders == nil {
+			c.CustomHeaders = map[string]string{}
+		}
+		c.CustomHeaders[strings.TrimPrefix(ref, prefix)] = string(v)
+	}
 }

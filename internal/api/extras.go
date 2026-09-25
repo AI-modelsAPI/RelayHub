@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 	"relayhub/internal/lab"
 	"relayhub/internal/mcp"
 	"relayhub/internal/ratelimit"
+	"relayhub/internal/secretfields"
 	"relayhub/internal/verify"
 )
 
@@ -376,19 +376,4 @@ func (s *Server) methodAllowed(w http.ResponseWriter, r *http.Request, methods .
 
 // maskProxyUserinfo strips credentials from a proxy URL before it is echoed
 // by the management API (AUDIT RH-31: proxy passwords were returned in clear).
-func maskProxyUserinfo(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u == nil {
-		return raw
-	}
-	if u.User != nil {
-		if _, hasPassword := u.User.Password(); hasPassword {
-			u.User = url.User(u.User.Username())
-		}
-	}
-	return u.String()
-}
+func maskProxyUserinfo(raw string) string { return secretfields.MaskProxyURL(raw) }
