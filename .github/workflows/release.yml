@@ -5,12 +5,21 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+  id-token: write
+
 jobs:
   release-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Full history so `git describe --tags` (version stamping in
+      # build-macos.sh / verify-release.sh) is reliable.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.27'
 
@@ -26,8 +35,94 @@ jobs:
       - name: Desktop lifecycle suite (native-arch bundle)
         run: python3 -m unittest -v tests.macos.test_desktop_lifecycle
 
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          shasum -a 256 RelayHub-macOS-*.dmg > SHA256SUMS
+          cat SHA256SUMS
+
+      # Supply-chain: prove these DMGs were built by this repo's CI (AUDIT D1).
+      # Users can verify offline with `gh attestation verify` or
+      # `sigstore verify` against the attached .attestation files.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: |
+            dist/RelayHub-macOS-apple-silicon.dmg
+            dist/RelayHub-macOS-intel.dmg
+
+      - name: Write release notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cat > release-notes.md <<EOF
+          # RelayHub ${TAG}
+
+          macOS 桌面版（Apple Silicon + Intel）。本版本包含 2026-09-24 安全审计的全部修复（F1–F21）。
+
+          ## 重要行为变化（必读）
+
+          - **管理 API 默认需要 token（F4）**：所有 /api/ 接口（含读取）需要 \`Authorization: Bearer <token>\`；例外仅 \`/api/v1/health\`、\`/healthz\` 和配对端点。首次启动会在数据目录生成 \`.data/management.token\` 并打印一次性配对链接。
+          - 桌面版内嵌窗口自动携带 token，无需操作；浏览器访问请用启动时打印的 \`#pair=\` 链接或 \`relayhub pair\` 命令。
+          - 恢复旧行为（不推荐）：配置 \`management_auth: off\`。
+          - HTTP 代理仅接受绝对形式的请求（origin-form 返回 400）；代理默认禁止访问本机端口与云元数据地址。
+          - 渠道 Key 在来源 origin 变化时会自动锁定，需要重新输入。
+          - 导入/导出配置为 v3 格式（旧版本导出可导入，新版本导出旧版本不能读）。
+
+          ## 安装
+
+          1. 下载对应架构的 DMG（apple-silicon = Apple Silicon，intel = Intel）。
+          2. 打开 DMG，把 RelayHub 拖进 Applications。
+
+          **本版本未做代码签名和公证**（需要 Apple Developer 证书）。首次打开时 macOS Gatekeeper 会拦截，二选一：
+          - 在 Finder 里**右键** RelayHub → 打开 → 再点"打开"；
+          - 或终端执行：\`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`
+
+          ## 校验
+
+          \`\`\`sh
+          shasum -a 256 -c SHA256SUMS
+          \`\`\`
+
+          附带的 \`.attestation\` 文件是本仓库 CI 构建的证明，可用 \`gh attestation verify\` 或 \`sigstore verify\` 离线核验。
+
+          ---
+          # RelayHub ${TAG}
+
+          macOS desktop build (Apple Silicon + Intel). Includes every fix from the 2026-09-24 security audit (F1-F21).
+
+          ## Breaking changes
+
+          - **Management API is token-authenticated by default (F4)**; exceptions: \`/api/v1/health\`, \`/healthz\`, the pairing endpoints. The desktop webview carries the token automatically; browser access uses the one-time \`#pair=\` link or \`relayhub pair\`. Restore old behaviour with \`management_auth: off\`.
+          - HTTP proxy only accepts absolute-form requests; proxying to local/metadata addresses is refused by default.
+          - Channel keys lock when their origin changes. Config export/import is now v3.
+
+          ## Install
+
+          Open the DMG for your architecture and drag RelayHub to Applications. **This build is unsigned and not notarized** (needs an Apple Developer certificate): right-click the app and choose Open, or run \`xattr -dr com.apple.quarantine /Applications/RelayHub.app\`.
+
+          Verify with \`shasum -a 256 -c SHA256SUMS\`; \`.attestation\` files prove the build came from this repository's CI.
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --title "RelayHub ${TAG}" \
+            --notes-file release-notes.md \
+            --verify
+          gh release upload "$TAG" \
+            dist/RelayHub-macOS-apple-silicon.dmg \
+            dist/RelayHub-macOS-intel.dmg \
+            dist/RelayHub-macOS-apple-silicon.dmg.attestation \
+            dist/RelayHub-macOS-intel.dmg.attestation \
+            dist/SHA256SUMS \
+            --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'
+
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-dmgs
           path: dist/*.dmg
