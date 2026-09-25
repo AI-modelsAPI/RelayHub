@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -160,13 +161,34 @@ func TestDataPlaneListenAddrEnvOverrides(t *testing.T) {
 		t.Fatalf("expected 401 from unauthenticated gateway, got %d", resp.StatusCode)
 	}
 
+	// The shipped binary authenticates the management API by default (AUDIT
+	// 2026-09-24 F4): anonymous reads are refused, and the token lives in
+	// <data-dir>/management.token.
+	anon, err := client.Get("http://" + mgmt + "/api/v1/settings")
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	anon.Body.Close()
+	if anon.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous management read: %d, want 401", anon.StatusCode)
+	}
+	rawToken, err := os.ReadFile(filepath.Join(dataDir, "management.token"))
+	if err != nil {
+		t.Fatalf("management token file: %v", err)
+	}
+
 	// Management settings must advertise a dialable gateway address, not the
 	// wildcard the socket was bound to (CLI sync writes this into configs).
-	sresp, err := client.Get("http://" + mgmt + "/api/v1/settings")
+	sreq, _ := http.NewRequest(http.MethodGet, "http://"+mgmt+"/api/v1/settings", nil)
+	sreq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(rawToken)))
+	sresp, err := client.Do(sreq)
 	if err != nil {
 		t.Fatalf("settings: %v", err)
 	}
 	defer sresp.Body.Close()
+	if sresp.StatusCode != http.StatusOK {
+		t.Fatalf("settings with token: %d", sresp.StatusCode)
+	}
 	var settings struct {
 		GatewayAddress string `json:"gateway_address"`
 	}

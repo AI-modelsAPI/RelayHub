@@ -26,9 +26,15 @@ type Config struct {
 	// EgressProxyURL is the global default exit for outbound traffic; a
 	// channel's proxy_url overrides it. See internal/egress.
 	EgressProxyURL string
-	// ManagementToken enables bearer-token authorization for mutating
-	// management API calls (AUDIT 2026-09-24 F4).
+	// ManagementToken is an explicit management API bearer token (AUDIT
+	// 2026-09-24 F4).
 	ManagementToken string
+	// ManagementAuth: "token" requires a token on the management API,
+	// generating <data-dir>/management.token when ManagementToken is empty;
+	// "off" disables authentication; "" (embedders and tests) uses
+	// ManagementToken as given, so an empty token means no authentication.
+	// The relayhub binary passes config's default, "token".
+	ManagementAuth string
 	// Notify configures outbound notification sinks (see internal/notify).
 	Notify NotifyConfig
 }

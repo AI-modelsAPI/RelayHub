@@ -69,6 +69,9 @@ type Runtime struct {
 	// for in-flight management requests instead of hard-cutting the listener).
 	MgmtHTTP *http.Server
 	Notifier *notify.Dispatcher
+	// ManagementTokenSource says where the management token came from:
+	// "config", "off", or the path of <data-dir>/management.token.
+	ManagementTokenSource string
 
 	stopCh  chan struct{}
 	stopped chan struct{}
@@ -92,6 +95,11 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	// dir (Docker's /data, a hand-made dir, an older install) kept 0755 and
 	// the database landed world-readable (AUDIT 2026-09-24 F19).
 	restrictToOwner(absDataDir, 0o700)
+
+	mgmtToken, mgmtTokenSource, err := resolveManagementToken(absDataDir, cfg.ManagementAuth, cfg.ManagementToken)
+	if err != nil {
+		return nil, err
+	}
 
 	// Database
 	dbPath := filepath.Join(absDataDir, "relayhub.db")
@@ -358,7 +366,8 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	apiServer, err := api.NewConfiguredServer(api.Config{
 		Management:     apiAddr,
 		LocalOnly:      true,
-		Token:          strings.TrimSpace(cfg.ManagementToken),
+		Token:          mgmtToken,
+		DataDir:        absDataDir,
 		Repo:           repo,
 		SecretStore:    secStore,
 		AuditLogger:    auditLog,
@@ -453,7 +462,9 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 		AuditLogger: auditLog,
 		Notifier:    notifier,
 		stopCh:      make(chan struct{}),
-		stopped:     make(chan struct{}),
+		// Source of the management credential, for the startup log.
+		ManagementTokenSource: mgmtTokenSource,
+		stopped:               make(chan struct{}),
 	}
 
 	return rt, nil

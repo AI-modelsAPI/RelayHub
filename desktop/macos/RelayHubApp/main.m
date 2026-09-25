@@ -617,11 +617,48 @@ static dispatch_source_t g_sigint_source = NULL;
     });
 }
 
+// The core authenticates its management API with the token it generates into
+// <data-dir>/management.token (AUDIT 2026-09-24 F4). The shell owns that data
+// directory, so it reads the token and hands it to its own web view; nil when
+// the file is missing (management_auth "off" or an explicit token).
+- (NSString *)managementToken {
+    if (self.dataDir.length == 0) return nil;
+    NSString *path = [self.dataDir stringByAppendingPathComponent:@"management.token"];
+    NSString *raw = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *token = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return token.length > 0 ? token : nil;
+}
+
+- (NSString *)consoleOrigin {
+    return [NSString stringWithFormat:@"http://127.0.0.1:%ld", (long)self.port];
+}
+
+// Seeds the console's localStorage with the management token before any page
+// script runs. The script only fires on the console's own origin, so a page
+// navigated to elsewhere never sees the token. WKWebView offers no
+// window.prompt, so without this the embedded console could not log in.
+- (void)installManagementTokenScript {
+    WKUserContentController *ucc = self.webView.configuration.userContentController;
+    [ucc removeAllUserScripts];
+    NSString *token = [self managementToken];
+    if (token == nil) return;
+    NSData *json = [NSJSONSerialization dataWithJSONObject:@[[self consoleOrigin], token] options:0 error:nil];
+    if (json == nil) return;
+    NSString *args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+    NSString *source = [NSString stringWithFormat:
+        @"(function(v){try{if(location.origin===v[0]){localStorage.setItem('relayhub.managementToken',v[1]);}}catch(e){}})(%@);", args];
+    WKUserScript *script = [[WKUserScript alloc] initWithSource:source
+                                                  injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                               forMainFrameOnly:YES];
+    [ucc addUserScript:script];
+}
+
 - (void)reloadWebView {
     if (self.portConflictDetected) {
         return;
     }
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld", (long)self.port]];
+    [self installManagementTokenScript];
+    NSURL *url = [NSURL URLWithString:[self consoleOrigin]];
     [self.webView loadRequest:[NSURLRequest requestWithURL:url]];
 }
 
@@ -630,10 +667,36 @@ static dispatch_source_t g_sigint_source = NULL;
     [self.window makeKeyAndOrderFront:nil];
 }
 
+// Opens the console in the default browser with a one-time pairing link, so
+// the browser gets its own session without the token ever appearing in a URL
+// (AUDIT 2026-09-24 F4). Falls back to the plain console address, where the
+// console asks for a pairing code or the token.
 - (void)openExternalBrowser {
     if (self.portConflictDetected) return;
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%ld", (long)self.port]];
-    [[NSWorkspace sharedWorkspace] openURL:url];
+    NSString *base = [self consoleOrigin];
+    NSString *token = [self managementToken];
+    if (token == nil) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:base]];
+        return;
+    }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[base stringByAppendingString:@"/api/v1/auth/pair-codes"]]];
+    req.HTTPMethod = @"POST";
+    req.timeoutInterval = 5;
+    [req setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+        NSString *target = base;
+        NSInteger status = [response isKindOfClass:[NSHTTPURLResponse class]] ? ((NSHTTPURLResponse *)response).statusCode : 0;
+        if (error == nil && status == 201 && data != nil) {
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            id link = [obj isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)obj)[@"url"] : nil;
+            if ([link isKindOfClass:[NSString class]] && [(NSString *)link hasPrefix:[base stringByAppendingString:@"/#pair="]]) {
+                target = link;
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:target]];
+        });
+    }] resume];
 }
 
 - (void)quitApp {

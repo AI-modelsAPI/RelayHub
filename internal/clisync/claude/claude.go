@@ -23,6 +23,10 @@ type Syncer struct {
 	// Executable overrides the binary path written into the MCP entry
 	// (tests); empty means the running executable.
 	Executable string
+	// DataDir is written into the MCP entry (RELAYHUB_DATA_DIR) so the
+	// bridge reads management.token from the right place; the token itself
+	// never lands in the Claude Code config (AUDIT 2026-09-24 F4).
+	DataDir string
 }
 
 // mcpEntry renders the Claude Code MCP server entry. The command is the
@@ -48,10 +52,14 @@ func (s *Syncer) mcpEntry() map[string]interface{} {
 	if mgmt == "" {
 		mgmt = "127.0.0.1:8790"
 	}
+	env := map[string]interface{}{"RELAYHUB_MANAGEMENT_ADDR": mgmt}
+	if s.DataDir != "" {
+		env["RELAYHUB_DATA_DIR"] = s.DataDir
+	}
 	return map[string]interface{}{
 		"command": cmd,
 		"args":    []string{"mcp"},
-		"env":     map[string]interface{}{"RELAYHUB_MANAGEMENT_ADDR": mgmt},
+		"env":     env,
 	}
 }
 

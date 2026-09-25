@@ -15,13 +15,15 @@ import (
 // MCP session: each newline-delimited JSON-RPC request on stdin is forwarded
 // and its response written back on one line, until EOF (AUDIT RH-25: the
 // previous implementation waited for full stdin EOF and served one request).
-func runMCPStdio(managementAddr string) error {
+func runMCPStdio(managementAddr, token string) error {
 	addr := strings.TrimSpace(managementAddr)
 	if addr == "" {
 		addr = "127.0.0.1:8790"
 	}
 	url := "http://" + addr + "/api/v1/mcp"
-	token := strings.TrimSpace(os.Getenv("RELAYHUB_MANAGEMENT_TOKEN"))
+	// token comes from RELAYHUB_MANAGEMENT_TOKEN, config.json or
+	// <data-dir>/management.token (clientManagementToken, AUDIT 2026-09-24 F4).
+	token = strings.TrimSpace(token)
 	client := &http.Client{Timeout: 120 * time.Second}
 
 	forward := func(body []byte) ([]byte, error) {

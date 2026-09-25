@@ -49,12 +49,18 @@ type Config struct {
 	// "direct"). A channel's own proxy_url takes precedence. Empty means the
 	// process environment (HTTPS_PROXY etc.) decides. Env: RELAYHUB_EGRESS_PROXY.
 	EgressProxyURL string `json:"egress_proxy_url"`
-	// ManagementToken, when set, is required (as "Authorization: Bearer …")
-	// for every mutating management API call. The web console asks for it on
-	// the first 401; `relayhub mcp` sends RELAYHUB_MANAGEMENT_TOKEN. Before
-	// this field existed the server had no way to enable its token check
-	// (AUDIT 2026-09-24 F4).
+	// ManagementToken, when set, is the bearer token ("Authorization: Bearer
+	// …") the management API requires; otherwise a random token is generated
+	// into <data-dir>/management.token (see ManagementAuth). Before this field
+	// existed the server had no way to enable its token check (AUDIT
+	// 2026-09-24 F4).
 	ManagementToken string `json:"management_token"`
+	// ManagementAuth controls management API authentication: "token"
+	// (default) requires a bearer token on every /api/ call except liveness
+	// and pairing — management_token when set, otherwise a random token kept
+	// in <data-dir>/management.token; "off" restores the unauthenticated
+	// loopback API (AUDIT 2026-09-24 F4). Env: RELAYHUB_MANAGEMENT_AUTH.
+	ManagementAuth string `json:"management_auth"`
 	// Notify configures outbound notifications (check-in failures, quota
 	// low, breaker open). All fields optional; env overrides see ApplyEnv.
 	Notify NotifyConfig `json:"notify"`
@@ -84,6 +90,7 @@ func ApplyEnv(cfg *Config) {
 	}
 	set(&cfg.EgressProxyURL, "RELAYHUB_EGRESS_PROXY")
 	set(&cfg.ManagementToken, "RELAYHUB_MANAGEMENT_TOKEN")
+	set(&cfg.ManagementAuth, "RELAYHUB_MANAGEMENT_AUTH")
 	set(&cfg.ProxyUsername, "RELAYHUB_PROXY_USERNAME")
 	set(&cfg.ProxyPassword, "RELAYHUB_PROXY_PASSWORD")
 	set(&cfg.MasterKeyStore, "RELAYHUB_MASTER_KEY_STORE")
@@ -107,6 +114,7 @@ func Defaults(dataDir string) Config {
 		HTTPProxyAddr: DefaultHTTPProxyAddr, SOCKS5Addr: DefaultSOCKS5Addr,
 		GatewayAddr: DefaultGatewayAddr, ManagementAddr: DefaultManagementAddr,
 		HTTPProxyTargetPolicy: "open", SOCKS5TargetPolicy: "open",
+		ManagementAuth: "token",
 	}
 }
 
@@ -237,6 +245,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.ManagementToken != "" {
 		dst.ManagementToken = src.ManagementToken
+	}
+	if src.ManagementAuth != "" {
+		dst.ManagementAuth = src.ManagementAuth
 	}
 	if src.ProxyUsername != "" {
 		dst.ProxyUsername = src.ProxyUsername

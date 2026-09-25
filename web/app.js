@@ -20,9 +20,11 @@ const state = {
   online: false,
 };
 
-// Optional management token (config "management_token" / env
-// RELAYHUB_MANAGEMENT_TOKEN). Mutations answer 401 until the operator enters
-// it once; it is kept in this browser's localStorage only.
+// Management authentication (AUDIT 2026-09-24 F4). The API requires a token
+// by default. The console gets it by redeeming a one-time pairing code — from
+// the startup log, `relayhub pair` or the desktop app — that arrives in the
+// URL fragment (#pair=…, never sent to a server), or through the auth gate
+// below. The token is kept in this origin's localStorage only.
 const TOKEN_KEY = "relayhub.managementToken";
 function withAuth(init) {
   const token = localStorage.getItem(TOKEN_KEY);
@@ -31,14 +33,95 @@ function withAuth(init) {
   next.headers = Object.assign({}, (init && init.headers) || {}, { Authorization: "Bearer " + token });
   return next;
 }
+
+function pairingCodeFrom(text) {
+  const m = /#pair=([A-Za-z0-9_-]{8,128})\s*$/.exec(text || "");
+  return m ? m[1] : null;
+}
+
+async function redeemPairingCode(code) {
+  const r = await fetch("/api/v1/auth/pair", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  if (!r.ok) return false;
+  const body = await r.json().catch(() => null);
+  if (!body || typeof body.token !== "string" || !body.token) return false;
+  localStorage.setItem(TOKEN_KEY, body.token);
+  return true;
+}
+
+// Drop the code from the address bar and history first, then redeem it once.
+const pairingReady = (async () => {
+  const code = pairingCodeFrom(location.hash);
+  if (!code) return;
+  history.replaceState(null, "", location.pathname + location.search);
+  try {
+    await redeemPairingCode(code);
+  } catch (_) {
+    /* the auth gate takes over on the first 401 */
+  }
+})();
+
+// One gate for every request that hits 401, however many are in flight. It
+// is an in-page form rather than window.prompt, which WKWebView (the desktop
+// shell) does not implement.
+let authGate = null;
+function askForCredential() {
+  if (authGate) return authGate;
+  authGate = new Promise((resolve) => {
+    const form = $("#auth-gate");
+    const input = $("#auth-input");
+    const err = $("#auth-error");
+    const submit = $("#auth-submit");
+    form.hidden = false;
+    err.hidden = true;
+    input.value = "";
+    input.focus();
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      submit.disabled = true;
+      let ok = false;
+      try {
+        const link = pairingCodeFrom(text);
+        const code = link || (/^[A-Za-z0-9_-]{32}$/.test(text) ? text : null);
+        if (code) ok = await redeemPairingCode(code);
+        if (!ok && !link) {
+          // Not a (live) pairing code: try it as the token itself.
+          const probe = await fetch("/api/v1/settings", { headers: { Authorization: "Bearer " + text } });
+          if (probe.ok) {
+            localStorage.setItem(TOKEN_KEY, text);
+            ok = true;
+          }
+        }
+      } catch (_) {
+        ok = false;
+      }
+      submit.disabled = false;
+      if (!ok) {
+        err.textContent = "无效或已过期。运行 relayhub pair 获取新的配对链接，或粘贴 management.token 中的令牌。";
+        err.hidden = false;
+        return;
+      }
+      form.hidden = true;
+      form.onsubmit = null;
+      authGate = null;
+      resolve();
+    };
+  });
+  return authGate;
+}
+
 async function authFetch(url, init) {
+  await pairingReady;
   let r = await fetch(url, withAuth(init));
   if (r.status === 401) {
-    const token = window.prompt("此操作需要 RelayHub 管理令牌（management_token）：");
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token.trim());
-      r = await fetch(url, withAuth(init));
-    }
+    localStorage.removeItem(TOKEN_KEY);
+    await askForCredential();
+    r = await fetch(url, withAuth(init));
   }
   return r;
 }

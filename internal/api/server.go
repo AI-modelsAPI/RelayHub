@@ -53,7 +53,9 @@ const apiPrefix = "/api/v1/"
 // directly; remote servers can only be served through NewServerOnListener,
 // which enforces the listener peer policy before routing requests.
 type Server struct {
-	Token          string
+	Token string
+	// pairing holds one-time console pairing codes (see pairing.go).
+	pairing        pairingStore
 	Repo           repository.ResourceRepository
 	LocalOnly      bool
 	Management     string
@@ -143,6 +145,11 @@ type Config struct {
 	// boundary. Direct Handler use remains available for local in-process tests.
 	Listener net.Listener
 
+	// DataDir is the RelayHub data directory. The Claude Code MCP entry
+	// passes it to `relayhub mcp` so the bridge finds management.token even
+	// with a non-default data directory.
+	DataDir string
+
 	// CLISync / ImportExport configuration
 	BackupDir   string
 	ClaudePath  string
@@ -205,7 +212,7 @@ func NewConfiguredServer(cfg Config) (*Server, error) {
 	}
 	syncEngine := clisync.NewEngine(cfg.Repo, cfg.BackupDir)
 	cliSyncSvc := clisync.NewService(syncEngine, cfg.LocalKeys, gatewayBase, map[string]clisync.Syncer{
-		"claude": &claude.Syncer{Engine: syncEngine, Path: cfg.ClaudePath, GatewayAddr: gatewayBase, ManagementAddr: cfg.Management},
+		"claude": &claude.Syncer{Engine: syncEngine, Path: cfg.ClaudePath, GatewayAddr: gatewayBase, ManagementAddr: cfg.Management, DataDir: cfg.DataDir},
 		"codex":  &codex.Syncer{Engine: syncEngine, Path: cfg.CodexPath, GatewayAddr: gatewayBase},
 		"hermes": &hermes.Syncer{Engine: syncEngine, Home: cfg.HermesHome, GatewayAddr: gatewayBase},
 	})
@@ -298,6 +305,8 @@ func (s *Server) managementRoutes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/api/v1/health", s.health)
+	mux.HandleFunc("/api/v1/auth/pair", s.authPair)
+	mux.HandleFunc("/api/v1/auth/pair-codes", s.authPairCodes)
 	mux.HandleFunc("/api/v1/overview", s.overview)
 	mux.HandleFunc("/api/v1/providers", s.providers)
 	mux.HandleFunc("/api/v1/providers/", s.providers)
@@ -363,7 +372,9 @@ func (s *Server) managementRoutes() http.Handler {
 }
 
 // publicAPIPaths are the only /api/ endpoints served without authorization.
-var publicAPIPaths = map[string]bool{"/api/v1/health": true}
+// Pairing redeems a one-time code, so it cannot require the token it hands
+// out (AUDIT 2026-09-24 F4).
+var publicAPIPaths = map[string]bool{"/api/v1/health": true, "/api/v1/auth/pair": true}
 
 // requireAuthorization applies the shared authorization check to every /api/
 // request before routing. Authorization used to be opt-in per handler, and
@@ -488,7 +499,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.write(w, r, http.StatusOK, map[string]any{"status": "ok", "management": s.Management, "local_only": s.LocalOnly, "request_id": requestID(r)})
 }
 func (s *Server) healthRequestAllowed(w http.ResponseWriter, r *http.Request) bool {
-	if !s.authorize(w, r) {
+	// Liveness stays public on the loopback management plane: the desktop
+	// shell and scripts probe it before they hold a credential, and it
+	// reveals nothing but the listen address. Remote management keeps
+	// requiring the token.
+	if !s.LocalOnly && !s.authorize(w, r) {
 		return false
 	}
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
@@ -527,12 +542,14 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request) bool {
 	// Loopback local mode without a configured token: allow everything.
 	// The listener/peer policy already guarantees the peer is loopback.
+	// The shipped binary always configures a token unless the operator sets
+	// management_auth to "off" (AUDIT 2026-09-24 F4).
 	if s.LocalOnly && s.Token == "" {
 		return true
 	}
-	if s.LocalOnly && (r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions) {
-		return true
-	}
+	// With a token, reads are protected as well: request logs, lab captures
+	// and usage history are as sensitive as the mutations. Reads used to stay
+	// open on loopback, so any local process or user could pull them.
 	if s.Token == "" {
 		s.fail(w, r, unauthorized())
 		return false
@@ -567,10 +584,16 @@ func (s *Server) auditEvent(ctx context.Context, action string, r *http.Request,
 	}
 	// Previously the error was discarded; a failed audit write must at least be
 	// observable in the server log (AUDIT RH-30).
+	// The actor names the credential (a hash prefix, never the token) so
+	// token-authenticated changes can be told apart (AUDIT 2026-09-24 F4).
+	actor := r.RemoteAddr
+	if id := s.credentialID(r); id != "" {
+		actor += " " + id
+	}
 	if err := s.AuditLogger.Record(ctx, audit.Event{
 		Action:    action,
 		RequestID: requestID(r),
-		Actor:     r.RemoteAddr,
+		Actor:     actor,
 		Metadata:  metadata,
 	}); err != nil && s.Logger != nil {
 		_ = s.Logger.Event("warn", "audit_write_failed", "", map[string]any{"action": action, "error": err.Error()})

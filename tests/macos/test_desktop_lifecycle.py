@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -110,9 +111,19 @@ class DesktopLifecycleTests(unittest.TestCase):
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
                     self.assertEqual(r.status, 200)
                     self.assertIn("text/html", r.headers.get("Content-Type", ""))
+                # The management API is authenticated by default (AUDIT
+                # 2026-09-24 F4): anonymous reads are refused, and the core
+                # generates its token into the shell's data dir.
+                summary = f"http://127.0.0.1:{port}/api/v1/usage/summary"
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    urllib.request.urlopen(summary, timeout=2)
+                self.assertEqual(denied.exception.code, 401)
+                token = (data_dir / "management.token").read_text().strip()
+                self.assertGreaterEqual(len(token), 32)
                 # Management API served through the shell's port: the extras
                 # family must be routed (P0-1 / RH-05 regression on real binary).
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/usage/summary", timeout=2) as r:
+                authed = urllib.request.Request(summary, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(authed, timeout=2) as r:
                     self.assertEqual(r.status, 200)
                     self.assertIn(b"cache_hit_ratio", r.read())
             finally:

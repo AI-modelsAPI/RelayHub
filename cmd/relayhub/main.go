@@ -62,7 +62,7 @@ func run(args []string) error {
 	fs.StringVar(&socks5Addr, "socks5-addr", envOr("RELAYHUB_SOCKS5_ADDR", config.DefaultSOCKS5Addr), "SOCKS5 proxy listen address (overrides RELAYHUB_SOCKS5_ADDR)")
 	fs.StringVar(&gatewayAddr, "gateway-addr", envOr("RELAYHUB_GATEWAY_ADDR", config.DefaultGatewayAddr), "AI gateway listen address (overrides RELAYHUB_GATEWAY_ADDR)")
 	fs.BoolVar(&showVersion, "version", false, "print version information and exit")
-	fs.StringVar(&dataDir, "data-dir", defaultDataDir(), "directory for RelayHub state")
+	fs.StringVar(&dataDir, "data-dir", envOr("RELAYHUB_DATA_DIR", defaultDataDir()), "directory for RelayHub state (overrides RELAYHUB_DATA_DIR)")
 	fs.BoolVar(&fullStack, "full-stack", false, "start full stack (proxies, gateway, management API)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -74,7 +74,14 @@ func run(args []string) error {
 	}
 
 	if fs.NArg() == 1 && fs.Arg(0) == "mcp" {
-		return runMCPStdio(managementAddr)
+		token, err := clientManagementToken(dataDir)
+		if err != nil {
+			return err
+		}
+		return runMCPStdio(managementAddr, token)
+	}
+	if fs.NArg() == 1 && fs.Arg(0) == "pair" {
+		return runPair(managementAddr, dataDir, os.Stdout, os.Stderr)
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
@@ -109,6 +116,7 @@ func run(args []string) error {
 		// handed to the app, so "local_only" silently stayed "open" (AUDIT
 		// 2026-09-24 F2).
 		ManagementToken:       fileCfg.ManagementToken,
+		ManagementAuth:        fileCfg.ManagementAuth,
 		ProxyUsername:         fileCfg.ProxyUsername,
 		ProxyPassword:         fileCfg.ProxyPassword,
 		MasterKeyStore:        fileCfg.MasterKeyStore,
@@ -134,6 +142,7 @@ func run(args []string) error {
 		return err
 	}
 	log.Printf("relayhub started: %s (data-dir %s)", a.Info(), dataDir)
+	logManagementAccess(a.Runtime())
 
 	// Block until a shutdown signal arrives.
 	<-ctx.Done()

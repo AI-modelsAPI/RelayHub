@@ -64,3 +64,15 @@ test("offline state is derived from the overview heartbeat, not assumed", () => 
   assert.match(appJs, /state\.online = ok\(ov\)/);
   assert.match(appJs, /live\.add\("off"\)/);
 });
+
+test("the console pairs through the URL fragment and an in-page gate (AUDIT 2026-09-24 F4)", () => {
+  assert.match(appJs, /#pair=/);
+  assert.match(appJs, /fetch\("\/api\/v1\/auth\/pair"/);
+  // The one-time code must leave the address bar and history before use.
+  assert.match(appJs, /history\.replaceState/);
+  // WKWebView (the desktop shell) has no window.prompt; a prompt-based login
+  // would lock the desktop app out.
+  assert.doesNotMatch(appJs, /\bprompt\(/);
+  assert.match(html, /<form[^>]*id="auth-gate"/);
+  assert.ok(isRegistered("/api/v1/auth/pair") && isRegistered("/api/v1/auth/pair-codes"));
+});
