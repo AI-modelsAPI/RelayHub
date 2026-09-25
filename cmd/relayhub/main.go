@@ -74,11 +74,14 @@ func run(args []string) error {
 	}
 
 	if fs.NArg() == 1 && fs.Arg(0) == "mcp" {
-		token, err := clientManagementToken(dataDir)
-		if err != nil {
-			return err
+		token := func() string {
+			t, err := clientManagementToken(dataDir)
+			if err != nil {
+				log.Printf("relayhub mcp: %v", err) // stderr; stdout carries JSON-RPC
+			}
+			return t
 		}
-		return runMCPStdio(managementAddr, token)
+		return runMCPStdio(managementAddr, token, os.Stdin, os.Stdout)
 	}
 	if fs.NArg() == 1 && fs.Arg(0) == "pair" {
 		return runPair(managementAddr, dataDir, os.Stdout, os.Stderr)
