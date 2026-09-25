@@ -207,6 +207,11 @@ type Config struct {
 	Lab            *lab.Ring
 	Guard          *guard.Guard
 	Verify         *verify.Registry
+
+	// StreamCommitWindow bounds how long a 2xx stream is held back waiting
+	// for its first output event, so an upstream that fails before producing
+	// output can still fail over (AUDIT 2026-09-24 §5 B4). Zero means 10s.
+	StreamCommitWindow time.Duration
 }
 
 type Handler struct {
@@ -336,6 +341,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	attempted := map[string]bool{decision.Channel.ID: true}
 	var last Response
 	var lastErr error
+	// precommit is set when the last attempt answered 2xx but failed before
+	// producing any output; probeWait is how long its stream was held back.
+	var precommit *precommitFailure
+	var probeWait time.Duration
 	// switchChannel moves to the next candidate (pre-first-byte failover).
 	// It returns false when no other candidate exists.
 	switchChannel := func() bool {
@@ -381,8 +390,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		attemptStart := time.Now()
 		last, lastErr = h.cfg.Upstream.Do(r.Context(), Request{Protocol: upProto, Path: upPath, Headers: requestHeaders(r, upProto, stream, decision), Body: upstreamInput, Stream: stream, Decision: decision})
 		ttfb := time.Since(attemptStart)
+		// Nothing has reached the client yet, so a 2xx that turns out to be
+		// an HTML page, an error event or an empty stream is a failed
+		// attempt that can still fail over (AUDIT 2026-09-24 §5 B4).
+		precommit, probeWait = nil, 0
+		if lastErr == nil && last.StatusCode >= 200 && last.StatusCode < 300 {
+			precommit, probeWait = h.vetResponse(r.Context(), &last, stream)
+		}
 		if lastErr == nil {
-			h.cfg.Limiter.Observe(h.limitKey(decision, last.CredentialKeyID), last.StatusCode, last.RetryAfter, last.Header)
+			status := last.StatusCode
+			if precommit != nil {
+				status = precommit.status
+			}
+			h.cfg.Limiter.Observe(h.limitKey(decision, last.CredentialKeyID), status, last.RetryAfter, last.Header)
 		}
 		// Every attempt outcome is fed to the health registry exactly once,
 		// including the final one: a channel whose last try failed used to
@@ -404,6 +424,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			retry = attempt+1 < h.cfg.MaxAttempts
 			// A short Retry-After is cheaper to honour than to fail over.
 			sameChannel = last.StatusCode == http.StatusTooManyRequests && last.RetryAfter > 0 && last.RetryAfter <= 2*time.Second
+		case precommit != nil:
+			if precommit.failover() {
+				h.observeFailure(decision, precommit.reason, last.Header)
+				retry = attempt+1 < h.cfg.MaxAttempts
+			}
 		case last.StatusCode >= 200 && last.StatusCode < 300:
 			// A successful upstream response closes the circuit breaker and
 			// clears the failure count. Without this, a channel that tripped
@@ -459,19 +484,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeUpstreamError(w, r, last)
 		return
 	}
+	if precommit != nil {
+		// Every attempt failed before producing output. Nothing has been
+		// written yet, so the client gets a real error status instead of a
+		// 200 stream wrapping an error (or nothing at all). Health already
+		// saw the failure in the loop.
+		h.recordFailure(r, protocol, model, decision, precommit.status, precommit.class, reqStart)
+		writePrecommitFailure(w, r, precommit, protocol == normalizeProtocol(decision.ProviderModel.Protocol))
+		return
+	}
 	if rr, ok := h.cfg.Resolver.(*router.Resolver); ok && rr.Sticky != nil && routeReq.SessionKey != "" {
 		rr.Sticky.Remember(routeReq.SessionKey, decision.Channel.ID, last.CredentialKeyID)
-	}
-	// A relay answering 200 with an HTML page (Cloudflare challenge, login or
-	// "insufficient balance" page) is a failure, not a completion to relay
-	// (AUDIT 2026-09-24 F9: response shape was never checked).
-	if ct := strings.ToLower(last.Header.Get("Content-Type")); strings.HasPrefix(ct, "text/html") {
-		if h.cfg.Health != nil {
-			h.cfg.Health.RecordFailure(decision.Channel.ID, h.cfg.MaxAttempts, h.cfg.Now())
-		}
-		h.recordFailure(r, protocol, model, decision, http.StatusBadGateway, "provider_protocol", reqStart)
-		writeGatewayError(w, r, http.StatusBadGateway, "provider_protocol", "upstream returned an HTML page instead of an API response")
-		return
 	}
 	if stream {
 		upProto := normalizeProtocol(decision.ProviderModel.Protocol)
@@ -497,7 +520,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// channel (RH-18) without double-counting the success.
 		rec := recordFor(r, protocol, decision, nil, http.StatusOK, h.cfg.Now())
 		rec.LatencyMS = int(time.Since(reqStart).Milliseconds())
-		rec.TTFTMS = meta.TTFTMS
+		// TTFT counts from the upstream headers, including the time the
+		// stream was held back waiting for its first output event.
+		rec.TTFTMS = int(probeWait.Milliseconds()) + meta.TTFTMS
 		rec.InputTokens = meta.InputTokens
 		rec.OutputTokens = meta.OutputTokens
 		rec.CacheReadTokens = meta.CacheReadTokens
