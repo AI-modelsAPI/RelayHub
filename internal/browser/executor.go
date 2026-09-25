@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,15 +60,19 @@ func NewCDPExecutor(rt *Runtime, dataDir string, detector func() Info) *CDPExecu
 	}
 }
 
-// findFreePort locates an available TCP port on localhost.
-func findFreePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+// readDevToolsActivePort parses the port Chrome wrote to DevToolsActivePort
+// (first line: port, second line: browser websocket path).
+func readDevToolsActivePort(path string) (int, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	defer l.Close()
-	addr := l.Addr().(*net.TCPAddr)
-	return addr.Port, nil
+	first, _, _ := strings.Cut(string(data), "\n")
+	port, err := strconv.Atoi(strings.TrimSpace(first))
+	if err != nil || port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("invalid DevToolsActivePort contents %q", first)
+	}
+	return port, nil
 }
 
 // sanitizeTargetURL validates target URLs to ensure security boundaries.
@@ -111,10 +116,18 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 		return CheckinResult{}, fmt.Errorf("failed to prepare profile dir: %w", err)
 	}
 
-	port, err := findFreePort()
-	if err != nil {
-		return CheckinResult{}, fmt.Errorf("failed to find free debugging port: %w", err)
+	// Chrome picks its own debugging port (--remote-debugging-port=0) and
+	// reports it in <profile>/DevToolsActivePort. Pre-selecting a port with
+	// findFreePort left a window in which another local process could bind
+	// it and impersonate the DevTools endpoint (AUDIT 2026-09-24 F15). The
+	// profile directory is private to this user.
+	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
+		return CheckinResult{}, fmt.Errorf("failed to create profile dir: %w", err)
 	}
+	_ = os.Chmod(userDataDir, 0o700)
+	activePortFile := filepath.Join(userDataDir, "DevToolsActivePort")
+	_ = os.Remove(activePortFile)
+	port := 0
 
 	timeout := req.Timeout
 	if timeout <= 0 {
@@ -151,6 +164,14 @@ func (e *CDPExecutor) ExecuteCheckin(ctx context.Context, req CheckinRequest) (o
 	for time.Now().Before(deadline) {
 		if runCtx.Err() != nil {
 			return CheckinResult{}, runCtx.Err()
+		}
+		if port == 0 {
+			p, perr := readDevToolsActivePort(activePortFile)
+			if perr != nil {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			port = p
 		}
 		t, err := cdp.GetFirstPageTarget(runCtx, port)
 		if err == nil && t.WebSocketDebuggerURL != "" {
