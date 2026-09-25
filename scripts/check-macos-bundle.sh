@@ -43,12 +43,9 @@ check_app() {
     local plist="$app/Contents/Info.plist"
     [ -f "$plist" ] || fail "[$label] missing Contents/Info.plist"
 
-    local exe lsmin
+    local exe
     exe="$(plutil -extract CFBundleExecutable raw "$plist" 2>/dev/null || true)"
     [ -n "$exe" ] || fail "[$label] Info.plist has no CFBundleExecutable"
-    lsmin="$(plutil -extract LSMinimumSystemVersion raw "$plist" 2>/dev/null || true)"
-    [ "$lsmin" = "$MIN" ] || fail "[$label] LSMinimumSystemVersion is '${lsmin:-<missing>}', expected $MIN"
-    echo "  [$label] LSMinimumSystemVersion $lsmin"
 
     local bin rel minos
     for bin in "$app/Contents/MacOS/$exe" "$app/Contents/Resources/relayhub-core"; do
@@ -60,6 +57,11 @@ check_app() {
             || fail "[$label] $rel requires macOS $minos but the floor is $MIN: macOS $MIN..$minos would refuse to open the app"
         echo "  [$label] $rel: minos $minos (<= $MIN)"
     done
+
+    local lsmin
+    lsmin="$(plutil -extract LSMinimumSystemVersion raw "$plist" 2>/dev/null || true)"
+    [ "$lsmin" = "$MIN" ] || fail "[$label] LSMinimumSystemVersion is '${lsmin:-<missing>}', expected $MIN"
+    echo "  [$label] LSMinimumSystemVersion $lsmin"
 
     local out
     if ! out="$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1)"; then
