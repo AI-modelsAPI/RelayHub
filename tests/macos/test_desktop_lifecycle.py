@@ -200,10 +200,16 @@ class DesktopLifecycleTests(unittest.TestCase):
         port = get_free_port()
         with tempfile.TemporaryDirectory() as td:
             proc = spawn(port, td, td)
-            core_pid, _ = read_token(td, timeout=1.5)
+            # 1.5 s used to be shorter than a cold shell+core start on a busy
+            # CI runner (this test runs first in the suite); the other tests
+            # wait 10 s for the same token file.
+            core_pid, _ = read_token(td, timeout=10.0)
             self.assertIsNotNone(core_pid)
             os.kill(core_pid, signal.SIGKILL)
-            time.sleep(0.8)
+            # The termination handler dispatches its NSLog to the main run
+            # loop; give a busy CI runner room to process it before we drain
+            # the shell's pipes.
+            time.sleep(2.0)
             out = stop(proc)
             self.assertTrue(
                 "Crash alert suppressed by RELAYHUB_NO_ALERT_MODAL" in out or "Core 服务异常退出" in out,
