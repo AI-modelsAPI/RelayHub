@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"relayhub/internal/affinity"
 	"relayhub/internal/domain"
@@ -178,7 +179,10 @@ func (s *Server) identityPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	out := identity.FromChannel(ch)
 	if r.URL.Query().Get("probe") == "1" {
-		out.EgressIP = identity.ProbeEgress(r.Context(), ch.ProxyURL)
+		// Probe through the exact egress the channel's traffic uses (global
+		// default + fail-closed channel proxy), not a lookalike client
+		// (AUDIT 2026-09-24 F13).
+		out.EgressIP = identity.ProbeEgressWith(r.Context(), s.upstreamProbeClient(ch, 8*time.Second))
 	}
 	// Proxy credentials are never echoed (AUDIT RH-31); the PATCH response
 	// used to return them unmasked.
