@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -174,7 +175,7 @@ func wire(ctx context.Context, cfg Config) (*Runtime, error) {
 	}
 
 	// Secret Store
-	keyProvider, err := secrets.NewFileKeyProvider(filepath.Join(absDataDir, "master.key"))
+	keyProvider, err := newKeyProvider(ctx, cfg.MasterKeyStore, filepath.Join(absDataDir, "master.key"), runtime.GOOS)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create key provider: %w", err)
@@ -660,4 +661,21 @@ func (r *Runtime) Shutdown(ctx context.Context) error {
 		r.Notifier.Flush(3 * time.Second)
 	}
 	return nil
+}
+
+// newKeyProvider selects where the secret-store key lives (AUDIT 2026-09-24
+// F18). "keychain" keeps it out of the data directory, so backups and sync
+// folders no longer carry the key next to the ciphertext.
+func newKeyProvider(ctx context.Context, store, keyPath, goos string) (secrets.KeyProvider, error) {
+	switch strings.ToLower(strings.TrimSpace(store)) {
+	case "", "file":
+		return secrets.NewFileKeyProvider(keyPath)
+	case "keychain":
+		if goos != "darwin" {
+			return nil, fmt.Errorf("master_key_store %q is only supported on macOS", store)
+		}
+		return secrets.NewKeychainKeyProvider(ctx, secrets.KeychainOptions{FilePath: keyPath})
+	default:
+		return nil, fmt.Errorf("unknown master_key_store %q (want \"file\" or \"keychain\")", store)
+	}
 }

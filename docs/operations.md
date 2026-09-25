@@ -91,6 +91,7 @@ CDP 签到默认寻找 `#checkin-btn, .checkin-btn, button[data-action="checkin"
 |---|---|---|
 | `management_token` | `RELAYHUB_MANAGEMENT_TOKEN` | 设置后，所有修改类管理 API 都要求 `Authorization: Bearer <token>`。控制台第一次遇到 401 时会提示输入，令牌只保存在浏览器的 localStorage 里；`relayhub mcp` 读取同一个环境变量 |
 | `proxy_username` / `proxy_password` | `RELAYHUB_PROXY_USERNAME` / `RELAYHUB_PROXY_PASSWORD` | 两个都设置时，本地 HTTP 代理要求 Basic 认证，SOCKS5 要求 RFC 1929 认证；只设置其中一个会阻止启动 |
+| `master_key_store` | `RELAYHUB_MASTER_KEY_STORE` | `file`（默认，`<data-dir>/master.key`）或 `keychain`（仅 macOS）。选 `keychain` 后主密钥存入登录钥匙串：已有的 `master.key` 会先迁移过去，回读校验通过后才删除文件；如果文件和钥匙串里的值不一致，就拒绝启动。之后备份和同步盘里就不再有明文主密钥（旧备份里仍然有，必要时请轮换渠道 Key）。钥匙串处于锁定状态时启动会失败，不会悄悄生成新密钥 |
 | `http_proxy_target_policy` / `socks5_target_policy` | — | 可选 `open`（默认）、`public_private`、`public_only`、`local_only`。无论选哪个，都会拒绝 RelayHub 自身的端口和云元数据地址；CGNAT（100.64/10）按私网处理 |
 
 ### 渠道请求头档案

@@ -111,6 +111,7 @@ func run(args []string) error {
 		ManagementToken:       fileCfg.ManagementToken,
 		ProxyUsername:         fileCfg.ProxyUsername,
 		ProxyPassword:         fileCfg.ProxyPassword,
+		MasterKeyStore:        fileCfg.MasterKeyStore,
 		HTTPProxyTargetPolicy: fileCfg.HTTPProxyTargetPolicy,
 		SOCKS5TargetPolicy:    fileCfg.SOCKS5TargetPolicy,
 		Notify: app.NotifyConfig{

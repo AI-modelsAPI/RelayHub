@@ -39,6 +39,11 @@ type Config struct {
 	// (AUDIT 2026-09-24 F2). Env: RELAYHUB_PROXY_USERNAME / _PASSWORD.
 	ProxyUsername string `json:"proxy_username"`
 	ProxyPassword string `json:"proxy_password"`
+	// MasterKeyStore selects where the secret-store key lives: "file"
+	// (default, <data-dir>/master.key) or "keychain" (macOS login keychain;
+	// an existing master.key is migrated and removed). AUDIT 2026-09-24 F18.
+	// Env: RELAYHUB_MASTER_KEY_STORE.
+	MasterKeyStore string `json:"master_key_store"`
 	// EgressProxyURL is the global default exit for outbound AI gateway,
 	// check-in and browser traffic (http://, https://, socks5://, or
 	// "direct"). A channel's own proxy_url takes precedence. Empty means the
@@ -81,6 +86,7 @@ func ApplyEnv(cfg *Config) {
 	set(&cfg.ManagementToken, "RELAYHUB_MANAGEMENT_TOKEN")
 	set(&cfg.ProxyUsername, "RELAYHUB_PROXY_USERNAME")
 	set(&cfg.ProxyPassword, "RELAYHUB_PROXY_PASSWORD")
+	set(&cfg.MasterKeyStore, "RELAYHUB_MASTER_KEY_STORE")
 	set(&cfg.Notify.WebhookURL, "RELAYHUB_NOTIFY_WEBHOOK_URL")
 	set(&cfg.Notify.BarkURL, "RELAYHUB_NOTIFY_BARK_URL")
 	set(&cfg.Notify.TelegramBotToken, "RELAYHUB_NOTIFY_TELEGRAM_TOKEN")
@@ -237,6 +243,9 @@ func merge(dst *Config, src Config) {
 	}
 	if src.ProxyPassword != "" {
 		dst.ProxyPassword = src.ProxyPassword
+	}
+	if src.MasterKeyStore != "" {
+		dst.MasterKeyStore = src.MasterKeyStore
 	}
 	if src.EgressProxyURL != "" {
 		dst.EgressProxyURL = src.EgressProxyURL
