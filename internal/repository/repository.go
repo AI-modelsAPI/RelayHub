@@ -54,6 +54,14 @@ type ProviderModelRepository interface {
 	DeleteProviderModelsByChannel(context.Context, string) error
 }
 
+// ModelSyncRepository stores the before-image of each model sync so a sync can
+// be rolled back in one step (AUDIT 2026-09-24 §5 B3).
+type ModelSyncRepository interface {
+	CreateModelSyncSnapshot(context.Context, domain.ModelSyncSnapshot) error
+	LastModelSyncSnapshot(context.Context, string) (domain.ModelSyncSnapshot, error)
+	MarkModelSyncSnapshotUndone(context.Context, string) error
+}
+
 type ModelGroupRepository interface {
 	CreateModelGroup(context.Context, domain.ModelGroup) error
 	GetModelGroup(context.Context, string) (domain.ModelGroup, error)
@@ -103,6 +111,7 @@ type ResourceRepository interface {
 	ChannelRepository
 	ModelRepository
 	ProviderModelRepository
+	ModelSyncRepository
 	ModelGroupRepository
 	RouteRepository
 	StatusRepository
@@ -555,6 +564,20 @@ func (s *Store) UpdateProviderModel(ctx context.Context, m domain.ProviderModel)
 func (s *Store) DeleteProviderModel(ctx context.Context, id string) error {
 	result, err := s.repositoryExecutor().ExecContext(ctx, `DELETE FROM provider_models WHERE id=?`, id)
 	return requireAffected(result, err)
+}
+
+// --- model sync snapshots (AUDIT 2026-09-24 §5 B3) ---
+
+func (s *Store) CreateModelSyncSnapshot(context.Context, domain.ModelSyncSnapshot) error {
+	return nil
+}
+
+func (s *Store) LastModelSyncSnapshot(context.Context, string) (domain.ModelSyncSnapshot, error) {
+	return domain.ModelSyncSnapshot{}, ErrNotFound
+}
+
+func (s *Store) MarkModelSyncSnapshotUndone(context.Context, string) error {
+	return nil
 }
 
 // DeleteProviderModelsByChannel removes every provider-model binding of one

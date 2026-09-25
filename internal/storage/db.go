@@ -43,6 +43,9 @@ var customHeadersAndIndices string
 //go:embed migrations/010_billing_reports.sql
 var billingReports string
 
+//go:embed migrations/011_model_provenance.sql
+var modelProvenance string
+
 type DB struct {
 	*sql.DB
 	// JournalMode is the effective SQLite journal mode after Open (normally "wal").
@@ -118,6 +121,7 @@ var migrations = []struct {
 	{8, requestRecordMeta},
 	{9, customHeadersAndIndices},
 	{10, billingReports},
+	{11, modelProvenance},
 }
 
 func (d *DB) Migrate(ctx context.Context) error {

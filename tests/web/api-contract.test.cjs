@@ -86,3 +86,14 @@ test("the channel inspector runs and shows authenticity probes (AUDIT §5 B1)", 
   assert.match(appJs, /function trustHTML\(/);
   assert.match(appJs, /esc\(c\.detail/);
 });
+
+test("the models view shows the provenance review queue (AUDIT §5 B3)", () => {
+  assert.ok(isRegistered("/api/v1/models/pending"), "the review queue endpoint is not registered");
+  assert.ok(isRegistered("/api/v1/channels/sync-undo"), "the sync undo endpoint is not registered");
+  assert.match(appJs, /api\("models\/pending"/);
+  // A decision is a real request, not a local state change.
+  assert.match(appJs, /api\("models\/pending", JSON_POST\(body\)\)/);
+  // The queue is rendered, and its container exists in the shell.
+  assert.match(appJs, /function pendingHTML\(/);
+  assert.match(html, /id="md-queue"/);
+});

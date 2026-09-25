@@ -346,6 +346,10 @@ func (s *Server) managementRoutes() http.Handler {
 	mux.HandleFunc("/api/v1/channels/sync-models", s.channelSyncModels)
 	mux.HandleFunc("/api/v1/channels/test", s.channelTest)
 	mux.HandleFunc("/api/v1/models/catalog", s.modelCatalog)
+	// The review queue and the sync undo are registered as exact patterns,
+	// which win over the "/api/v1/models/" and "/api/v1/channels/" prefixes.
+	mux.HandleFunc("/api/v1/models/pending", s.modelPending)
+	mux.HandleFunc("/api/v1/channels/sync-undo", s.modelSyncUndo)
 	mux.HandleFunc("/api/v1/models/batch", s.modelBatch)
 	mux.HandleFunc("/api/v1/channels/duplicate", s.channelDuplicate)
 	mux.HandleFunc("/api/v1/channels/batch", s.channelBatch)

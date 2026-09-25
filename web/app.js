@@ -12,6 +12,7 @@ const state = {
   summary: null,
   scores: [],
   billing: null,
+  pending: null,
   identity: [],
   lab: [],
   labEnabled: false,
@@ -308,7 +309,48 @@ async function probeChannel(ch) {
   }
 }
 
+// Model provenance (AUDIT 2026-09-24 §5 B3): a relay that lists "claude-*"
+// does not get to serve it until the operator says so, so the models view
+// shows the review queue above the catalog.
+function pendingHTML() {
+  const queue = state.pending || [];
+  if (!queue.length) return "";
+  const rows = queue
+    .map((p) => {
+      const reason = p.reason === "reserved_model_name" ? "保留名称（渠道未标记为官方同源）" : "其他渠道已在提供（后台同步）";
+      return `<li class="row pending" data-channel="${esc(p.channel_id)}" data-model="${esc(p.model_id)}">
+        <span class="n">${esc(p.model_id)}</span>
+        <span class="m">${esc(p.channel_id)} · ${esc(reason)}</span>
+        <button class="ghost" type="button" data-act="approve">批准</button>
+        <button class="ghost" type="button" data-act="reject">拒绝</button>
+      </li>`;
+    })
+    .join("");
+  return `<div class="ins-block"><header class="col-h"><h2>待审模型 ${queue.length}</h2></header>
+    <p class="lede">这些模型是渠道自己声明的，批准后才会进入路由。</p><ul class="rows">${rows}</ul></div>`;
+}
+
+function decidePending(channelID, modelID, action, target) {
+  const body = { channel_id: channelID, model_id: modelID, action };
+  if (target) body.model_id_target = target;
+  return api("models/pending", JSON_POST(body)).then(() => api("models/pending")).then((r) => {
+    state.pending = r.pending || [];
+    renderModels();
+  });
+}
+
 function renderModels() {
+  const queue = $("#md-queue");
+  if (queue) queue.innerHTML = pendingHTML();
+  if (queue) {
+    queue.querySelectorAll("[data-act]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const row = btn.closest(".pending");
+        if (!row) return;
+        decidePending(row.dataset.channel, row.dataset.model, btn.dataset.act).catch(() => {});
+      });
+    });
+  }
   $("#md-rows").innerHTML = state.models.length
     ? state.models.map((m) => rowHTML(m.id, m.id || m.name, `ctx ${m.context_window || "—"}`, m.protocol || "")).join("")
     : `<li class="row"><span class="n">暂无模型</span><span class="m">通过 POST /api/v1/models 创建</span></li>`;
@@ -511,7 +553,7 @@ function render() {
 }
 
 async function boot() {
-  const [ov, ch, md, us, ck, sm, sc, idn, lb, ag, st, bl] = await Promise.allSettled([
+  const [ov, ch, md, us, ck, sm, sc, idn, lb, ag, st, bl, pd] = await Promise.allSettled([
     api("overview"),
     api("channels"),
     api("models"),
@@ -524,6 +566,7 @@ async function boot() {
     api("cli-sync"),
     api("settings"),
     api("billing/reconcile"),
+    api("models/pending"),
   ]);
   const ok = (r) => r.status === "fulfilled";
   if (ok(ov)) state.overview = ov.value;
@@ -544,6 +587,7 @@ async function boot() {
   }
   if (ok(st)) state.settings = st.value;
   if (ok(bl)) state.billing = bl.value;
+  if (ok(pd)) state.pending = pd.value.pending || [];
 
   // The Core indicator follows the overview heartbeat. Previously every fetch
   // could fail and the dot stayed green because the catch never ran (RH-29).

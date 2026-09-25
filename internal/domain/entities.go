@@ -34,18 +34,24 @@ type Channel struct {
 	RoutingEnabled bool              `json:"routing_enabled"`
 	Enabled        bool              `json:"enabled"`
 	// AxonHub-compatible extensions
-	Status           string    `json:"status"`             // enabled | disabled | archived
-	ManualModels     string    `json:"manual_models"`      // comma-separated manual model list
-	AutoSync         bool      `json:"auto_sync"`          // auto-sync supported models
-	AutoSyncPattern  string    `json:"auto_sync_pattern"`  // regex filter for auto-sync
-	DefaultTestModel string    `json:"default_test_model"` // model used for connectivity test
-	StreamPolicy     string    `json:"stream_policy"`      // unlimited | disabled
-	ErrorMessage     string    `json:"error_message"`      // last upstream error
-	Remark           string    `json:"remark"`             // user remark
-	ProxyURL         string    `json:"proxy_url"`          // upstream proxy (socks5://...)
-	CheckinMode      string    `json:"checkin_mode"`       // auto | manual
-	CreatedAt        time.Time `json:"created_at,omitempty"`
-	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+	Status           string `json:"status"`             // enabled | disabled | archived
+	ManualModels     string `json:"manual_models"`      // comma-separated manual model list
+	AutoSync         bool   `json:"auto_sync"`          // auto-sync supported models
+	AutoSyncPattern  string `json:"auto_sync_pattern"`  // regex filter for auto-sync
+	DefaultTestModel string `json:"default_test_model"` // model used for connectivity test
+	StreamPolicy     string `json:"stream_policy"`      // unlimited | disabled
+	ErrorMessage     string `json:"error_message"`      // last upstream error
+	Remark           string `json:"remark"`             // user remark
+	ProxyURL         string `json:"proxy_url"`          // upstream proxy (socks5://...)
+	CheckinMode      string `json:"checkin_mode"`       // auto | manual
+	// OfficialSource marks a channel the operator vouches for as the vendor's
+	// own (or an authorised reseller). Only such a channel may claim a
+	// reserved model name (claude-*, gpt-*, …) automatically during a model
+	// sync; every other channel's claim on those names is held for review
+	// (AUDIT 2026-09-24 §5 B3).
+	OfficialSource bool      `json:"official_source"`
+	CreatedAt      time.Time `json:"created_at,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at,omitempty"`
 }
 
 type Credential struct {
@@ -96,19 +102,24 @@ type Model struct {
 }
 
 type ProviderModel struct {
-	ID                string    `json:"id"`
-	ProviderID        string    `json:"provider_id"`
-	ChannelID         string    `json:"channel_id,omitempty"`
-	ModelID           string    `json:"model_id"`
-	UpstreamModelName string    `json:"upstream_model_name"`
-	Protocol          string    `json:"protocol"`
-	RequestTransform  string    `json:"request_transform"`
-	ResponseTransform string    `json:"response_transform"`
-	Priority          int       `json:"priority"`
-	Weight            int       `json:"weight"`
-	Enabled           bool      `json:"enabled"`
-	CreatedAt         time.Time `json:"created_at,omitempty"`
-	UpdatedAt         time.Time `json:"updated_at,omitempty"`
+	ID                string `json:"id"`
+	ProviderID        string `json:"provider_id"`
+	ChannelID         string `json:"channel_id,omitempty"`
+	ModelID           string `json:"model_id"`
+	UpstreamModelName string `json:"upstream_model_name"`
+	Protocol          string `json:"protocol"`
+	RequestTransform  string `json:"request_transform"`
+	ResponseTransform string `json:"response_transform"`
+	Priority          int    `json:"priority"`
+	Weight            int    `json:"weight"`
+	Enabled           bool   `json:"enabled"`
+	// HeldReason is set when a model sync created this binding but held it
+	// disabled for operator review: reserved_model_name (the channel is not
+	// marked as an official source) or served_elsewhere (another channel
+	// already serves the model). Empty means the binding is not pending.
+	HeldReason string    `json:"held_reason,omitempty"`
+	CreatedAt  time.Time `json:"created_at,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at,omitempty"`
 }
 
 type ModelGroup struct {
@@ -200,4 +211,24 @@ type ConfigBackup struct {
 	Path      string    `json:"path"`
 	SHA256    string    `json:"sha256"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// ModelSyncSnapshot records the state a channel's model bindings were in
+// before one sync, so the sync can be undone in one step (AUDIT 2026-09-24
+// §5 B3). It holds metadata only: binding configuration and the IDs of the
+// global models the sync created.
+type ModelSyncSnapshot struct {
+	ID        string    `json:"id"`
+	ChannelID string    `json:"channel_id"`
+	Source    string    `json:"source"` // manual | background
+	CreatedAt time.Time `json:"created_at"`
+	// Bindings are the channel's provider-model bindings before the sync.
+	Bindings []ProviderModel `json:"bindings"`
+	// AddedModels are the global models the sync created (a rejected or
+	// re-mapped held model must not leave a phantom global name behind).
+	AddedModels []string `json:"added_models"`
+	// Held are the model IDs the sync held for review.
+	Held []string `json:"held"`
+	// Undone marks a snapshot whose sync has already been rolled back.
+	Undone bool `json:"undone"`
 }

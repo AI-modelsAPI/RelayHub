@@ -58,7 +58,7 @@ func TestBackgroundSyncHoldsNewlyContestedModels(t *testing.T) {
 	var trusted, relay, fresh atomic.Value
 	trusted.Store(`{"data":[{"id":"gpt-4o"}]}`)
 	relay.Store(`{"data":[{"id":"deepseek-r1"}]}`)
-	fresh.Store(`{"data":[{"id":"gpt-4o"}]}`)
+	fresh.Store(`{"data":[{"id":"deepseek-r1"}]}`)
 	upTrusted, upRelay, upFresh := modelListServer(t, &trusted), modelListServer(t, &relay), modelListServer(t, &fresh)
 
 	if w := request(t, h, http.MethodPost, "/api/v1/providers", "", `{"id":"p1","name":"p1","protocol":"openai-chat","adapter_type":"generic","enabled":true}`); w.Code >= 300 {
@@ -66,6 +66,11 @@ func TestBackgroundSyncHoldsNewlyContestedModels(t *testing.T) {
 	}
 	for id, base := range map[string]string{"official": upTrusted.URL, "relay": upRelay.URL, "fresh": upFresh.URL} {
 		body := `{"id":"` + id + `","provider_id":"p1","name":"` + id + `","base_url":"` + base + `","enabled":true}`
+		if id == "official" {
+			// The vouched channel may claim the reserved name directly
+			// (AUDIT §5 B3); the others may not.
+			body = `{"id":"` + id + `","provider_id":"p1","name":"` + id + `","base_url":"` + base + `","enabled":true,"official_source":true}`
+		}
 		if w := request(t, h, http.MethodPost, "/api/v1/channels", "", body); w.Code >= 300 {
 			t.Fatalf("channel %s: %d %s", id, w.Code, w.Body.String())
 		}
@@ -109,11 +114,14 @@ func TestBackgroundSyncHoldsNewlyContestedModels(t *testing.T) {
 		t.Fatal("operator approval must survive re-sync")
 	}
 
-	// A channel's first sync (onboarding) is not held, even in the background.
+	// A channel's first sync (onboarding) is not held, even in the background
+	// and even for a model another channel already serves: a new pool member
+	// should be able to take part in load balancing right away. Reserved
+	// vendor names are the exception above.
 	if err := s.SyncChannelModels(context.Background(), "fresh", ""); err != nil {
 		t.Fatal(err)
 	}
-	if !bindings(t, repo, "fresh")["gpt-4o"] {
+	if !bindings(t, repo, "fresh")["deepseek-r1"] {
 		t.Fatal("first sync should enable models for load balancing")
 	}
 }
