@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"relayhub/internal/affinity"
 	"relayhub/internal/audit"
@@ -742,6 +744,22 @@ var errInvalidPattern = errors.New("invalid pattern")
 // optional regex pattern, and rebuilds the channel's provider-model bindings.
 // Extracted so both the HTTP handler and the scheduler auto-sync callback share
 // one implementation. Returns the surviving model names and the count bound.
+// maxSyncedModels bounds how many models one upstream sync may register.
+const maxSyncedModels = 2000
+
+// validSyncedModelID accepts printable model identifiers of sane length.
+func validSyncedModelID(id string) bool {
+	if id == "" || len(id) > 200 {
+		return false
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) || unicode.IsSpace(r) || r == utf8.RuneError {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern string) ([]string, int, error) {
 	if s.Repo == nil {
 		return nil, 0, errors.New("resource persistence is not configured")
@@ -768,6 +786,32 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 			}
 		}
 	}
+	// Upstream model lists are untrusted input from a third-party relay:
+	// drop malformed IDs and refuse absurd lists instead of registering
+	// every entry as a global model (AUDIT 2026-09-24 F6).
+	valid := filtered[:0:0]
+	seen := map[string]bool{}
+	for _, m := range filtered {
+		if validSyncedModelID(m) && !seen[m] {
+			seen[m] = true
+			valid = append(valid, m)
+		}
+	}
+	filtered = valid
+	if len(filtered) > maxSyncedModels {
+		return nil, 0, fmt.Errorf("%w: upstream listed %d models (limit %d); narrow auto_sync_pattern", errInvalidPattern, len(filtered), maxSyncedModels)
+	}
+	// Operator edits to existing bindings (priority, weight, enabled, upstream
+	// name mapping, protocol, transforms) survive a re-sync; the old
+	// delete-and-recreate reset them on every scheduled auto-sync.
+	previous := map[string]domain.ProviderModel{}
+	if all, lerr := s.Repo.ListProviderModels(ctx, ""); lerr == nil {
+		for _, pm := range all {
+			if pm.ChannelID == channelID {
+				previous[pm.ModelID] = pm
+			}
+		}
+	}
 	// Bindings inherit the provider protocol instead of hard-coded openai-chat:
 	// anthropic upstreams previously got non-routable "openai-chat" bindings
 	// after auto-sync (AUDIT RH-15).
@@ -785,7 +829,7 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 	}
 	plans := make([]bindingPlan, 0, len(filtered))
 	for _, m := range filtered {
-		plans = append(plans, bindingPlan{pm: domain.ProviderModel{
+		pm := domain.ProviderModel{
 			ID:                fmt.Sprintf("pm-%s-%s", channelID, m),
 			ProviderID:        ch.ProviderID,
 			ChannelID:         channelID,
@@ -795,7 +839,18 @@ func (s *Server) syncChannelModels(ctx context.Context, channelID, pattern strin
 			Priority:          ch.Priority,
 			Weight:            ch.Weight,
 			Enabled:           true,
-		}})
+		}
+		if old, ok := previous[m]; ok {
+			pm.ID = old.ID
+			pm.UpstreamModelName = old.UpstreamModelName
+			pm.Protocol = old.Protocol
+			pm.RequestTransform = old.RequestTransform
+			pm.ResponseTransform = old.ResponseTransform
+			pm.Priority = old.Priority
+			pm.Weight = old.Weight
+			pm.Enabled = old.Enabled
+		}
+		plans = append(plans, bindingPlan{pm: pm})
 	}
 	created := 0
 	apply := func(tx *repository.Tx) error {
