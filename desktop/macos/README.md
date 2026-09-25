@@ -73,8 +73,12 @@ Check what macOS will think of a build before shipping it:
 ```bash
 vtool -show-build dist/RelayHub-amd64.app/Contents/MacOS/RelayHub   # minos 13.0
 codesign --verify --deep --strict --verbose=2 dist/RelayHub-amd64.app
-syspolicy_check distribution dist/RelayHub-amd64.app                  # only notarization errors expected
+syspolicy_check distribution dist/RelayHub-amd64.app                  # expect "Notary Ticket Missing" only*
 ```
+
+\* macOS 14's `syspolicy_check` may also print "Internal Xprotect Error"; it
+does the same for the old unsigned builds and is not a malware verdict (the
+sealed app launches normally once the quarantine flag is cleared).
 
 ## Real-device tests
 
