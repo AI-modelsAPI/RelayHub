@@ -82,9 +82,33 @@ jobs:
           grep -E '^(--- |ok|FAIL)|keychain_darwin_test' keychain.log > keychain-summary.log || true
           python3 scripts/ci-annotate.py notice keychain keychain-summary.log
 
-      # Compiles the Objective-C shell (desktop/macos/RelayHubApp/main.m).
+      # Compiles the Objective-C shell (desktop/macos/RelayHubApp/main.m),
+      # signs and packages both arches, then scripts/check-macos-bundle.sh
+      # rejects any artifact an older supported macOS would refuse (deployment
+      # target above the floor, broken signature seal, DMG without
+      # RelayHub.app + Applications shortcut).
       - name: Build macOS bundles
         run: ./scripts/build-macos.sh
+
+      # The runner is always the newest macOS, so it cannot tell whether an
+      # older one opens the app. Keep the PR's DMGs so they can be installed
+      # on a real older Mac before a tag is cut (one artifact per CPU, so a
+      # tester on a slow link downloads only the DMG they need).
+      - name: Upload Intel DMG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: RelayHub-macOS-intel
+          path: dist/RelayHub-macOS-intel.dmg
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload Apple Silicon DMG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: RelayHub-macOS-apple-silicon
+          path: dist/RelayHub-macOS-apple-silicon.dmg
+          compression-level: 0
+          retention-days: 7
 
       # Process ownership, health, fail-closed port conflict, flock, crash
       # watchdog, and the token-authenticated management API (AUDIT F4).
